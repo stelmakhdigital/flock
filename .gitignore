@@ -1,0 +1,7 @@
+node_modules/
+dist/
+docs/
+AGENTS.md
+.pi/
+.flock/
+*.log
