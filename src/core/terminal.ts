@@ -121,6 +121,15 @@ export async function paneAlive(role: string): Promise<boolean> {
   return r.code === 0 && r.out.trim() === '0';
 }
 
+// Foreground process of the pod pane. A runner-sidecar "ready" (or a READY
+// marker in scrollback) only counts while the foreground is NOT a shell —
+// a dead runner leaves the pane at the shell (OpenRig's stale-artifact guard).
+export const SHELL_COMMANDS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh']);
+export async function paneCommand(target: string): Promise<string> {
+  const r = await tmux(['display-message', '-p', '-t', target, '#{pane_current_command}']);
+  return r.code === 0 ? r.out.trim() : '';
+}
+
 // Typed pod state from the runner sidecar (never screen-scraped).
 export function readRunnerState(stateRoot: string, role: string): RunnerState | null {
   try {

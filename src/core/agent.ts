@@ -20,15 +20,29 @@ import { fileURLToPath } from 'node:url';
 export interface AgentManifest {
   id: string;
   command: string;
+  // runtime selects the RuntimeAdapter (v3.1). Legacy: runner === 'flock-rpc'
+  // maps to 'pi'; bare command 'bash' maps to 'bash'.
+  runtime?: string;
   modelFlag?: string;
   args?: string[];
   env?: Record<string, string>;
-  // pi RPC bridge: enable the pane-hosted runner (typed ready/busy/exit,
-  // delivery ack, session identity). Absent = plain window (bash, ...).
+  // pi RPC bridge (legacy selector -> runtime 'pi'): pane-hosted runner
+  // (typed ready/busy/exit, delivery ack, session identity).
   runner?: 'flock-rpc';
-  trust?: 'approve' | 'no-approve';
+  trust?: 'approve' | 'no-approve'; // configured resource trust (floor posture)
   trustOption?: string; // fallback: trust dialog option substring
   trustLevel?: 'off' | 'dev' | 'untrusted' | 'vm'; // sandbox level pre-seeded per pod
+  // v3.1: launch posture — 'full_bypass' forces full resource trust
+  // (OpenRig YOLO semantics). Default 'floor' respects `trust`.
+  launchPosture?: 'floor' | 'full_bypass';
+  // v3.1: permission mode slot (claude/codex style). The pi adapter REJECTS
+  // a set value: pi resource trust is a separate mechanism (trust/posture).
+  permissionMode?: string;
+  // v3.1: startup guidance — managed blocks merged into the pod AGENTS.md
+  // (idempotent, boot-refresh-safe). Content is additive, never replaces.
+  guidance?: { id: string; content: string }[];
+  // v3.1: sent to the agent once, after the ready gate, fresh starts only.
+  firstPrompt?: string;
 }
 
 export const BUILTIN_AGENTS: Record<string, AgentManifest> = {
@@ -75,6 +89,16 @@ export function resolveAgent(id: string | undefined, model?: string | null): Res
   const parts = [m.command, ...(m.args ?? [])];
   if (model && m.modelFlag) parts.push(m.modelFlag, model);
   return { id: m.id, cmd: parts.join(' '), env: { ...(m.env ?? {}) }, manifest: m };
+}
+
+// Which RuntimeAdapter serves this manifest (v3.1). Legacy manifests without
+// an explicit runtime are derived: runner flock-rpc -> pi, bare bash -> bash,
+// anything else -> 'cmd' (raw window, no adapter).
+export function manifestRuntime(m: AgentManifest): string {
+  if (m.runtime) return m.runtime;
+  if (m.runner === 'flock-rpc') return 'pi';
+  if (m.command === 'bash') return 'bash';
+  return 'cmd';
 }
 
 // ── Config projection (flock's analogue of OpenRig's project(), symlinked) ──

@@ -127,8 +127,10 @@ reconciler в лексике run/pod.
   `crashed(signal SIGKILL)` / `crashed(code N)` в runkeeper'е;
 - **доставка с подтверждением**: `pod send` идёт `flockmsg <base64>`
   (одна строка для любого текста), ack — из sidecar, не с экрана;
-- **relaunch с памятью**: `flock pod relaunch <role>` — тот же session
-  (`--session-id <role>`), агент помнит контекст;
+- **relaunch с памятью (честный resume)**: `flock pod relaunch <role>`
+  перезапускает ТОЧНЫЙ persisted session-файл (`--session <file>`);
+  файла нет → retry_fresh с записью в meta, никогда silent fresh;
+  `--fork <role|file>` — форк в новую сессию (новая, не родительская);
 - **изоляция**: per-pod конфиг pi (`PI_CODING_AGENT_DIR`/`SESSION_DIR`,
   симлинки моделей/auth), `--no-context-files` + `--append-system-prompt
   <pod>/AGENTS.md` — home-AGENTS.md (и родительские context-файлы) в под
@@ -140,12 +142,30 @@ reconciler в лексике run/pod.
 ```sh
 ./bin/flock pod spawn dev                  # runner + pi (ready-gate)
 ./bin/flock pod send dev "..."              # flockmsg + sidecar-ack
-./bin/flock pod relaunch dev                # новый run, та же память
+./bin/flock pod relaunch dev                # честный resume: точный session-файл
+./bin/flock pod spawn dev2 --fork dev       # форк сессии dev в новую
 ```
 
-Анатомия: чистый модуль `runner-protocol` (фрейминг, env-allowlist,
-билдеры; hermetic-тест `node dist/core/runner-protocol.test.js`) +
+Анатомия: чистый модуль `runner-protocol` (фрейминг, env-allowlist, билдеры,
+trust/resume/fork-решения; hermetic-тест `npm test`) +
 `runner.js` (child pi, зеркало в панель, sidecar, activity.jsonl).
+
+## RuntimeAdapter + honest resume (этап 3.1)
+
+Запуск рантайма — через 5-методный **RuntimeAdapter** (как у OpenRig):
+`listInstalled / project / deliverStartup / launchHarness / checkReady`.
+pi — RPC-мост с typed session identity; bash — plain window. Новый рантайм
+= адаптер + manifest (`runtime` в JSON).
+
+- **launch posture**: `pod spawn --posture full_bypass` форсирует полный
+  resource trust; `floor` уважает `trust` из manifest.
+  `permissionMode` — слот; pi его отклоняет (trust — отдельный механизм);
+- **startup-контекст**: manifest `guidance[]` — managed blocks в
+  `<pod>/AGENTS.md` (идемпотентный merge, до запуска); `firstPrompt` —
+  первый промпт после ready (только fresh);
+- **checkReady**: live-готовность в `/api/pods` (`ready.reason`);
+  sidecar «ready» при панели на shell = stale (`stale_ready`);
+- **listInstalled**: нет бинарного рантайма — чистая ошибка на spawn.
 
 ## Этап 0 (готово)
 

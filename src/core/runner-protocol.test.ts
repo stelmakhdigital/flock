@@ -55,10 +55,16 @@ assert.ok(!fresh.includes('--session') && !fresh.includes('--fork'));
 const resume = buildPiChildArgs({ sessionsDir: '/s', role: 'dev', trust: 'no-approve', sessionFile: '/s/f.jsonl' });
 assert.strictEqual(resume[resume.indexOf('--session') + 1], '/s/f.jsonl');
 assert.ok(resume.includes('--no-approve'));
+assert.ok(!resume.includes('--session-id')); // pi 1.0.0: incompatible (verified live)
+assert.ok(!resume.includes('--fork'));
 
 const fork = buildPiChildArgs({ sessionsDir: '/s', role: 'rev', trust: 'approve', forkRef: '/s/parent.jsonl' });
 assert.strictEqual(fork[fork.indexOf('--fork') + 1], '/s/parent.jsonl');
-assert.strictEqual(fork[fork.indexOf('--session-id') + 1], 'rev');
+assert.ok(!fork.includes('--session-id')); // fork yields a NEW session (uuid)
+assert.ok(!fork.includes('--session'));
+
+const fresh2 = buildPiChildArgs({ sessionsDir: '/s', role: 'x', trust: 'approve' });
+assert.strictEqual(fresh2[fresh2.indexOf('--session-id') + 1], 'x');
 
 // runner command: shell-quoted, launchId present
 const cmd = buildRunnerCommand({

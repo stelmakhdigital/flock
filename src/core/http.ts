@@ -6,6 +6,8 @@ import { createAdaptorServer } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
+import { resolveAgent, manifestRuntime } from './agent.js';
+import { getAdapter, type AdapterEnv } from './runtime-adapter.js';
 import { apply, OpError, type CoreCtx } from './ops.js';
 
 const safeJson = (s: string): unknown => {
@@ -43,12 +45,34 @@ export function createHttp(ctx: CoreCtx) {
     });
   });
 
-  app.get('/api/pods', (c) => {
-    // pods + typed runner state (sidecar) + runs with meta parsed
-    const pods = store.listPods(ctx.store).map((p) => ({
-      ...p,
-      runner: p.state === 'live' ? terminal.readRunnerState(ctx.store.home, p.role) : null,
-    }));
+  app.get('/api/pods', async (c) => {
+    // pods + typed runner state (sidecar) + checkReady (live: sidecar +
+    // foreground-pane guard) + runs with meta parsed
+    const adapterEnv: AdapterEnv = {
+      home: ctx.store.home,
+      token: ctx.store.token,
+      runnerPath: path.join(import.meta.dirname, 'runner.js'),
+    };
+    const pods = (await Promise.all(
+      store.listPods(ctx.store).map(async (p) => {
+        const row: (store.Pod & { runner: unknown; ready?: unknown }) & Record<string, unknown> = {
+          ...p,
+          runner: p.state === 'live' ? terminal.readRunnerState(ctx.store.home, p.role) : null,
+        };
+        if (p.state === 'live' && p.agent && p.agent !== 'cmd') {
+          const resolved = resolveAgent(p.agent, null);
+          if (resolved && manifestRuntime(resolved.manifest) !== 'cmd') {
+            const adapter = getAdapter(resolved.manifest, adapterEnv);
+            if (adapter) {
+              row.ready = await adapter
+                .checkReady({ role: p.role, cwd: p.dir })
+                .catch(() => ({ ready: false, reason: 'check failed' }));
+            }
+          }
+        }
+        return row;
+      }),
+    )) as (store.Pod & { runner: unknown; ready?: unknown })[];
     const runs = store.listRuns(ctx.store).map((r) => ({
       ...r,
       meta: r.meta ? safeJson(r.meta) : null,

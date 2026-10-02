@@ -149,15 +149,19 @@ export interface PiChildArgs {
 }
 
 // argv for the `pi --mode rpc` child the RUNNER spawns (no shell).
-// - --session-id <role>: deterministic session per pod; relaunch = memory.
+// - fresh: --session-id <role> — deterministic session per pod; relaunch =
+//   memory.
+// - resume (--session <file>) and fork (--fork <ref>) are MUTUALLY
+//   INCOMPATIBLE with --session-id in pi 1.0.0 (verified live: "Error:
+//   --session-id cannot be combined with --session"). The file/fork decides
+//   the session; fork yields a NEW session file (uuid), resume keeps the
+//   exact file — never an interactive picker.
 // - --no-context-files + --append-system-prompt <pod AGENTS.md>: full
 //   isolation from ancestor/home context files (improvement over OpenRig).
-// - Exact-file resume NEVER goes through an interactive picker.
 export function buildPiChildArgs(o: PiChildArgs): string[] {
   const args = [
     '--mode', 'rpc',
     '--session-dir', o.sessionsDir,
-    '--session-id', o.role,
     o.trust === 'approve' ? '--approve' : '--no-approve',
     '--no-context-files',
   ];
@@ -165,5 +169,82 @@ export function buildPiChildArgs(o: PiChildArgs): string[] {
   if (o.model) args.push('--model', o.model);
   if (o.sessionFile) args.push('--session', o.sessionFile);
   else if (o.forkRef) args.push('--fork', o.forkRef);
+  else args.push('--session-id', o.role);
   return args;
+}
+
+// ── Launch posture + resource trust ─────────────────────────────────────────
+// pi --approve/--no-approve governs RESOURCE TRUST (context files), not a
+// permission policy (that distinction is OpenRig's, we keep it). The resolved
+// launch posture is authoritative: full_bypass forces full resource trust
+// (their YOLO semantics); floor respects the configured value.
+export type LaunchPosture = 'floor' | 'full_bypass';
+
+export function resolveTrust(
+  configured: 'approve' | 'no-approve' | undefined,
+  posture: LaunchPosture | undefined,
+): 'approve' | 'no-approve' {
+  if (posture === 'full_bypass') return 'approve';
+  // flock default: managed, per-pod-isolated pods -> approve (OpenRig's seat
+  // default is no-approve; ours are sandboxes, not user projects).
+  return configured ?? 'approve';
+}
+
+// ── Resume token = the persisted pi session file ────────────────────────────
+// HONEST resume (OpenRig BR-6): relaunch with the exact file, never an
+// interactive picker. A missing file is retry_fresh — the caller decides,
+// never a silent fresh start.
+const MAX_RESUME_TOKEN_LEN = 512;
+const RESUME_TOKEN_CHARSET = /^[A-Za-z0-9._@/-]+$/;
+
+export type ResumeTokenCheck = { ok: true; token: string } | { ok: false; error: string };
+
+export function validateResumeToken(raw: unknown): ResumeTokenCheck {
+  if (typeof raw !== 'string') return { ok: false, error: 'resume token is missing or not a string' };
+  const token = raw.trim();
+  if (token.length === 0) return { ok: false, error: 'resume token is empty' };
+  if (token.length > MAX_RESUME_TOKEN_LEN) return { ok: false, error: `resume token too long (max ${MAX_RESUME_TOKEN_LEN})` };
+  if (!token.startsWith('/')) return { ok: false, error: 'resume token must be an absolute path' };
+  if (token.split('/').includes('..')) return { ok: false, error: 'resume token must not contain a ".." segment' };
+  if (!RESUME_TOKEN_CHARSET.test(token)) return { ok: false, error: 'resume token has disallowed characters' };
+  if (!token.endsWith('.jsonl')) return { ok: false, error: 'resume token must end with ".jsonl"' };
+  return { ok: true, token };
+}
+
+// ── Fork source ─────────────────────────────────────────────────────────────
+// v1: kind "native_id" only (parent session file path or session id),
+// as in OpenRig's pi adapter. The captured resumeToken after a fork is the
+// NEW post-fork session, never the parent's (the adapter enforces this).
+export interface ForkSource {
+  kind: 'native_id' | 'artifact_path' | 'name' | 'last';
+  value?: string;
+}
+
+export type LaunchMode =
+  | { mode: 'fresh' }
+  | { mode: 'resume'; sessionFile: string }
+  | { mode: 'fork'; forkRef: string }
+  | { mode: 'error'; error: string; recovery?: 'retry_fresh' };
+
+// The fresh/resume/fork decision — pure, testable. resumeToken and
+// forkSource are mutually exclusive: the adapter refuses, never guesses.
+export function resolveLaunchMode(opts: { resumeToken?: string; forkSource?: ForkSource }): LaunchMode {
+  const { resumeToken, forkSource } = opts;
+  if (resumeToken && forkSource) {
+    return { mode: 'error', error: 'resumeToken and forkSource are mutually exclusive — pick one' };
+  }
+  if (resumeToken) {
+    const v = validateResumeToken(resumeToken);
+    if (!v.ok) return { mode: 'error', error: `pi resume: ${v.error}`, recovery: 'retry_fresh' };
+    return { mode: 'resume', sessionFile: v.token };
+  }
+  if (forkSource) {
+    if (forkSource.kind !== 'native_id') {
+      return { mode: 'error', error: `pi fork: kind "${forkSource.kind}" is not supported in v1; use kind "native_id" with the parent session file path` };
+    }
+    const ref = forkSource.value?.trim();
+    if (!ref) return { mode: 'error', error: 'pi fork: value is required (parent session file path)' };
+    return { mode: 'fork', forkRef: ref };
+  }
+  return { mode: 'fresh' };
 }

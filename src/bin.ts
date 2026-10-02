@@ -26,7 +26,7 @@ const USAGE = `flock — core CLI
 
   flock core up | down | status
   flock healthz
-  flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--cmd c]
+  flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--posture floor|full_bypass] [--cmd c]
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
       pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
   flock pod relaunch <role> [--model M]   # новый агент на том же pod, сессия сохраняется
@@ -163,6 +163,7 @@ async function main(): Promise<void> {
           model: flag(flags, '--model'),
           cmd: flag(flags, '--cmd'),
           fork: flag(flags, '--fork'),
+          posture: flag(flags, '--posture'),
         }));
       } else if (action === 'relaunch') {
         const flags = rest.slice(1);
