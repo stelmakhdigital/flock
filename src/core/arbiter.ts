@@ -1,5 +1,6 @@
 import * as store from './store.js';
 import * as terminal from './terminal.js';
+import { frameMessage } from './runner-protocol.js';
 import { advanceWorkflow } from './ops.js';
 import type { CoreCtx } from './ops.js';
 
@@ -61,14 +62,35 @@ function claimTask(ctx: CoreCtx, role: string, taskId: string): void {
   store.setTaskStatus(ctx.store, taskId, 'active', { reason: 'claimed' });
   const task = store.getTask(ctx.store, taskId)!;
   const pod = store.getPodByRole(ctx.store, role)!;
+  const isRunner = pod.agent === 'pi'; // flock-rpc bridge: typed delivery ack
+  const text = claimPrompt(task);
+  const wire = isRunner ? frameMessage(text) : text;
   // Fire-and-forget the send; the verified send() may retry a few times.
   // If the pod is gone it throws — swallow, the verify pass will block it.
   void terminal
-    .send(pod.terminal_target!, claimPrompt(task))
-    .then((r) => {
+    .send(pod.terminal_target!, wire, isRunner ? { raw: true } : undefined)
+    .then(async (r) => {
       if (!r.delivered) {
         store.setTaskStatus(ctx.store, taskId, 'blocked', { reason: 'delivery not verified' });
         ctx.emit?.({ type: 'task_blocked', taskId, pod: role, reason: 'delivery not verified' });
+        return;
+      }
+      if (isRunner) {
+        // semantic ack: the runner recorded the prompt in its sidecar
+        const deadline = Date.now() + 8000;
+        let acked = false;
+        while (Date.now() < deadline) {
+          const st = terminal.readRunnerState(ctx.store.home, role);
+          if (st?.lastPrompt && st.lastPrompt.text.startsWith(text.slice(0, 200))) {
+            acked = true;
+            break;
+          }
+          await new Promise((res) => setTimeout(res, 300));
+        }
+        if (!acked) {
+          store.setTaskStatus(ctx.store, taskId, 'blocked', { reason: 'runner did not ack prompt (sidecar)' });
+          ctx.emit?.({ type: 'task_blocked', taskId, pod: role, reason: 'no runner ack' });
+        }
       }
     })
     .catch(() => {

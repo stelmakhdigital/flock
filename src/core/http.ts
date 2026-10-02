@@ -1,7 +1,20 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import type { Server } from 'node:http';
 import { Hono } from 'hono';
+import { createAdaptorServer } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import * as store from './store.js';
+import * as terminal from './terminal.js';
 import { apply, OpError, type CoreCtx } from './ops.js';
+
+const safeJson = (s: string): unknown => {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return s;
+  }
+};
 
 export function createHttp(ctx: CoreCtx) {
   const app = new Hono();
@@ -31,7 +44,16 @@ export function createHttp(ctx: CoreCtx) {
   });
 
   app.get('/api/pods', (c) => {
-    return c.json({ pods: store.listPods(ctx.store), runs: store.listRuns(ctx.store) });
+    // pods + typed runner state (sidecar) + runs with meta parsed
+    const pods = store.listPods(ctx.store).map((p) => ({
+      ...p,
+      runner: p.state === 'live' ? terminal.readRunnerState(ctx.store.home, p.role) : null,
+    }));
+    const runs = store.listRuns(ctx.store).map((r) => ({
+      ...r,
+      meta: r.meta ? safeJson(r.meta) : null,
+    }));
+    return c.json({ pods, runs });
   });
 
   app.get('/api/watchdog', (c) => {
@@ -92,4 +114,53 @@ export function createHttp(ctx: CoreCtx) {
   );
 
   return { app, injectWebSocket, emit };
+}
+
+// Per-pod unix socket: <pod dir>/core.sock. The pod dir is the workspace —
+// the only part of $HOME visible to the pi sandbox (bwrap masks /home). A
+// unix socket needs no network namespace, so even an untrusted (no-net)
+// pod can reach the daemon API with its CLI. Same auth (Bearer token).
+const podSockets = new Map<string, Server>();
+
+export function podSocketPath(podDir: string): string {
+  return path.join(podDir, 'core.sock');
+}
+
+export function startPodSocket(ctx: CoreCtx, podDir: string): void {
+  if (podSockets.has(podDir)) return;
+  const sockPath = podSocketPath(podDir);
+  try {
+    fs.rmSync(sockPath, { force: true });
+  } catch {
+    /* stale file is fine, listen() replaces it */
+  }
+  const { app } = createHttp(ctx);
+  const server = createAdaptorServer({ fetch: app.fetch }) as Server;
+  server.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code !== 'EADDRINUSE') console.error(`pod socket ${sockPath}: ${e.message}`);
+  });
+  server.listen(sockPath, () => {
+    try {
+      fs.chmodSync(sockPath, 0o660);
+    } catch {
+      /* best effort */
+    }
+  });
+  podSockets.set(podDir, server);
+}
+
+export function stopPodSocket(podDir: string): void {
+  const server = podSockets.get(podDir);
+  if (!server) return;
+  podSockets.delete(podDir);
+  try {
+    server.close();
+  } catch {
+    /* already gone */
+  }
+  try {
+    fs.rmSync(podSocketPath(podDir), { force: true });
+  } catch {
+    /* best effort */
+  }
 }

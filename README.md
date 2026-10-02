@@ -77,6 +77,76 @@ Auto-registration: core кладёт `flock` в `~/.flock/bin` (на PATH в о�
 
 Архитектура — docs/04-watchdog.md.
 
+## Workflow / runkeeper / адаптеры / multi-flock (этап 2.5)
+
+**Workflow** — именованный последовательный пайплайн шагов; запуск
+(instance) двигает шаги через обычную очередь задач, результат шага
+передаётся в тело следующего.
+
+```sh
+./bin/flock workflow define demo --steps "intake:pm,build:dev,review:rev"
+./bin/flock workflow start demo "payload для всех шагов"
+./bin/flock workflow ls
+./bin/flock workflow status <instance_id>
+```
+
+Шаг done → следующий сам ставится в очередь; blocked/под-лоуст →
+instance останавливается. DAG/зависимости/retry — при первом реальном случае.
+
+**Runkeeper** (тик 5с) — pid агента умер → run `crashed` за один тик
+(«окно живо, агент мёртв»). Это наше название OpenRig seat-identity-
+reconciler в лексике run/pod.
+
+**Агент-адаптеры** — manifest-driven: один generic-реализатор + декларация
+`{id, command, modelFlag?, args?, env?}`. Встроенные: `pi`, `bash`;
+свой рантайм = `<FLOCK_HOME>/agents/<id>.json` (не код):
+
+```sh
+./bin/flock pod spawn dev --agent pi --model <provider/id>
+./bin/flock pod spawn stub --agent bash
+```
+
+**Multi-flock (profiles)** — несколько изолированных инстансов core:
+
+```sh
+./bin/flock -p team2 core up        # свой home ~/.flock/team2, порт, сессия flock-team2
+./bin/flock -p team2 pod spawn dev
+./bin/flock -p team2 task add dev "..."
+```
+
+Порт = 7461 + hash(name) (переопределить `FLOCK_PORT`), tmux-сессия
+`flock-<name>`, БД/token/log — свои. Инстансы не пересекаются.
+
+## flock-rpc runner + изоляция пода (этап 3)
+
+Под с агентом `pi` живёт не голым TUI, а через **runner**: процесс в окне
+запускает `pi --mode rpc`, держит с ним typed JSONL-канал. Всё, что раньше
+гадлось по экрану, теперь — события:
+
+- **готовность и exit**: spawn ждёт typed ready (sidecar), смерть агента —
+  `crashed(signal SIGKILL)` / `crashed(code N)` в runkeeper'е;
+- **доставка с подтверждением**: `pod send` идёт `flockmsg <base64>`
+  (одна строка для любого текста), ack — из sidecar, не с экрана;
+- **relaunch с памятью**: `flock pod relaunch <role>` — тот же session
+  (`--session-id <role>`), агент помнит контекст;
+- **изоляция**: per-pod конфиг pi (`PI_CODING_AGENT_DIR`/`SESSION_DIR`,
+  симлинки моделей/auth), `--no-context-files` + `--append-system-prompt
+  <pod>/AGENTS.md` — home-AGENTS.md (и родительские context-файлы) в под
+  не попадают; per-pod sandbox-trust (уровень из manifest `trustLevel`);
+- **CLI в песочнице**: per-pod unix-сокет `<pod>/core.sock` + снапшот CLI
+  в `<pod>/.flock-cli/` — агент в bwrap-песочнице завершает задачи
+  `flock task done` без сети и без видимого home.
+
+```sh
+./bin/flock pod spawn dev                  # runner + pi (ready-gate)
+./bin/flock pod send dev "..."              # flockmsg + sidecar-ack
+./bin/flock pod relaunch dev                # новый run, та же память
+```
+
+Анатомия: чистый модуль `runner-protocol` (фрейминг, env-allowlist,
+билдеры; hermetic-тест `node dist/core/runner-protocol.test.js`) +
+`runner.js` (child pi, зеркало в панель, sidecar, activity.jsonl).
+
 ## Этап 0 (готово)
 
 core: HTTP+WS (Hono, bearer), node:sqlite с миграциями, единый путь мутаций

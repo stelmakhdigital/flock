@@ -1,3 +1,4 @@
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { coreUp, coreDown, coreStatus, healthz, readToken } from './core/up.js';
@@ -25,8 +26,10 @@ const USAGE = `flock — core CLI
 
   flock core up | down | status
   flock healthz
-  flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--cmd c]
+  flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--cmd c]
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
+      pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
+  flock pod relaunch <role> [--model M]   # новый агент на том же pod, сессия сохраняется
   flock pod status [role]
   flock pod send <role> <text...>
   flock pod capture <role> [--lines N]
@@ -57,16 +60,55 @@ const [, , cmd, sub, ...rest] = process.argv;
 
 const port = () => Number(process.env.FLOCK_PORT ?? 7460);
 
-async function api(method: 'GET' | 'POST', path: string, body?: unknown): Promise<any> {
-  const token = readToken();
-  const res = await fetch(`http://127.0.0.1:${port()}${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${token ?? ''}`,
-      'content-type': 'application/json',
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
+// Pod CLI shim (inside the workspace): the daemon also listens on a per-pod
+// unix socket (<pod dir>/core.sock) — visible inside the pi sandbox, needs no
+// network (untrusted level blocks TCP, a unix socket is a file, not a route).
+const POD_SOCKET = process.env.FLOCK_SOCKET;
+
+function unixRequest(socketPath: string, method: string, path: string, token: string, payload?: string): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        socketPath,
+        path,
+        method,
+        headers: {
+          authorization: `Bearer ${token ?? ''}`,
+          'content-type': 'application/json',
+          ...(payload ? { 'content-length': Buffer.byteLength(payload) } : {}),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () =>
+          resolve(
+            new Response(Buffer.concat(chunks), {
+              status: res.statusCode ?? 0,
+              headers: { 'content-type': 'application/json' },
+            }),
+          ),
+        );
+      },
+    );
+    req.on('error', reject);
+    if (payload) req.write(payload);
+    req.end();
   });
+}
+
+async function api(method: 'GET' | 'POST', path: string, body?: unknown): Promise<any> {
+  const token = process.env.FLOCK_TOKEN ?? readToken();
+  const res = POD_SOCKET
+    ? await unixRequest(POD_SOCKET, method, path, token ?? '', body === undefined ? undefined : JSON.stringify(body))
+    : await fetch(`http://127.0.0.1:${port()}${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${token ?? ''}`,
+          'content-type': 'application/json',
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
   const data = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 401) {
@@ -118,8 +160,13 @@ async function main(): Promise<void> {
           role,
           dir: flag(flags, '--dir'),
           agent: flag(flags, '--agent'),
+          model: flag(flags, '--model'),
           cmd: flag(flags, '--cmd'),
+          fork: flag(flags, '--fork'),
         }));
+      } else if (action === 'relaunch') {
+        const flags = rest.slice(1);
+        print(await api('POST', '/api/ops', { type: 'pod_relaunch', role, model: flag(flags, '--model') }));
       } else if (action === 'status') {
         const data = await api('GET', '/api/pods');
         const pods = rest[1] ? data.pods.filter((p: { role: string }) => p.role === rest[1]) : data.pods;

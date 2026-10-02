@@ -3,8 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { serve } from '@hono/node-server';
 import { openStore, crashStaleRuns, listPods, currentRun, endRun } from './store.js';
+import { readRunnerState } from './terminal.js';
 import { Ticks } from './ticks.js';
-import { createHttp } from './http.js';
+import { createHttp, startPodSocket } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
 import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
 import { writePodAgentsMd } from './ops.js';
@@ -57,11 +58,38 @@ ticks.register('arbiter', ARBITER_INTERVAL_MS, () => runArbiterTick(ctx));
 // runkeeper (5s): the agent process is dead -> mark the run crashed fast.
 // Fast detection layer for "window alive, agent dead" (OpenRig's
 // seat-identity reconciler, in our naming: run = the live occupant).
+// runkeeper (5s): the agent process is dead -> mark the run crashed fast.
+// Two signals: (1) typed — the runner sidecar records the pi exit code,
+// launchId-scoped; (2) pid liveness — covers non-runner pods and pane death.
+function runLaunchId(run: { meta: string }): string | null {
+  try {
+    const arr = JSON.parse(run.meta || '[]');
+    if (!Array.isArray(arr)) return null;
+    const created = arr.find((e: unknown) => (e as { kind?: string })?.kind === 'created');
+    return created && typeof (created as { launchId?: string }).launchId === 'string' ? (created as { launchId: string }).launchId : null;
+  } catch {
+    return null;
+  }
+}
+
 function checkRunLiveness(): void {
   for (const pod of listPods(store)) {
     if (pod.state !== 'live') continue;
     const run = currentRun(store, pod.role);
-    if (!run || run.ended_at || !run.pid) continue;
+    if (!run || run.ended_at) continue;
+    // 1) typed: sidecar exit (only when it belongs to THIS run's launch)
+    const launchId = runLaunchId(run);
+    const st = readRunnerState(store.home, pod.role);
+    if (launchId && st?.exited && st.launchId === launchId) {
+      const ex = st.exited;
+      const state = ex.code === 0 && !ex.signal ? 'clean' : `crashed(${ex.signal ? `signal ${ex.signal}` : `code ${ex.code}`})`;
+      endRun(store, run.id, state);
+      console.log(`[core] runkeeper: run ${run.id} (pod ${pod.role}) ${state} [sidecar]`);
+      ctx.emit?.({ type: 'run_ended', pod: pod.role, run: run.id, state });
+      continue;
+    }
+    // 2) pid liveness (runner pod: pane pid; non-runner: agent pid)
+    if (!run.pid) continue;
     let alive = true;
     try {
       process.kill(run.pid, 0);
@@ -83,6 +111,10 @@ const pidFile = path.join(FLOCK_HOME, 'core.pid');
 
 const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: FLOCK_PORT }, () => {
   injectWebSocket(server);
+  // pod-local unix sockets (visible to the pi sandbox, no network needed)
+  for (const pod of listPods(store)) {
+    if (pod.state === 'live') startPodSocket(ctx, pod.dir);
+  }
   fs.writeFileSync(pidFile, String(process.pid));
   console.log(`[core] listening http://127.0.0.1:${FLOCK_PORT} pid=${process.pid} home=${FLOCK_HOME}`);
 });

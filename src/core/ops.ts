@@ -2,7 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
-import { resolveAgent, loadAgents } from './agent.js';
+import { resolveAgent, loadAgents, projectPodConfig, userPiAgentDir, firstUserModel, installPodCli, type AgentManifest } from './agent.js';
+import { startPodSocket, stopPodSocket } from './http.js';
+import { seatPaths, buildRunnerCommand, frameMessage } from './runner-protocol.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import type { Ticks } from './ticks.js';
 
@@ -50,6 +52,8 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
   switch (t) {
     case 'pod_spawn':
       return podSpawn(o, ctx);
+    case 'pod_relaunch':
+      return podRelaunch(o, ctx);
     case 'pod_send':
       return podSend(o, ctx);
     case 'pod_capture':
@@ -91,6 +95,84 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
   }
 }
 
+// Shared spawn path for pod_spawn and pod_relaunch.
+// pi agent (flock-rpc runner): config isolation + typed ready-wait before
+// the pod row goes live, so the arbiter never claims to an unready pod.
+async function spawnAgent(ctx: CoreCtx, o: { role: string; dir: string; model?: string; agentId?: string; rawCmd?: string; sessionFile?: string; forkRef?: string }): Promise<{ pod: store.Pod; run: store.Run }> {
+  fs.mkdirSync(o.dir, { recursive: true });
+  writePodAgentsMd(o.dir, o.role);
+  let cmd: string;
+  let agentEnv: Record<string, string> = {};
+  let agentStored: string;
+  let manifest: AgentManifest | null = null;
+  let launchId: string | null = null;
+  let model = o.model ?? null;
+
+  if (o.rawCmd) {
+    cmd = o.rawCmd;
+    agentStored = 'cmd';
+  } else {
+    const agentId = o.agentId ?? 'pi';
+    const r = resolveAgent(agentId, null);
+    if (!r) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
+    manifest = r.manifest;
+    agentEnv = r.env;
+    agentStored = r.id;
+    if (manifest.runner === 'flock-rpc') {
+      if (!model) model = firstUserModel();
+      launchId = store.newId('la');
+      const paths = seatPaths(ctx.store.home, o.role);
+      fs.mkdirSync(paths.agentDir, { recursive: true });
+      fs.mkdirSync(paths.sessionsDir, { recursive: true });
+      projectPodConfig(userPiAgentDir(), paths.agentDir);
+      installPodCli(o.dir, ctx.store.token);
+      cmd = buildRunnerCommand({
+        runnerPath: path.join(import.meta.dirname, 'runner.js'),
+        stateRoot: ctx.store.home,
+        role: o.role,
+        cwd: o.dir,
+        launchId,
+        trust: manifest.trust ?? 'approve',
+        trustOption: manifest.trustOption,
+        trustLevel: manifest.trustLevel,
+        model: model ?? undefined,
+        sessionFile: o.sessionFile,
+        forkRef: o.forkRef,
+      });
+    } else {
+      cmd = resolveAgent(agentId, o.model ?? null)!.cmd;
+    }
+  }
+
+  const { target, pid } = await terminal.spawnPod({ role: o.role, dir: o.dir, cmd, env: agentEnv });
+  const runMeta: Record<string, unknown> = {};
+  if (launchId) {
+    const ready = await terminal.waitForRunnerReady(ctx.store.home, o.role, launchId, 25000);
+    if (!ready.ok) {
+      await terminal.killWindow(o.role).catch(() => {});
+      if (ready.reason === 'exited') {
+        throw new OpError(500, `agent exited during launch (code ${ready.code ?? '?'}) — check ${path.join(o.dir, '.pi')}`);
+      }
+      throw new OpError(500, `agent did not report ready in 25s${ready.detail ? ` (${ready.detail})` : ''} — check pane ${target}`);
+    }
+    runMeta.launchId = launchId;
+    if (ready.state.sessionFile) runMeta.sessionFile = ready.state.sessionFile;
+    if (ready.state.sessionId) runMeta.sessionId = ready.state.sessionId;
+  }
+  store.openPod(ctx.store, {
+    id: store.newId('pod'),
+    role: o.role,
+    dir: o.dir,
+    terminalTarget: target,
+    model,
+    agent: agentStored,
+  });
+  const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: o.role, pid, meta: runMeta });
+  startPodSocket(ctx, o.dir); // pod-local API socket (sandbox-visible)
+  ctx.emit?.({ type: 'pod_spawned', role: o.role, target, run: run.id });
+  return { pod: store.getPodByRole(ctx.store, o.role)!, run };
+}
+
 async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const existing = store.getPodByRole(ctx.store, role);
@@ -98,34 +180,52 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
     throw new OpError(409, `pod ${role} already ${existing.state}`);
   }
   const dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
-  fs.mkdirSync(dir, { recursive: true });
-  writePodAgentsMd(dir, role);
-  // agent adapter: manifest registry (builtins + <home>/agents/*.json) or raw --cmd
-  let cmd: string;
-  let agentEnv: Record<string, string> = {};
-  let agentStored = 'cmd';
-  if (op.cmd) {
-    cmd = String(op.cmd);
-  } else {
-    const agentId = op.agent ? String(op.agent) : 'pi';
-    const r = resolveAgent(agentId, op.model ? String(op.model) : null);
-    if (!r) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
-    cmd = r.cmd;
-    agentEnv = r.env;
-    agentStored = r.id;
-  }
-  const { target, pid } = await terminal.spawnPod({ role, dir, cmd, env: agentEnv });
-  store.openPod(ctx.store, {
-    id: store.newId('pod'),
+  const { pod, run } = await spawnAgent(ctx, {
     role,
     dir,
-    terminalTarget: target,
-    model: op.model ? String(op.model) : null,
-    agent: agentStored,
+    model: op.model ? String(op.model) : undefined,
+    agentId: op.agent ? String(op.agent) : undefined,
+    rawCmd: op.cmd ? String(op.cmd) : undefined,
+    forkRef: op.fork ? resolveForkRef(ctx, String(op.fork)) : undefined,
   });
-  const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: role, pid });
-  ctx.emit?.({ type: 'pod_spawned', role, target, run: run.id });
-  return { pod: store.getPodByRole(ctx.store, role), run };
+  return { pod, run };
+}
+
+// relaunch: agent dies (or operator wants a fresh one) -> new run on the same
+// pod. pi: session-id == role, so memory is preserved (that's the point).
+async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod) throw new OpError(404, `no pod: ${role}`);
+  if (pod.agent === 'cmd') throw new OpError(400, `relaunch not supported for raw-cmd pods (cmd is not stored)`);
+  const run = store.currentRun(ctx.store, role);
+  if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'replaced');
+  await terminal.killWindow(role).catch(() => {});
+  const res = await spawnAgent(ctx, {
+    role,
+    dir: pod.dir,
+    model: op.model ? String(op.model) : pod.model ?? undefined,
+    agentId: pod.agent ?? undefined,
+  });
+  ctx.emit?.({ type: 'pod_relaunched', role, run: res.run.id });
+  return { pod: res.pod, run: res.run, resumed: pod.agent === 'pi' };
+}
+
+// --fork <role|path>: role -> that pod's current session file (session-id is
+// in the filename); path is used as-is.
+function resolveForkRef(ctx: CoreCtx, ref: string): string {
+  if (ref.includes('/') || ref.includes('\\')) return ref;
+  const pod = store.getPodByRole(ctx.store, ref);
+  if (!pod) throw new OpError(404, `no pod to fork from: ${ref}`);
+  const dir = path.join(pod.dir, '.pi', 'sessions');
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith(`_${ref}.jsonl`)).sort();
+  } catch {
+    /* no sessions dir */
+  }
+  if (!files.length) throw new OpError(404, `no session file for pod ${ref}`);
+  return path.join(dir, files[files.length - 1]);
 }
 
 async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
@@ -133,6 +233,33 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const text = String(op.text ?? '');
   if (!text.trim()) throw new OpError(400, 'text required');
   const pod = requireLivePod(ctx, role);
+  if (pod.agent === 'pi') {
+    // runner bridge: framed message + raw paste, verified by the sidecar ack
+    // (the visual probe breaks on long/wrapped lines in a TTY line editor).
+    const wire = frameMessage(text);
+    const res = await terminal.send(pod.terminal_target!, wire, { raw: true });
+    const deadline = Date.now() + 5000;
+    let acked = false;
+    while (Date.now() < deadline) {
+      const st = terminal.readRunnerState(ctx.store.home, pod.role);
+      if (st?.lastPrompt && st.lastPrompt.text.startsWith(text.slice(0, 200))) {
+        acked = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    if (!acked) throw new OpError(504, 'runner did not ack the message (check the pod pane)');
+    const run = store.currentRun(ctx.store, role);
+    if (run && !run.ended_at) {
+      store.appendRunMeta(ctx.store, run.id, {
+        kind: 'sent',
+        bytes: Buffer.byteLength(text),
+        attempts: res.attempts,
+        ack: 'sidecar',
+      });
+    }
+    return { ok: true, attempts: res.attempts, ack: 'sidecar' };
+  }
   const res = await terminal.send(pod.terminal_target!, text);
   if (!res.delivered) {
     throw new OpError(503, `delivery not verified after ${res.attempts} attempts (pod busy or pane gone)`);
@@ -168,6 +295,7 @@ async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   }
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'done');
+  stopPodSocket(pod.dir);
   store.setPodState(ctx.store, role, 'closed');
   ctx.emit?.({ type: 'pod_closed', role });
   return { ok: true };

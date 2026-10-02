@@ -232,11 +232,36 @@ export function setPodState(store: Store, role: string, state: string): void {
 
 // ---------- runs ----------
 
-export function insertRun(store: Store, r: { id: string; podRole: string; pid: number | null }): Run {
+export function insertRun(store: Store, r: { id: string; podRole: string; pid: number | null; meta?: Record<string, unknown> }): Run {
+  const meta =
+    r.meta && Object.keys(r.meta).length
+      ? JSON.stringify([{ ts: nowIso(), kind: 'created', ...r.meta }])
+      : null;
   dbOf(store)
-    .prepare('INSERT INTO runs(id, pod_role, pid, started_at) VALUES (?, ?, ?, ?)')
-    .run(r.id, r.podRole, r.pid, nowIso());
+    .prepare('INSERT INTO runs(id, pod_role, pid, started_at, meta) VALUES (?, ?, ?, ?, ?)')
+    .run(r.id, r.podRole, r.pid, nowIso(), meta);
   return currentRun(store, r.podRole)!;
+}
+
+// Latest session file recorded for a role (any run, most recent first) —
+// used by fork/relaunch bookkeeping.
+export function latestSessionFile(store: Store, role: string): string | null {
+  const rows = dbOf(store)
+    .prepare('SELECT meta FROM runs WHERE pod_role = ? AND meta IS NOT NULL ORDER BY started_at DESC, rowid DESC LIMIT 50')
+    .all(role) as { meta: string }[];
+  for (const row of rows) {
+    try {
+      const arr = JSON.parse(row.meta);
+      if (!Array.isArray(arr)) continue;
+      for (let i = arr.length - 1; i >= 0; i--) {
+        const e = arr[i];
+        if (e && typeof e.sessionFile === 'string') return e.sessionFile;
+      }
+    } catch {
+      /* malformed meta row: skip */
+    }
+  }
+  return null;
 }
 
 export function currentRun(store: Store, role: string): Run | null {

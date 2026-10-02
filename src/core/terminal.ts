@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { seatPaths, parseRunnerState, type RunnerState } from './runner-protocol.js';
 
 // tmux transport: one window per pod.
 // Text delivery = load-buffer + paste-buffer (NOT send-keys with text):
@@ -43,7 +44,10 @@ async function newWindow(name: string, dir: string, cmd: string, role: string, e
   // the agent manifest's env (config isolation etc.).
   const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
   const envPairs: Record<string, string> = {
-    PATH: `${home}/bin:$PATH`,
+    // home bin first (shadows system /usr/bin/flock); <pod>/bin second — it is
+    // the only part of $HOME visible to the pi sandbox (bwrap masks /home),
+    // so the agent's `flock` resolves inside the sandbox too.
+    PATH: `${home}/bin:${dir}/bin:$PATH`,
     FLOCK_HOME: home,
     FLOCK_PORT: process.env.FLOCK_PORT ?? '7460',
     FLOCK_POD_ROLE: role,
@@ -117,6 +121,36 @@ export async function paneAlive(role: string): Promise<boolean> {
   return r.code === 0 && r.out.trim() === '0';
 }
 
+// Typed pod state from the runner sidecar (never screen-scraped).
+export function readRunnerState(stateRoot: string, role: string): RunnerState | null {
+  try {
+    return parseRunnerState(fs.readFileSync(seatPaths(stateRoot, role).runnerStatePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// Poll the sidecar until this launch reports ready (or exits). Used by
+// pod_spawn so the arbiter never claims a task to an unready pod.
+export async function waitForRunnerReady(
+  stateRoot: string,
+  role: string,
+  launchId: string,
+  timeoutMs = 20000,
+): Promise<{ ok: true; state: RunnerState } | { ok: false; reason: 'exited' | 'timeout'; code?: number | null; detail?: string }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const st = readRunnerState(stateRoot, role);
+    if (st && st.launchId === launchId) {
+      if (st.exited) return { ok: false, reason: 'exited', code: st.exited.code };
+      if (st.ready) return { ok: true, state: st };
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  const st = readRunnerState(stateRoot, role);
+  return { ok: false, reason: 'timeout', detail: st ? `sidecar: ${JSON.stringify(st).slice(0, 200)}` : 'no sidecar' };
+}
+
 const bufName = () => `flock_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
 export async function paste(target: string, text: string): Promise<void> {
@@ -155,8 +189,16 @@ export async function capture(target: string, lines = 200): Promise<string> {
 export async function send(
   target: string,
   text: string,
-  opts?: { attempts?: number; waitMs?: number; lines?: number },
+  opts?: { attempts?: number; waitMs?: number; lines?: number; raw?: boolean },
 ): Promise<{ delivered: boolean; attempts: number }> {
+  // raw: paste + Enter without visual verification — for runner pods, where
+  // the typed sidecar ack is the real verification (the visual probe breaks
+  // on long/wrapped lines: the TTY line editor clears its input after Enter).
+  if (opts?.raw) {
+    await paste(target, text);
+    await sendEnter(target);
+    return { delivered: true, attempts: 1 };
+  }
   const attempts = opts?.attempts ?? 3;
   const waitMs = opts?.waitMs ?? 1500;
   const lines = opts?.lines ?? 100;
