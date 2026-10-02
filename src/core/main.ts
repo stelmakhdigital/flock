@@ -8,6 +8,7 @@ import { Ticks } from './ticks.js';
 import { createHttp, startPodSocket } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
 import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
+import { runHealthTick } from './health.js';
 import { writePodAgentsMd } from './ops.js';
 import type { CoreCtx } from './ops.js';
 
@@ -55,6 +56,8 @@ const { app, injectWebSocket, emit } = createHttp(ctx);
 ctx.emit = emit;
 // stage 1: arbiter — claim/verify/handoff of the task queue
 ticks.register('arbiter', ARBITER_INTERVAL_MS, () => runArbiterTick(ctx));
+// stage 4.1: built-in pod health (gate/idle wake-ladder, 20s)
+ticks.register('health', 20_000, () => runHealthTick(ctx));
 // runkeeper (5s): the agent process is dead -> mark the run crashed fast.
 // Fast detection layer for "window alive, agent dead" (OpenRig's
 // seat-identity reconciler, in our naming: run = the live occupant).

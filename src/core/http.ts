@@ -9,6 +9,7 @@ import * as terminal from './terminal.js';
 import { resolveAgent, manifestRuntime } from './agent.js';
 import { getAdapter, type AdapterEnv } from './runtime-adapter.js';
 import { apply, OpError, type CoreCtx } from './ops.js';
+import { listAlerts, healthOptsFromEnv } from './health.js';
 
 const safeJson = (s: string): unknown => {
   try {
@@ -78,6 +79,11 @@ export function createHttp(ctx: CoreCtx) {
       meta: r.meta ? safeJson(r.meta) : null,
     }));
     return c.json({ pods, runs });
+  });
+
+  app.get('/api/health', (c) => {
+    const alerts = listAlerts(ctx);
+    return c.json({ alerts, opts: healthOptsFromEnv() });
   });
 
   app.get('/api/watchdog', (c) => {

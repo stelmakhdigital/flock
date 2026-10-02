@@ -11,6 +11,9 @@ import {
   buildRunnerCommand,
   buildPiChildArgs,
   buildWindowLaunchCmd,
+  parseAnswerLine,
+  dialogResponse,
+  type PendingDialog,
 } from './runner-protocol.js';
 
 // frame round-trip (multi-line, unicode)
@@ -98,5 +101,25 @@ assert.ok(wlc.includes('FLOCK_PORT="7461"'));
 assert.ok(wlc.includes('FLOCK_POD_ROLE="dev"'));
 assert.ok(wlc.includes('PI_CODING_AGENT_DIR="/h/pods/dev/.pi/agent"'));
 assert.ok(wlc.endsWith('node /d/runner.js --x'));
+
+// operator answers for extension dialogs (permission gates)
+assert.deepStrictEqual(parseAnswerLine('/answer'), { kind: 'index', n: 1 });
+assert.deepStrictEqual(parseAnswerLine('/answer 2'), { kind: 'index', n: 2 });
+assert.deepStrictEqual(parseAnswerLine('/answer run'), { kind: 'value', v: 'run' });
+assert.strictEqual(parseAnswerLine('hello'), null);
+assert.strictEqual(parseAnswerLine('/answer2'), null);
+
+const sel: PendingDialog = { id: 'd1', index: 1, method: 'select', title: 't', options: ['Выполнить', 'Отменить'], at: 't' };
+assert.deepStrictEqual(dialogResponse(sel, { kind: 'index', n: 1 }), { value: 'Выполнить' });
+assert.deepStrictEqual(dialogResponse(sel, { kind: 'value', v: 'отменить' }), { value: 'Отменить' });
+assert.strictEqual(dialogResponse(sel, { kind: 'index', n: 9 }), null);
+assert.strictEqual(dialogResponse(sel, { kind: 'value', v: 'нет такого' }), null);
+const conf: PendingDialog = { id: 'd2', index: 2, method: 'confirm', title: 't', at: 't' };
+assert.deepStrictEqual(dialogResponse(conf, { kind: 'index', n: 1 }), { confirmed: true });
+assert.deepStrictEqual(dialogResponse(conf, { kind: 'index', n: 2 }), { confirmed: false });
+assert.deepStrictEqual(dialogResponse(conf, { kind: 'value', v: 'yes' }), { confirmed: true });
+assert.deepStrictEqual(dialogResponse(conf, { kind: 'value', v: 'no' }), { confirmed: false });
+const inp: PendingDialog = { id: 'd3', index: 3, method: 'input', title: 't', at: 't' };
+assert.deepStrictEqual(dialogResponse(inp, { kind: 'value', v: 'текст' }), { value: 'текст' });
 
 console.log('runner-protocol: all checks passed');

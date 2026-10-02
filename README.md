@@ -135,6 +135,10 @@ reconciler в лексике run/pod.
   relaunch = typed stop старого runner'а (C-c → sidecar `exited`) + новая
   команда в то же окно; скроллбек живёт через агентов, pane_pid неизменен;
   runkeeper детектит нетипизированную смерть: `runner gone (pane at shell)`;
+- **здоровье подов** (этап 4.1): built-in health-чеки поверх typed-сигналов —
+  **gate** (dialog ждёт человека: `flock pod answer <role> <n|текст>`) и
+  **idle** (агент на паузе с active-задачей: nudge → `task needs`);
+  `flock health ls` / `/api/health`, алерты в `health_alerts`;
 - **изоляция**: per-pod конфиг pi (`PI_CODING_AGENT_DIR`/`SESSION_DIR`,
   симлинки моделей/auth), `--no-context-files` + `--append-system-prompt
   <pod>/AGENTS.md` — home-AGENTS.md (и родительские context-файлы) в под

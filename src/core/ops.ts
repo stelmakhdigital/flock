@@ -7,6 +7,7 @@ import { startPodSocket, stopPodSocket } from './http.js';
 import { seatPaths, frameMessage } from './runner-protocol.js';
 import { getAdapter, mergeManagedBlock, type PodBinding, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
+import { listAlerts } from './health.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -57,6 +58,8 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return podRelaunch(o, ctx);
     case 'pod_send':
       return podSend(o, ctx);
+    case 'pod_answer':
+      return podAnswer(o, ctx);
     case 'pod_capture':
       return podCapture(o, ctx);
     case 'pod_close':
@@ -89,6 +92,8 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return taskReport(o, ctx, 'blocked');
     case 'task_needs':
       return taskReport(o, ctx, 'needs');
+    case 'health_list':
+      return { alerts: listAlerts(ctx) };
     case 'terminal_check':
       return terminalCheck(ctx);
     default:
@@ -331,6 +336,26 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
     });
   }
   ctx.emit?.({ type: 'pod_sent', role, bytes: Buffer.byteLength(text), attempts: res.attempts });
+  return { ok: true, attempts: res.attempts };
+}
+
+// Answer a pending extension dialog (permission gate) in a pi pod.
+// The pane is a text mirror — the operator's answer travels as a `/answer`
+// line the runner translates into an extension_ui_response for the pending
+// dialog (stage 4.1). Delivery is fire-and-log: the dialog either resolves
+// (activity ext_dialog_answered) or the runner explains why not (pane line).
+async function podAnswer(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const arg = String(op.arg ?? '1').trim();
+  if (!arg) throw new OpError(400, 'arg required (option number or value)');
+  const pod = requireLivePod(ctx, role);
+  if (pod.agent !== 'pi') throw new OpError(400, `pod_answer is for pi pods (this is: ${pod.agent ?? 'unknown'})`);
+  const res = await terminal.send(pod.terminal_target!, `/answer ${arg}`, { raw: true });
+  const run = store.currentRun(ctx.store, role);
+  if (run && !run.ended_at) {
+    store.appendRunMeta(ctx.store, run.id, { kind: 'dialog_answer', arg: arg.slice(0, 200), attempts: res.attempts });
+  }
+  ctx.emit?.({ type: 'pod_dialog_answered', role, arg: arg.slice(0, 200) });
   return { ok: true, attempts: res.attempts };
 }
 

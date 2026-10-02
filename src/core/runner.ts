@@ -22,7 +22,10 @@ import {
   RUNNER_READY_MARKER,
   RUNNER_EXIT_MARKER,
   RUNNER_ERROR_MARKER,
+  parseAnswerLine,
+  dialogResponse,
   type RunnerState,
+  type PendingDialog,
 } from './runner-protocol.js';
 
 interface ParsedArgs {
@@ -90,6 +93,11 @@ export class RunnerCore {
   private exited = false;
   private trustOption: string;
   private lastPrompt: { text: string; at: string } | undefined;
+  // extension dialogs waiting for a client response (select/confirm/input/editor).
+  // pi has no timeout — these block the agent forever until answered (/answer)
+  // or the runner dies. Cap: newest 10.
+  private pendingDialogs: PendingDialog[] = [];
+  private dialogCounter = 0;
 
   constructor(io: RunnerIO, paths: ReturnType<typeof seatPaths>, launchId: string, trustOption = 'untrusted') {
     this.io = io;
@@ -236,8 +244,8 @@ export class RunnerCore {
   }
 
   // Extension dialogs in RPC mode: trust dialog is auto-answered (configurable
-  // option substring, default the strictest); any other dialog is mirrored +
-  // logged (pi auto-resolves on timeout; stage 3 health picks it up).
+  // option substring, default the strictest); any other dialog is tracked +
+  // mirrored + logged and waits for the operator's `/answer` (stage 4.1 gate).
   private handleExtensionUi(record: Record<string, unknown>): void {
     const method = typeof record.method === 'string' ? record.method : '';
     const id = typeof record.id === 'string' ? record.id : '';
@@ -251,18 +259,58 @@ export class RunnerCore {
       this.io.appendActivity({ event: 'ext_ui', method, statusKey: record.statusKey });
       return;
     }
-    this.io.mirrorLine(`[ext] ? ${title.slice(0, 140)}`);
-    if (method === 'select' && /доверя|trust/i.test(title) && id) {
+    if (method === 'select' && /доверя|trust/i.test(title) && id && options.length) {
       const wanted = this.trustOption.toLowerCase();
       const chosen = options.find((o) => o.toLowerCase().includes(wanted)) ?? options[options.length - 1];
-      if (chosen) {
-        this.io.sendRpc({ type: 'extension_ui_response', id, value: chosen });
-        this.io.mirrorLine(`[ext] → ${chosen}`);
-        this.io.appendActivity({ event: 'ext_dialog_trust', title, chosen });
-        return;
-      }
+      this.io.sendRpc({ type: 'extension_ui_response', id, value: chosen });
+      this.io.mirrorLine(`[ext] trust → ${chosen}`);
+      this.io.appendActivity({ event: 'ext_dialog_trust', title, chosen, id });
+      this.io.appendActivity({ event: 'ext_dialog_answered', id, via: 'auto_trust' });
+      return;
     }
-    this.io.appendActivity({ event: 'ext_dialog_unanswered', method, title: title.slice(0, 200) });
+    // unanswered: track + mirror with an answer index
+    this.dialogCounter += 1;
+    const dialog: PendingDialog = {
+      id,
+      index: this.dialogCounter,
+      method: method as PendingDialog['method'],
+      title,
+      ...(options.length ? { options } : {}),
+      at: this.io.now(),
+    };
+    this.pendingDialogs.push(dialog);
+    if (this.pendingDialogs.length > 10) this.pendingDialogs.shift();
+    const optsHint = options.length ? ` [${options.map((o, i) => `${i + 1}) ${o}`).join(' | ')}]` : '';
+    this.io.mirrorLine(`[ext] ? [${dialog.index}] ${title.slice(0, 140)}${optsHint} — ответ: /answer <n|текст>`);
+    this.io.appendActivity({ event: 'ext_dialog_unanswered', id, index: dialog.index, method, title: title.slice(0, 200) });
+  }
+
+  /**
+   * Operator answer for a pending dialog: `/answer 2` | `/answer run` | …
+   * A dialog blocks the agent's turn, so at most one is pending per session;
+   * the target is the newest. For select: n = option number (as mirrored in
+   * the pane) or an option substring; for confirm: 1=yes 2=no or text;
+   * for input/editor: free text.
+   */
+  private handleAnswerLine(block: string): boolean {
+    const arg = parseAnswerLine(block);
+    if (!arg) return false;
+    const open = this.pendingDialogs;
+    if (open.length === 0) {
+      this.io.mirrorLine('[flock-runner] no pending dialog to answer');
+      return true;
+    }
+    const target = open[open.length - 1];
+    const payload = dialogResponse(target, arg);
+    if (!payload) {
+      this.io.mirrorLine(`[flock-runner] no such option for dialog [${target.index}]: ${block}`);
+      return true;
+    }
+    this.io.sendRpc({ type: 'extension_ui_response', id: target.id, ...payload });
+    this.pendingDialogs = this.pendingDialogs.filter((d) => d.id !== target.id);
+    this.io.mirrorLine(`[ext] → dialog [${target.index}] answered by operator: ${JSON.stringify(payload)}`);
+    this.io.appendActivity({ event: 'ext_dialog_answered', id: target.id, via: 'operator', payload });
+    return true;
   }
 
   handleUserBlock(rawBlock: string): void {
@@ -271,6 +319,10 @@ export class RunnerCore {
     if (block === '/abort') {
       this.io.sendRpc({ type: 'abort' });
       this.io.mirrorLine('[flock-runner] abort sent');
+      return;
+    }
+    if (block.startsWith('/answer')) {
+      this.handleAnswerLine(block);
       return;
     }
     if (block.startsWith('/followup ')) {

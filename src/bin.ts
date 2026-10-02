@@ -32,8 +32,10 @@ const USAGE = `flock — core CLI
   flock pod relaunch <role> [--model M]   # новый агент на том же pod, сессия сохраняется
   flock pod status [role]
   flock pod send <role> <text...>
+  flock pod answer <role> <n|текст>   # ответ оператором на dialog (gate) в pi-поде
   flock pod capture <role> [--lines N]
   flock pod close <role>
+  flock health ls                      # built-in health-алерты (gate/idle)
   flock watchdog add --policy <marker|timer|stall|file> --target <role> [opts]
       marker: --text T [--lines N] [--repeat]
       timer:  --after N
@@ -174,6 +176,8 @@ async function main(): Promise<void> {
         print({ pods, runs: data.runs });
       } else if (action === 'send') {
         print(await api('POST', '/api/ops', { type: 'pod_send', role, text: rest.slice(1).join(' ') }));
+      } else if (action === 'answer') {
+        print(await api('POST', '/api/ops', { type: 'pod_answer', role, arg: rest.slice(1).join(' ') }));
       } else if (action === 'capture') {
         const flags = rest.slice(1);
         print(await api('POST', '/api/ops', { type: 'pod_capture', role, lines: numFlag(flags, '--lines', 200) }));
@@ -181,6 +185,15 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'pod_close', role }));
       } else {
         console.log(USAGE);
+      }
+      return;
+    }
+
+    case 'health': {
+      if (sub === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'health_list' }));
+      } else {
+        console.log('usage: flock health ls');
       }
       return;
     }

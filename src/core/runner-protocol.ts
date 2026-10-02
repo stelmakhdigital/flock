@@ -267,3 +267,58 @@ export function resolveLaunchMode(opts: { resumeToken?: string; forkSource?: For
   }
   return { mode: 'fresh' };
 }
+
+// ---------------------------------------------------------------------------
+// Extension dialogs (permission gates) in RPC mode
+//
+// pi RPC mode: blocking dialogs (select/confirm/input/editor) are emitted as
+// extension_ui_request and wait for the client's extension_ui_response —
+// INDEFINITELY when the extension passes no timeout. The pod pane is a text
+// mirror (no TUI), so the operator answers via a pane line: `/answer <arg>`.
+// `custom` dialogs (bash-guard, ask-user-question) are no-ops in RPC mode and
+// never block (pi resolves them to undefined; extensions default to abort).
+
+export interface PendingDialog {
+  id: string;
+  index: number; // 1-based, per runner lifetime
+  method: 'select' | 'confirm' | 'input' | 'editor';
+  title: string;
+  options?: string[]; // select
+  at: string; // ISO — when the request arrived
+}
+
+export type AnswerArg = { kind: 'index'; n: number } | { kind: 'value'; v: string };
+
+/** Parse an operator answer line: `/answer 2` | `/answer run` | `/answer any text`. */
+export function parseAnswerLine(line: string): AnswerArg | null {
+  const m = line.trim().match(/^\/answer(?:\s+(.*))?$/);
+  if (!m) return null;
+  const rest = (m[1] ?? '').trim();
+  if (!rest) return { kind: 'index', n: 1 }; // bare /answer = first option / yes
+  if (/^\d+$/.test(rest)) return { kind: 'index', n: parseInt(rest, 10) };
+  return { kind: 'value', v: rest };
+}
+
+/**
+ * Build the extension_ui_response payload for a pending dialog.
+ * pi response shapes (from rpc-mode parseResponse): select/input/editor carry
+ * {value} (or {cancelled}), confirm carries {confirmed}. Returns null when the
+ * argument does not match (bad index, no such option).
+ */
+export function dialogResponse(dialog: PendingDialog, arg: AnswerArg): { value?: string; confirmed?: boolean } | null {
+  if (dialog.method === 'select') {
+    const opts = dialog.options ?? [];
+    if (arg.kind === 'index') {
+      const o = opts[arg.n - 1];
+      return o !== undefined ? { value: o } : null;
+    }
+    const o = opts.find((x) => x.toLowerCase() === arg.v.toLowerCase());
+    return o !== undefined ? { value: o } : null;
+  }
+  if (dialog.method === 'confirm') {
+    if (arg.kind === 'index') return { confirmed: arg.n === 1 };
+    return { confirmed: !/^(no|нет|abort|cancel)$/i.test(arg.v) };
+  }
+  // input / editor: free text (index form = the value of /n/ is the text itself)
+  return { value: arg.kind === 'value' ? arg.v : '' };
+}

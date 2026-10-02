@@ -158,6 +158,22 @@ CREATE INDEX IF NOT EXISTS tasks_wf_idx ON tasks(workflow_instance_id);
 ALTER TABLE pods ADD COLUMN agent TEXT;
 `,
   },
+  {
+    name: '005_health',
+    sql: `
+CREATE TABLE IF NOT EXISTS health_alerts(
+  pod_role TEXT NOT NULL,
+  kind TEXT NOT NULL, -- gate | idle
+  ref TEXT NOT NULL, -- dialog id | task id
+  state TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  first_at TEXT NOT NULL,
+  last_at TEXT NOT NULL,
+  note TEXT,
+  PRIMARY KEY (pod_role, kind, ref)
+);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
