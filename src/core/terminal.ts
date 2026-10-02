@@ -31,7 +31,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // tmux quirk: without an explicit index, new-window in a clientless session
 // can pick a taken index ("index N in use"). Pick max+1 explicitly.
-async function newWindow(name: string, dir: string, cmd: string): Promise<void> {
+async function newWindow(name: string, dir: string, cmd: string, role: string): Promise<void> {
   const list = await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_index}']);
   const idxs = list.out
     .trim()
@@ -39,7 +39,16 @@ async function newWindow(name: string, dir: string, cmd: string): Promise<void> 
     .map((s) => parseInt(s, 10))
     .filter((n) => Number.isFinite(n));
   const next = (idxs.length ? Math.max(...idxs) : 0) + 1;
-  const r = await tmux(['new-window', '-t', `${TMUX_SESSION}:${next}`, '-n', name, '-c', dir, cmd]);
+  const r = await tmux([
+    'new-window',
+    '-t', `${TMUX_SESSION}:${next}`,
+    '-n', name,
+    '-c', dir,
+    // env wrapper: flock CLI on PATH for the agent (auto-registration,
+    // W2), FLOCK_HOME for state, FLOCK_POD_ROLE so the agent's CLI calls
+    // are attributed to this pod, not to 'cli'.
+    `env PATH="$HOME/.flock/bin:$PATH" FLOCK_HOME="$HOME/.flock" FLOCK_POD_ROLE=${JSON.stringify(role)} ${cmd}`,
+  ]);
   // automatic-rename would rename the window to the running command
   // ("flock-dev" -> "pi"), breaking name addressing: pin it off.
   await tmux(['set-option', '-w', '-t', `${TMUX_SESSION}:${next}`, 'automatic-rename', 'off']);
@@ -77,7 +86,7 @@ export async function spawnPod(o: SpawnOpts): Promise<{ target: string; pid: num
   if (names.includes(winName(o.role))) {
     throw new Error(`pod window already exists: ${winName(o.role)}`);
   }
-  await newWindow(winName(o.role), o.dir, o.cmd ?? 'pi');
+  await newWindow(winName(o.role), o.dir, o.cmd ?? 'pi', o.role);
   await sleep(300);
   const pr = await tmux(['display-message', '-p', '-t', winTarget(o.role), '#{pane_pid}']);
   return { target: winTarget(o.role), pid: pr.code === 0 ? Number(pr.out.trim()) : null };
@@ -119,12 +128,44 @@ export async function capture(target: string, lines = 200): Promise<string> {
   return r.out.replace(/\n+$/, '');
 }
 
+// Reliable delivery: paste + Enter, then VERIFY the text reached the TUI
+// (visible in the transcript or the "Steering" queue). pi TUI queues input
+// typed while a turn is in flight, so pasting is safe even when busy — no
+// long busy-wait (that would block the caller and time out the CLI).
+// ponytail: whitespace-insensitive match — the TUI wraps long lines, which
+// breaks naive substring checks (and false-failures cause duplicate resends).
+// A repeated identical message can still false-positive from scrollback.
+// Upgrade path: per-send nonce in the text.
+export async function send(
+  target: string,
+  text: string,
+  opts?: { attempts?: number; waitMs?: number; lines?: number },
+): Promise<{ delivered: boolean; attempts: number }> {
+  const attempts = opts?.attempts ?? 3;
+  const waitMs = opts?.waitMs ?? 1500;
+  const lines = opts?.lines ?? 100;
+  const norm = (s: string) => s.replace(/\s+/g, '');
+  const probe = norm(text.split('\n').find((l) => l.trim()) ?? '').slice(0, 80);
+  for (let i = 1; i <= attempts; i++) {
+    await paste(target, text);
+    await sendEnter(target);
+    await sleep(waitMs);
+    try {
+      const out = norm(await capture(target, lines));
+      if (!probe || out.includes(probe)) return { delivered: true, attempts: i };
+    } catch {
+      // pane vanished mid-flight; next attempt will surface the error
+    }
+  }
+  return { delivered: false, attempts };
+}
+
 // Transport self-test, isolated from agents: temp bash window, echo roundtrip.
 export async function checkTransport(home: string): Promise<{ ok: boolean; detail: string }> {
   const tag = `FLOCKCHECK_${Date.now().toString(36)}`;
   const target = winTarget('_check');
   await ensureSession();
-  await newWindow(winName('_check'), home, 'bash');
+  await newWindow(winName('_check'), home, 'bash', '_check');
   try {
     await sleep(400);
     await paste(target, `echo ${tag}`);

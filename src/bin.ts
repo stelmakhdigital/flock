@@ -9,10 +9,11 @@ const USAGE = `flock — core CLI (stage 0)
   flock pod send <role> <text...>
   flock pod capture <role> [--lines N]
   flock pod close <role>
-  flock watchdog add --policy <marker|timer|stall> --target <role> [opts]
+  flock watchdog add --policy <marker|timer|stall|file> --target <role> [opts]
       marker: --text T [--lines N] [--repeat]
       timer:  --after N
       stall:  --idle N [--lines N]
+      file:   --path P [--wait-for exists|absent] [--repeat]
       common: [--interval N] [--wake-interval N] [--timeout N]
   flock watchdog ls
   flock watchdog history <id>
@@ -127,8 +128,14 @@ async function main(): Promise<void> {
           const idle = flag(flags, '--idle');
           if (!idle) { console.error('stall: --idle required'); process.exit(1); }
           specObj.idleSeconds = Number(idle);
+        } else if (policy === 'file') {
+          const p = flag(flags, '--path');
+          if (!p) { console.error('file: --path required'); process.exit(1); }
+          specObj.path = p;
+          const wf = flag(flags, '--wait-for');
+          if (wf) specObj.waitFor = wf;
         } else {
-          console.error(`unknown policy: ${policy} (want marker | timer | stall)`);
+          console.error(`unknown policy: ${policy} (want marker | timer | stall | file)`);
           process.exit(1);
         }
         const lines = flag(flags, '--lines');
@@ -142,6 +149,8 @@ async function main(): Promise<void> {
           spec: specObj,
           intervalSeconds: numFlag(flags, '--interval', 5),
           activeWakeIntervalSeconds: flag(flags, '--wake-interval') ? Number(flag(flags, '--wake-interval')) : null,
+          // pod-registered job? attribute it to the pod, not to 'cli'
+          ...(process.env.FLOCK_POD_ROLE ? { registeredBy: process.env.FLOCK_POD_ROLE } : {}),
         }));
       } else if (action === 'ls') {
         print(await api('GET', '/api/watchdog'));

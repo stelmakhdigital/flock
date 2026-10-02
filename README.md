@@ -21,23 +21,35 @@ npm run build
 
 Состояние: `~/.flock/` (flock.db, core.pid, core.log, token).
 
-## Watchdog (W1)
+## Watchdog (W1+W2)
 
-Декларативные проверки: кто угодно (CLI/агент) регистрирует job, core
+Декларативные проверки: кто угодно (CLI/агент в pod) регистрирует job, core
 оценивает по расписанию (tick 1с) и будит нужный pod.
 
 ```sh
 ./bin/flock watchdog add --policy timer  --after 30 --target dev
 ./bin/flock watchdog add --policy marker --text "CI:OK" --target dev --repeat
 ./bin/flock watchdog add --policy stall  --idle 120 --target dev --wake-interval 300
+./bin/flock watchdog add --policy file --path ~/build/out.txt --target dev
 ./bin/flock watchdog ls
 ./bin/flock watchdog history <job_id>
 ./bin/flock watchdog cancel <job_id>
 ```
 
 Политики: `marker` (текст в capture pod), `timer` (разбудить через N сек),
-`stall` (экран не меняется N сек). Quiet-period (`--wake-interval`), timeout
-(`--timeout`), история доставок. Архитектура — docs/04-watchdog.md.
+`stall` (экран не меняется N сек), `file` (файл появился/исчез).
+Quiet-period (`--wake-interval`, дефолт 30с/60с для stall), timeout
+(`--timeout`), история доставок.
+
+Доставка надёжная: paste + Enter → **верификация по capture** (белспейс-
+независимая) → ретраи при неуверке. Ввод во время занятого pod не теряется
+(pi TUI его очередь), поэтому отправка не блокирует и не таймаутит.
+
+Auto-registration: core кладёт `flock` в `~/.flock/bin` (на PATH в окне pod),
+поэтому агент сам ставит слежку — job атрибутируется его pod'у
+(`FLOCK_POD_ROLE`).
+
+Архитектура — docs/04-watchdog.md.
 
 ## Этап 0 (готово)
 

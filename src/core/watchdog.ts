@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
 import type { CoreCtx } from './ops.js';
@@ -8,7 +11,7 @@ import type { WatchdogJob } from './store.js';
 // on schedule and wakes the target pod. One runner, one tick, policy registry.
 // (OpenRig-style architecture, see docs/04-watchdog.md.)
 
-export const WATCHDOG_POLICIES = ['marker', 'timer', 'stall'] as const;
+export const WATCHDOG_POLICIES = ['marker', 'timer', 'stall', 'file'] as const;
 export type PolicyName = (typeof WATCHDOG_POLICIES)[number];
 
 interface PolicyResult {
@@ -90,6 +93,24 @@ const policies: Record<PolicyName, Policy> = {
       };
     },
   },
+  file: {
+    // "wait until a file appears (or disappears)" — e.g. CI/build artifact.
+    // Relative paths resolve against the target pod's dir.
+    async evaluate(job, ctx) {
+      const s = specOf<{ path: string; waitFor?: 'exists' | 'absent'; once?: boolean }>(job);
+      const raw = s.path.startsWith('~/') ? path.join(os.homedir(), s.path.slice(2)) : s.path;
+      const pod = store.getPodByRole(ctx.store, job.target_pod);
+      const p = path.isAbsolute(raw) ? raw : path.join(pod?.dir ?? os.homedir(), raw);
+      const want = s.waitFor ?? 'exists';
+      const met = want === 'exists' ? fs.existsSync(p) : !fs.existsSync(p);
+      if (!met) return { action: 'skip', reason: `waiting: ${want} ${p}` };
+      return {
+        action: 'send',
+        message: `file ${want === 'exists' ? 'appeared' : 'disappeared'}: ${p}`,
+        terminalAfterSend: s.once !== false,
+      };
+    },
+  },
 };
 
 export function validateSpec(policy: PolicyName, spec: Record<string, unknown>): string | null {
@@ -99,6 +120,11 @@ export function validateSpec(policy: PolicyName, spec: Record<string, unknown>):
     if (typeof spec.afterSeconds !== 'number' || spec.afterSeconds <= 0) return 'timer: spec.afterSeconds > 0 required';
   } else if (policy === 'stall') {
     if (typeof spec.idleSeconds !== 'number' || spec.idleSeconds <= 0) return 'stall: spec.idleSeconds > 0 required';
+  } else if (policy === 'file') {
+    if (typeof spec.path !== 'string' || !spec.path.trim()) return 'file: spec.path required';
+    if (spec.waitFor !== undefined && spec.waitFor !== 'exists' && spec.waitFor !== 'absent') {
+      return 'file: spec.waitFor must be "exists" or "absent"';
+    }
   }
   return null;
 }
@@ -163,8 +189,16 @@ async function evaluateJob(ctx: CoreCtx, job: WatchdogJob, nowIso: string): Prom
     return;
   }
   const message = formatDeliveryMessage(job, res.message ?? '');
-  await terminal.paste(target, message);
-  await terminal.sendEnter(target);
+  // ponytail: pasting while the pod is busy is safe (pi queues it as Steering);
+  // verification + retry below is what guarantees delivery.
+  const res2 = await terminal.send(target, message);
+  if (!res2.delivered) {
+    // do NOT stamp last_fire_at: next evaluation retries (quiet stays off)
+    updates.last_skip_reason = `delivery unverified after ${res2.attempts} attempts, retrying`;
+    store.watchdogUpdate(ctx.store, job.id, updates);
+    store.addWatchdogHistory(ctx.store, { jobId: job.id, outcome: 'send', deliveryStatus: 'failed', deliveryMessage: message });
+    return;
+  }
   updates.last_fire_at = nowIso;
   updates.last_skip_reason = null;
   store.watchdogUpdate(ctx.store, job.id, updates);

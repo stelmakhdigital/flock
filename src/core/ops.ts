@@ -95,14 +95,20 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const text = String(op.text ?? '');
   if (!text.trim()) throw new OpError(400, 'text required');
   const pod = requireLivePod(ctx, role);
-  await terminal.paste(pod.terminal_target!, text);
-  await terminal.sendEnter(pod.terminal_target!);
+  const res = await terminal.send(pod.terminal_target!, text);
+  if (!res.delivered) {
+    throw new OpError(503, `delivery not verified after ${res.attempts} attempts (pod busy or pane gone)`);
+  }
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) {
-    store.appendRunMeta(ctx.store, run.id, { kind: 'sent', bytes: Buffer.byteLength(text) });
+    store.appendRunMeta(ctx.store, run.id, {
+      kind: 'sent',
+      bytes: Buffer.byteLength(text),
+      attempts: res.attempts,
+    });
   }
-  ctx.emit?.({ type: 'pod_sent', role, bytes: Buffer.byteLength(text) });
-  return { ok: true };
+  ctx.emit?.({ type: 'pod_sent', role, bytes: Buffer.byteLength(text), attempts: res.attempts });
+  return { ok: true, attempts: res.attempts };
 }
 
 async function podCapture(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
@@ -144,7 +150,11 @@ async function watchdogRegister(op: Record<string, unknown>, ctx: CoreCtx): Prom
   const specErr = validateSpec(policy as PolicyName, specObj);
   if (specErr) throw new OpError(400, specErr);
   const intervalSeconds = Math.max(1, Math.min(3600, Number(op.intervalSeconds ?? 5)));
-  const wake = op.activeWakeIntervalSeconds != null ? Math.max(1, Number(op.activeWakeIntervalSeconds)) : null;
+  // quiet tuning (W2): stall-type jobs default to a gentler wake cadence so a
+  // repeatedly-stalled pod isn't hammered every tick. Explicit value wins.
+  const isStall = policy === 'stall';
+  const defaultWake = isStall ? 60 : 30;
+  const wake = op.activeWakeIntervalSeconds != null ? Math.max(1, Number(op.activeWakeIntervalSeconds)) : defaultWake;
   const id = store.newId('wd');
   store.insertWatchdogJob(ctx.store, {
     id,

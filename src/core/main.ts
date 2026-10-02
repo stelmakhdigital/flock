@@ -14,6 +14,21 @@ export const FLOCK_PORT = Number(process.env.FLOCK_PORT ?? 7460);
 const startedAt = new Date().toISOString();
 const store = openStore(FLOCK_HOME);
 
+// Auto-registration (W2): every pod window gets flock on PATH, so the agent
+// can register its own watchdog jobs. The shim points at this core's CLI.
+function writeFlockShim(home: string): void {
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const binJs = path.join(import.meta.dirname, '..', 'bin.js');
+  const shimPath = path.join(binDir, 'flock');
+  const content = `#!/bin/sh\nexec ${process.execPath} ${JSON.stringify(binJs)} "$@"\n`;
+  try {
+    if (fs.existsSync(shimPath) && fs.readFileSync(shimPath, 'utf8') === content) return;
+  } catch {}
+  fs.writeFileSync(shimPath, content, { mode: 0o755 });
+}
+writeFlockShim(FLOCK_HOME);
+
 // Restart safety: any run left open by a dead core is marked crashed.
 // No special recovery code — the same logic continues from the DB.
 const crashed = crashStaleRuns(store);
