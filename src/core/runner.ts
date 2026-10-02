@@ -403,6 +403,22 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     process.exitCode = code ?? 1;
   });
 
+  // Typed exit on signals: C-c / SIGTERM (relaunch in a persistent pane) must
+  // leave the sidecar `exited` behind — an untyped death is the stale-ready
+  // case the foreground guard exists for, but a typed exit is cleaner.
+  const onSignal = (sig: string) => {
+    core.handlePiExit(null, sig);
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      /* already dead */
+    }
+    input.close();
+    setTimeout(() => process.exit(sig === 'SIGINT' ? 130 : 143), 1500).unref();
+  };
+  process.on('SIGINT', () => onSignal('SIGINT'));
+  process.on('SIGTERM', () => onSignal('SIGTERM'));
+
   core.start();
 }
 

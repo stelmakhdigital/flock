@@ -1,8 +1,11 @@
 import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { seatPaths, parseRunnerState, type RunnerState } from './runner-protocol.js';
+import { seatPaths, parseRunnerState, buildWindowLaunchCmd, type RunnerState } from './runner-protocol.js';
+
+const execFileP = promisify(execFile);
 
 // tmux transport: one window per pod.
 // Text delivery = load-buffer + paste-buffer (NOT send-keys with text):
@@ -34,26 +37,29 @@ function tmux(args: string[]): Promise<ExecRes> {
   });
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+export { sleep };
 
 // tmux quirk: without an explicit index, new-window in a clientless session
 // can pick a taken index ("index N in use"). Pick max+1 explicitly.
-async function newWindow(name: string, dir: string, cmd: string, role: string, env?: Record<string, string>): Promise<void> {
-  // env for the window: flock CLI on PATH (auto-registration, task reports),
-  // this instance's home/port (multi-flock), pod role for attribution, plus
-  // the agent manifest's env (config isolation etc.).
-  const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
-  const envPairs: Record<string, string> = {
-    // home bin first (shadows system /usr/bin/flock); <pod>/bin second — it is
-    // the only part of $HOME visible to the pi sandbox (bwrap masks /home),
-    // so the agent's `flock` resolves inside the sandbox too.
-    PATH: `${home}/bin:${dir}/bin:$PATH`,
-    FLOCK_HOME: home,
-    FLOCK_PORT: process.env.FLOCK_PORT ?? '7460',
-    FLOCK_POD_ROLE: role,
-    ...(env ?? {}),
-  };
-  const envPrefix = Object.entries(envPairs).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+async function newWindow(name: string, dir: string, cmd: string | undefined, role: string, env?: Record<string, string>): Promise<void> {
+  // cmd set: the window's process IS the command, with the env prefix (flock
+  // CLI on PATH, instance identity) — bash/cmd pods: the agent is the shell,
+  // its life = the window's life.
+  // cmd undefined: bare interactive shell — the PERSISTENT pane (OpenRig seat
+  // model): it outlives the runner, each launch is pasted into it.
+  let line = cmd;
+  if (line !== undefined && role) {
+    const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+    line = buildWindowLaunchCmd(line, {
+      role,
+      dir,
+      home,
+      port: process.env.FLOCK_PORT ?? '7460',
+      basePath: process.env.PATH ?? '/usr/local/sbin:/usr/bin:/bin',
+      extraEnv: env,
+    });
+  }
   const list = await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_index}']);
   const idxs = list.out
     .trim()
@@ -66,7 +72,7 @@ async function newWindow(name: string, dir: string, cmd: string, role: string, e
     '-t', `${TMUX_SESSION}:${next}`,
     '-n', name,
     '-c', dir,
-    `env ${envPrefix} ${cmd}`,
+    ...(line ? [line] : []),
   ]);
   // automatic-rename would rename the window to the running command
   // ("flock-dev" -> "pi"), breaking name addressing: pin it off.
@@ -95,7 +101,7 @@ async function ensureSession(): Promise<void> {
 export interface SpawnOpts {
   role: string;
   dir: string;
-  cmd?: string;
+  cmd?: string; // undefined -> bare shell pane (persistent); set -> window is the command
   env?: Record<string, string>;
 }
 
@@ -106,10 +112,61 @@ export async function spawnPod(o: SpawnOpts): Promise<{ target: string; pid: num
   if (names.includes(winName(o.role))) {
     throw new Error(`pod window already exists: ${winName(o.role)}`);
   }
-  await newWindow(winName(o.role), o.dir, o.cmd ?? 'pi', o.role, o.env);
+  await newWindow(winName(o.role), o.dir, o.cmd, o.role, o.env);
   await sleep(300);
   const pr = await tmux(['display-message', '-p', '-t', winTarget(o.role), '#{pane_pid}']);
   return { target: winTarget(o.role), pid: pr.code === 0 ? Number(pr.out.trim()) : null };
+}
+
+export async function windowExists(role: string): Promise<boolean> {
+  const list = await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_name}']);
+  return list.code === 0 && list.out.trim().split('\n').includes(winName(role));
+}
+
+export async function panePid(target: string): Promise<number | null> {
+  const r = await tmux(['display-message', '-p', '-t', target, '#{pane_pid}']);
+  return r.code === 0 ? Number(r.out.trim()) : null;
+}
+
+// Paste a launch command into the pod's shell pane (raw: paste + Enter; for
+// runner pods the typed sidecar ack is the real verification).
+export async function launchInWindow(role: string, cmd: string, dir: string, env?: Record<string, string>): Promise<void> {
+  const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+  const line = buildWindowLaunchCmd(cmd, {
+    role,
+    dir,
+    home,
+    port: process.env.FLOCK_PORT ?? '7460',
+    basePath: process.env.PATH ?? '/usr/local/sbin:/usr/bin:/bin',
+    extraEnv: env,
+  });
+  await send(winTarget(role), line, { raw: true, attempts: 1 });
+}
+
+// Typed stop of the pane's foreground (relaunch in a persistent pane):
+// C-c -> the runner's signal handler writes the sidecar `exited` and dies,
+// the pane returns to the shell. Already at the shell -> no-op.
+export async function stopWindowProcess(role: string, timeoutMs = 6000): Promise<void> {
+  const target = winTarget(role);
+  const cmd0 = await paneCommand(target).catch(() => '');
+  if (!cmd0 || SHELL_COMMANDS.has(cmd0)) return;
+  await tmux(['send-keys', '-t', target, 'C-c']);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(250);
+    const c = await paneCommand(target).catch(() => '');
+    if (!c || SHELL_COMMANDS.has(c)) return;
+  }
+  // Stubborn foreground: SIGKILL its children (the shell itself stays — it IS
+  // the pane). Last resort only.
+  const pid = await panePid(target);
+  if (pid) {
+    try {
+      await execFileP('pkill', ['-9', '-P', String(pid)], { timeout: 3000 });
+    } catch {
+      /* nothing else to do; the launch paste will surface the failure */
+    }
+  }
 }
 
 export async function killWindow(role: string): Promise<void> {

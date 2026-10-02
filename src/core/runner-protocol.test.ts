@@ -10,6 +10,7 @@ import {
   buildPiChildEnv,
   buildRunnerCommand,
   buildPiChildArgs,
+  buildWindowLaunchCmd,
 } from './runner-protocol.js';
 
 // frame round-trip (multi-line, unicode)
@@ -81,5 +82,21 @@ assert.ok(cmd.includes("'o'\\''brien'"));
 assert.ok(cmd.includes('--launch-id') && cmd.includes('la_1'));
 assert.ok(cmd.includes('--approve'));
 assert.ok(!cmd.includes('--no-approve'));
+
+// window launch command: env prefix + command, JSON-quoted values
+const wlc = buildWindowLaunchCmd('node /d/runner.js --x', {
+  role: 'dev',
+  dir: '/h/pods/dev',
+  home: '/h',
+  port: '7461',
+  basePath: '/usr/bin',
+  extraEnv: { PI_CODING_AGENT_DIR: '/h/pods/dev/.pi/agent' },
+});
+assert.ok(wlc.startsWith('PATH="/h/bin:/h/pods/dev/bin:/usr/bin" '));
+assert.ok(wlc.includes('FLOCK_HOME="/h"'));
+assert.ok(wlc.includes('FLOCK_PORT="7461"'));
+assert.ok(wlc.includes('FLOCK_POD_ROLE="dev"'));
+assert.ok(wlc.includes('PI_CODING_AGENT_DIR="/h/pods/dev/.pi/agent"'));
+assert.ok(wlc.endsWith('node /d/runner.js --x'));
 
 console.log('runner-protocol: all checks passed');

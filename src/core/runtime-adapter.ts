@@ -19,6 +19,9 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as terminal from './terminal.js';
 import {
+  RUNNER_EXIT_MARKER,
+  RUNNER_READY_MARKER,
+  RUNNER_ERROR_MARKER,
   buildPendingState,
   buildRunnerCommand,
   frameMessage,
@@ -76,6 +79,7 @@ export type LaunchResult =
       mode: 'fresh' | 'resume' | 'fork';
       target: string; // tmux window target (spawnPod result)
       pid: number | null; // pane pid (runkeeper liveness)
+      trust?: 'approve' | 'no-approve'; // applied resource trust (observability)
       sessionFile?: string; // pi: typed session identity
       sessionId?: string;
       resumeToken?: string; // pi: the session file to persist for relaunch
@@ -226,7 +230,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     const paths = seatPaths(this.env.home, binding.role);
     fs.mkdirSync(paths.agentDir, { recursive: true });
     fs.mkdirSync(paths.sessionsDir, { recursive: true });
-    // Pending record (launchId-scoped) BEFORE the window: a dead runner is
+    // Pending record (launchId-scoped) BEFORE the launch: a dead runner is
     // distinguishable from a missing one.
     fs.mkdirSync(path.dirname(paths.runnerStatePath), { recursive: true });
     fs.writeFileSync(paths.runnerStatePath, JSON.stringify(buildPendingState(opts.launchId, new Date().toISOString()), null, 2));
@@ -244,15 +248,26 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       sessionFile: mode.mode === 'resume' ? mode.sessionFile : undefined,
       forkRef: mode.mode === 'fork' ? mode.forkRef : undefined,
     });
-    const { target, pid } = await terminal.spawnPod({
-      role: binding.role,
-      dir: binding.cwd,
-      cmd,
-      env: this.m.env,
-    });
+    // PERSISTENT PANE (OpenRig seat model): the window outlives the runner.
+    // Alive -> typed-stop the old foreground (C-c -> runner writes the
+    // sidecar `exited`, pane returns to the shell); gone -> create it.
+    // On failure we do NOT kill the window: the operator keeps the pane
+    // (scrollback, capture) and can relaunch into it.
+    const target = terminal.winTarget(binding.role);
+    if (await terminal.windowExists(binding.role)) {
+      await terminal.stopWindowProcess(binding.role);
+      // tmux settles the pane/window close asynchronously; give it a moment
+      // before the recheck (a still-listed dying window would swallow the paste).
+      await terminal.sleep(400);
+    }
+    // The stop can still leave no window (legacy windows die with the
+    // command, a human typed exit): in that case create a fresh pane.
+    if (!(await terminal.windowExists(binding.role))) {
+      await terminal.spawnPod({ role: binding.role, dir: binding.cwd });
+    }
+    await terminal.launchInWindow(binding.role, cmd, binding.cwd, this.m.env);
     const ready = await terminal.waitForRunnerReady(this.env.home, binding.role, opts.launchId, 25000);
     if (!ready.ok) {
-      await terminal.killWindow(binding.role).catch(() => {});
       const evidence = (await terminal.capture(target, 30).catch(() => '')).slice(-800);
       return {
         ok: false,
@@ -275,11 +290,13 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     if (mode.mode === 'resume' && sessionFile !== mode.sessionFile) {
       return { ok: false, error: `ready state is not the requested session file (got ${sessionFile})`, recovery: 'attention_required' };
     }
+    const panePid = await terminal.panePid(target).catch(() => null);
     return {
       ok: true,
       mode: mode.mode,
       target,
-      pid,
+      pid: panePid,
+      trust,
       sessionFile,
       sessionId: ready.state.sessionId,
       resumeToken: sessionFile,
@@ -292,13 +309,23 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     const state = terminal.readRunnerState(this.env.home, binding.role);
     if (state?.exited) return { ready: false, reason: `runner exited (code ${state.exited.code ?? '?'})`, code: 'runner_exited' };
     const cmd = await terminal.paneCommand(target).catch(() => '');
-    if (terminal.SHELL_COMMANDS.has(cmd)) {
-      // A ready sidecar with the pane at the shell is stale (runner died).
-      return { ready: false, reason: 'stale: pane is at the shell', code: 'stale_ready' };
+    const atShell = terminal.SHELL_COMMANDS.has(cmd);
+    if (state?.ready) {
+      if (atShell) return { ready: false, reason: 'stale: pane is at the shell', code: 'stale_ready' };
+      return { ready: true, reason: 'sidecar ready' };
     }
-    if (state?.ready) return { ready: true, reason: 'sidecar ready' };
-    const out = await terminal.capture(target, 80).catch(() => '');
-    if (out.includes('[flock-runner] READY')) return { ready: true, reason: 'ready marker (sidecar stale)' };
+    // Secondary signals (runner-authored markers in scrollback) only when the
+    // sidecar has no answer — a stale marker from a prior launch cannot
+    // override a live sidecar. Negative markers first (OpenRig ordering).
+    if (!state) {
+      const out = await terminal.capture(target, 80).catch(() => '');
+      if (out.includes(RUNNER_ERROR_MARKER)) return { ready: false, reason: 'runner error marker in pane', code: 'runner_error' };
+      if (out.includes(RUNNER_EXIT_MARKER)) return { ready: false, reason: 'runner exit marker in pane', code: 'runner_exited' };
+      if (out.includes(RUNNER_READY_MARKER)) {
+        if (atShell) return { ready: false, reason: 'READY marker is stale scrollback; pane at the shell', code: 'stale_ready' };
+        return { ready: true, reason: 'ready marker (no sidecar)' };
+      }
+    }
     return { ready: false, reason: 'awaiting runtime', code: 'awaiting_runtime' };
   }
 }
@@ -349,6 +376,11 @@ export class BashRuntimeAdapter implements RuntimeAdapter {
   ): Promise<LaunchResult> {
     if (opts.resumeToken || opts.forkSource) {
       return { ok: false, error: 'bash runtime: resume/fork not supported (plain window has no session)', recovery: 'attention_required' };
+    }
+    // bash: the agent IS the shell — its life is the window's life (no
+    // persistent pane needed: there is no session to outlive).
+    if (await terminal.windowExists(binding.role)) {
+      await terminal.killWindow(binding.role).catch(() => {});
     }
     const { target, pid } = await terminal.spawnPod({
       role: binding.role,

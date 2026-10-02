@@ -154,12 +154,18 @@ async function spawnAgent(ctx: CoreCtx, o: {
       path: g.id,
       content: g.content,
       deliveryHint: 'guidance_merge' as const,
+      required: true, // missing guidance = degraded agent: fail the launch, don't ship it
     }));
     if (o.freshStart !== false && manifest.firstPrompt) {
       startup.push({ path: 'first-prompt', content: manifest.firstPrompt, deliveryHint: 'send_text', appliesOn: ['fresh_start'] });
     }
     adapter.project(binding);
-    await adapter.deliverStartup(startup, binding, 'pre_launch');
+    const pre = await adapter.deliverStartup(startup, binding, 'pre_launch');
+    // required startup files are launch-blocking (OpenRig contract: a failed
+    // required file is a startup error, not a warning)
+    if (pre.failed.length) {
+      throw new OpError(500, `startup delivery failed: ${pre.failed.map((f) => `${f.path}: ${f.error}`).join('; ')}`);
+    }
 
     let launchId = store.newId('la');
     let launch = await adapter.launchHarness(binding, {
@@ -183,6 +189,7 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (runMeta.resume === undefined) runMeta.resume = launch.mode;
     runMeta.launchId = launchId;
     runMeta.runtime = adapter.runtime;
+    if (launch.trust) runMeta.trust = launch.trust;
     if (launch.sessionFile) runMeta.sessionFile = launch.sessionFile;
     if (launch.sessionId) runMeta.sessionId = launch.sessionId;
     if (launch.resumeToken) runMeta.resumeToken = launch.resumeToken;
@@ -237,7 +244,8 @@ async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   if (pod.agent === 'cmd') throw new OpError(400, `relaunch not supported for raw-cmd pods (cmd is not stored)`);
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'replaced');
-  await terminal.killWindow(role).catch(() => {});
+  // PERSISTENT PANE: no killWindow — the adapter typed-stops the old runner
+  // (C-c) and launches into the same window.
   const resolved = resolveAgent(pod.agent ?? undefined, null);
   const isPi = !!resolved && manifestRuntime(resolved.manifest) === 'pi';
   const resumeToken = isPi ? (store.latestSessionFile(ctx.store, role) ?? undefined) : undefined;

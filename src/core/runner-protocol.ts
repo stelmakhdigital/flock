@@ -173,6 +173,25 @@ export function buildPiChildArgs(o: PiChildArgs): string[] {
   return args;
 }
 
+// ── Window launch command ─────────────────────────────────────────────────────
+// The persistent shell pane (OpenRig seat model): the window outlives the
+// runner; each launch is a new foreground process pasted into the pane with
+// the env prefix (flock CLI on PATH, instance identity).
+export function buildWindowLaunchCmd(
+  cmd: string,
+  o: { role: string; dir: string; home: string; port: string; basePath: string; extraEnv?: Record<string, string> },
+): string {
+  const env: Record<string, string> = {
+    PATH: `${o.home}/bin:${o.dir}/bin:${o.basePath}`,
+    FLOCK_HOME: o.home,
+    FLOCK_PORT: o.port,
+    FLOCK_POD_ROLE: o.role,
+    ...(o.extraEnv ?? {}),
+  };
+  const prefix = Object.entries(env).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+  return `${prefix} ${cmd}`;
+}
+
 // ── Launch posture + resource trust ─────────────────────────────────────────
 // pi --approve/--no-approve governs RESOURCE TRUST (context files), not a
 // permission policy (that distinction is OpenRig's, we keep it). The resolved

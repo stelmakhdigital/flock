@@ -131,6 +131,10 @@ reconciler в лексике run/pod.
   перезапускает ТОЧНЫЙ persisted session-файл (`--session <file>`);
   файла нет → retry_fresh с записью в meta, никогда silent fresh;
   `--fork <role|file>` — форк в новую сессию (новая, не родительская);
+- **постоянный pane** (OpenRig seat-модель): окно пода — постоянный shell,
+  relaunch = typed stop старого runner'а (C-c → sidecar `exited`) + новая
+  команда в то же окно; скроллбек живёт через агентов, pane_pid неизменен;
+  runkeeper детектит нетипизированную смерть: `runner gone (pane at shell)`;
 - **изоляция**: per-pod конфиг pi (`PI_CODING_AGENT_DIR`/`SESSION_DIR`,
   симлинки моделей/auth), `--no-context-files` + `--append-system-prompt
   <pod>/AGENTS.md` — home-AGENTS.md (и родительские context-файлы) в под

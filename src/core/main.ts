@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { serve } from '@hono/node-server';
 import { openStore, crashStaleRuns, listPods, currentRun, endRun } from './store.js';
-import { readRunnerState } from './terminal.js';
+import { readRunnerState, paneCommand, SHELL_COMMANDS } from './terminal.js';
 import { Ticks } from './ticks.js';
 import { createHttp, startPodSocket } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
@@ -88,7 +88,22 @@ function checkRunLiveness(): void {
       ctx.emit?.({ type: 'run_ended', pod: pod.role, run: run.id, state });
       continue;
     }
-    // 2) pid liveness (runner pod: pane pid; non-runner: agent pid)
+    // 2) foreground guard (pi pods, persistent pane): the pane is back at the
+    // shell while THIS run's sidecar has no typed exit = the runner died
+    // untyped (killed -9, OOM, ...). Relaunch never leaves an unended run
+    // during the stop->paste gap, so "at shell" here is a real death.
+    if (pod.agent === 'pi' && launchId && st && st.launchId === launchId && !st.exited) {
+      void (async () => {
+        const fg = await paneCommand(pod.terminal_target!).catch(() => '');
+        if (!SHELL_COMMANDS.has(fg)) return;
+        endRun(store, run.id, 'crashed(runner gone, pane at shell)');
+        console.log(`[core] runkeeper: run ${run.id} (pod ${pod.role}) runner gone (pane at shell) -> crashed`);
+        ctx.emit?.({ type: 'run_crashed', pod: pod.role, run: run.id });
+      })();
+      continue;
+    }
+    // 3) pid liveness (bash/cmd pods: the window's process; also catches a
+    // killed window for any pod)
     if (!run.pid) continue;
     let alive = true;
     try {
