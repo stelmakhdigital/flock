@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
+import { resolveAgent, loadAgents } from './agent.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import type { Ticks } from './ticks.js';
 
@@ -61,6 +62,14 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return watchdogCancel(o, ctx);
     case 'watchdog_list':
       return { jobs: store.listWatchdogJobs(ctx.store) };
+    case 'workflow_define':
+      return workflowDefine(o, ctx);
+    case 'workflow_start':
+      return workflowStart(o, ctx);
+    case 'workflow_ls':
+      return { workflows: store.listWorkflows(ctx.store), instances: store.listWorkflowInstances(ctx.store) };
+    case 'workflow_status':
+      return workflowStatus(o, ctx);
     case 'task_add':
       return taskAdd(o, ctx);
     case 'task_list':
@@ -91,14 +100,28 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   const dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
   fs.mkdirSync(dir, { recursive: true });
   writePodAgentsMd(dir, role);
-  const cmd = op.cmd ? String(op.cmd) : 'pi';
-  const { target, pid } = await terminal.spawnPod({ role, dir, cmd });
+  // agent adapter: manifest registry (builtins + <home>/agents/*.json) or raw --cmd
+  let cmd: string;
+  let agentEnv: Record<string, string> = {};
+  let agentStored = 'cmd';
+  if (op.cmd) {
+    cmd = String(op.cmd);
+  } else {
+    const agentId = op.agent ? String(op.agent) : 'pi';
+    const r = resolveAgent(agentId, op.model ? String(op.model) : null);
+    if (!r) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
+    cmd = r.cmd;
+    agentEnv = r.env;
+    agentStored = r.id;
+  }
+  const { target, pid } = await terminal.spawnPod({ role, dir, cmd, env: agentEnv });
   store.openPod(ctx.store, {
     id: store.newId('pod'),
     role,
     dir,
     terminalTarget: target,
     model: op.model ? String(op.model) : null,
+    agent: agentStored,
   });
   const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: role, pid });
   ctx.emit?.({ type: 'pod_spawned', role, target, run: run.id });
@@ -218,13 +241,111 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
   const reason =
     (to === 'blocked' || to === 'needs') && op.reason ? String(op.reason).slice(0, 200) :
     to === 'cancelled' ? 'cancelled' : `reported by ${by}`;
+  // done: optional result text (carried into the next workflow step)
+  const result = to === 'blocked' || to === 'needs' ? reason :
+    to === 'done' && op.result ? String(op.result).slice(0, 400) : null;
   try {
-    store.setTaskStatus(ctx.store, id, to, { reason, result: to === 'blocked' || to === 'needs' ? reason : null });
+    store.setTaskStatus(ctx.store, id, to, { reason, result });
   } catch (e) {
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
   ctx.emit?.({ type: `task_${to}`, taskId: id, pod: task.pod_role, reason });
+  advanceWorkflow(ctx, id);
   return store.getTask(ctx.store, id);
+}
+
+// ---------- workflows ----------
+
+interface WfStep { id: string; role: string; title?: string }
+
+function parseSteps(raw: unknown): WfStep[] {
+  if (!Array.isArray(raw) || raw.length === 0) throw new OpError(400, 'steps: non-empty array required');
+  const steps = raw as WfStep[];
+  const ids = new Set<string>();
+  for (const s of steps) {
+    if (!s || typeof s.id !== 'string' || !s.id.trim() || typeof s.role !== 'string' || !s.role.trim()) {
+      throw new OpError(400, 'each step needs {id, role}');
+    }
+    if (ids.has(s.id)) throw new OpError(400, `duplicate step id: ${s.id}`);
+    ids.add(s.id);
+  }
+  return steps;
+}
+
+function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.Workflow, step: WfStep, prevResult?: string): void {
+  const bodyLines = [
+    `Workflow ${wf.name}: шаг ${step.id}`,
+    inst.payload ? `Payload: ${inst.payload}` : '',
+    prevResult ? `Результат предыдущего шага: ${prevResult}` : '',
+  ].filter(Boolean);
+  store.insertTask(ctx.store, {
+    id: store.newId('t'),
+    title: `[wf ${wf.name}] ${step.title ?? step.id}`,
+    body: bodyLines.join('\n') || null,
+    podRole: step.role,
+    workflowInstanceId: inst.id,
+    workflowStep: step.id,
+  });
+}
+
+// A workflow step task finished (done/blocked/cancelled) → move the instance:
+// done + next step exists → enqueue next step (frontier advance);
+// done + last step → instance done; blocked/cancelled → instance stops.
+export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
+  const task = store.getTask(ctx.store, taskId);
+  if (!task || !task.workflow_instance_id) return;
+  const inst = store.getWorkflowInstance(ctx.store, task.workflow_instance_id);
+  if (!inst || inst.state !== 'running') return;
+  const wf = store.getWorkflow(ctx.store, inst.workflow_id);
+  if (!wf) return;
+  const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
+  if (task.status === 'done') {
+    const idx = steps.findIndex((s) => s.id === task.workflow_step);
+    const next = idx >= 0 ? steps[idx + 1] : undefined;
+    if (!next) {
+      store.setWorkflowInstanceState(ctx.store, inst.id, 'done');
+      ctx.emit?.({ type: 'workflow_done', instanceId: inst.id, workflow: wf.name });
+      return;
+    }
+    enqueueStepTask(ctx, inst, wf, next, task.result ?? undefined);
+    store.setWorkflowInstanceState(ctx.store, inst.id, 'running', next.id);
+    ctx.emit?.({ type: 'workflow_step', instanceId: inst.id, step: next.id, role: next.role });
+  } else {
+    const state = task.status === 'cancelled' ? 'cancelled' : 'blocked';
+    store.setWorkflowInstanceState(ctx.store, inst.id, state);
+    ctx.emit?.({ type: `workflow_${state}`, instanceId: inst.id, reason: task.result ?? task.status });
+  }
+}
+
+async function workflowDefine(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) throw new OpError(400, `bad workflow name: ${name || '(empty)'}`);
+  const steps = parseSteps(op.steps);
+  const existing = store.getWorkflow(ctx.store, name);
+  if (existing) throw new OpError(409, `workflow exists: ${name}`);
+  const id = store.newId('wf');
+  store.insertWorkflow(ctx.store, { id, name, spec: JSON.stringify({ steps }) });
+  ctx.emit?.({ type: 'workflow_defined', name, steps: steps.length });
+  return store.getWorkflow(ctx.store, id)!;
+}
+
+async function workflowStart(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const wf = store.getWorkflow(ctx.store, String(op.name ?? ''));
+  if (!wf) throw new OpError(404, `no workflow: ${String(op.name ?? '')}`);
+  const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
+  const instId = store.newId('wfi');
+  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null });
+  store.setWorkflowInstanceState(ctx.store, instId, 'running', steps[0].id);
+  enqueueStepTask(ctx, { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null }, wf, steps[0]);
+  ctx.emit?.({ type: 'workflow_started', instanceId: instId, workflow: wf.name });
+  return { instance: store.getWorkflowInstance(ctx.store, instId), workflow: wf };
+}
+
+async function workflowStatus(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '');
+  const inst = store.getWorkflowInstance(ctx.store, id);
+  if (!inst) throw new OpError(404, `no workflow instance: ${id}`);
+  return { instance: inst, workflow: store.getWorkflow(ctx.store, inst.workflow_id), tasks: store.listTasksForInstance(ctx.store, id) };
 }
 
 async function watchdogRegister(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {

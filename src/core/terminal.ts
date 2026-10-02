@@ -8,7 +8,13 @@ import path from 'node:path';
 // long prompts via send-keys are slow and break on special characters.
 // send-keys is used only for Enter.
 
-export const TMUX_SESSION = 'flock';
+export const TMUX_SESSION = (() => {
+  // multi-flock: each profile (FLOCK_HOME) gets its own tmux session so
+  // parallel cores don't fight over windows. Main keeps the historic name.
+  const h = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+  const b = path.basename(h).replace(/^\./, '');
+  return b === 'flock' ? 'flock' : `flock-${b}`;
+})();
 export const winName = (role: string) => `flock-${role}`;
 export const winTarget = (role: string) => `${TMUX_SESSION}:${winName(role)}`;
 
@@ -31,7 +37,19 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // tmux quirk: without an explicit index, new-window in a clientless session
 // can pick a taken index ("index N in use"). Pick max+1 explicitly.
-async function newWindow(name: string, dir: string, cmd: string, role: string): Promise<void> {
+async function newWindow(name: string, dir: string, cmd: string, role: string, env?: Record<string, string>): Promise<void> {
+  // env for the window: flock CLI on PATH (auto-registration, task reports),
+  // this instance's home/port (multi-flock), pod role for attribution, plus
+  // the agent manifest's env (config isolation etc.).
+  const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+  const envPairs: Record<string, string> = {
+    PATH: `${home}/bin:$PATH`,
+    FLOCK_HOME: home,
+    FLOCK_PORT: process.env.FLOCK_PORT ?? '7460',
+    FLOCK_POD_ROLE: role,
+    ...(env ?? {}),
+  };
+  const envPrefix = Object.entries(envPairs).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
   const list = await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_index}']);
   const idxs = list.out
     .trim()
@@ -44,10 +62,7 @@ async function newWindow(name: string, dir: string, cmd: string, role: string): 
     '-t', `${TMUX_SESSION}:${next}`,
     '-n', name,
     '-c', dir,
-    // env wrapper: flock CLI on PATH for the agent (auto-registration,
-    // W2), FLOCK_HOME for state, FLOCK_POD_ROLE so the agent's CLI calls
-    // are attributed to this pod, not to 'cli'.
-    `env PATH="$HOME/.flock/bin:$PATH" FLOCK_HOME="$HOME/.flock" FLOCK_POD_ROLE=${JSON.stringify(role)} ${cmd}`,
+    `env ${envPrefix} ${cmd}`,
   ]);
   // automatic-rename would rename the window to the running command
   // ("flock-dev" -> "pi"), breaking name addressing: pin it off.
@@ -77,6 +92,7 @@ export interface SpawnOpts {
   role: string;
   dir: string;
   cmd?: string;
+  env?: Record<string, string>;
 }
 
 export async function spawnPod(o: SpawnOpts): Promise<{ target: string; pid: number | null }> {
@@ -86,7 +102,7 @@ export async function spawnPod(o: SpawnOpts): Promise<{ target: string; pid: num
   if (names.includes(winName(o.role))) {
     throw new Error(`pod window already exists: ${winName(o.role)}`);
   }
-  await newWindow(winName(o.role), o.dir, o.cmd ?? 'pi', o.role);
+  await newWindow(winName(o.role), o.dir, o.cmd ?? 'pi', o.role, o.env);
   await sleep(300);
   const pr = await tmux(['display-message', '-p', '-t', winTarget(o.role), '#{pane_pid}']);
   return { target: winTarget(o.role), pid: pr.code === 0 ? Number(pr.out.trim()) : null };

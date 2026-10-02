@@ -11,6 +11,7 @@ export interface Pod {
   dir: string;
   terminal_target: string | null;
   model: string | null;
+  agent: string | null; // runtime adapter id (pi | bash | ...)
   state: string; // live | idle | closed
   created_at: string;
 }
@@ -64,22 +65,6 @@ CREATE TABLE IF NOT EXISTS runs(
   meta TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS runs_pod_idx ON runs(pod_role, started_at);
-CREATE TABLE IF NOT EXISTS tasks(
-  id TEXT PRIMARY KEY,
-  spec TEXT NOT NULL,
-  state TEXT NOT NULL,
-  pipeline TEXT,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS task_transitions(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id TEXT NOT NULL REFERENCES tasks(id),
-  from_state TEXT,
-  to_state TEXT NOT NULL,
-  ts TEXT NOT NULL,
-  meta TEXT
-);
-CREATE INDEX IF NOT EXISTS transitions_task_idx ON task_transitions(task_id, id);
 CREATE TABLE IF NOT EXISTS pod_notes(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   pod_role TEXT NOT NULL REFERENCES pods(role),
@@ -149,6 +134,30 @@ CREATE TABLE IF NOT EXISTS task_transitions(
 CREATE INDEX IF NOT EXISTS task_transitions_task_idx ON task_transitions(task_id, id);
 `,
   },
+  {
+    name: '004_workflows',
+    sql: `
+CREATE TABLE IF NOT EXISTS workflows(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  spec TEXT NOT NULL, -- JSON {steps: [{id, role, title?}]}
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow_instances(
+  id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL REFERENCES workflows(id),
+  payload TEXT,
+  state TEXT NOT NULL DEFAULT 'running', -- running|done|blocked|cancelled
+  current_step TEXT,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+ALTER TABLE tasks ADD COLUMN workflow_instance_id TEXT;
+ALTER TABLE tasks ADD COLUMN workflow_step TEXT;
+CREATE INDEX IF NOT EXISTS tasks_wf_idx ON tasks(workflow_instance_id);
+ALTER TABLE pods ADD COLUMN agent TEXT;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -194,17 +203,18 @@ function dbOf(store: Store): DatabaseSync {
 
 export function openPod(
   store: Store,
-  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null },
+  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null },
 ): void {
   dbOf(store)
     .prepare(
-      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at)
-       VALUES (?, ?, ?, ?, ?, 'live', ?)
+      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent)
+       VALUES (?, ?, ?, ?, ?, 'live', ?, ?)
        ON CONFLICT(role) DO UPDATE SET
          dir = excluded.dir,
-         terminal_target = excluded.terminal_target, model = excluded.model, state = 'live'`,
+         terminal_target = excluded.terminal_target, model = excluded.model,
+         agent = excluded.agent, state = 'live'`,
     )
-    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso());
+    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null);
 }
 
 export function getPodByRole(store: Store, role: string): Pod | null {
@@ -360,11 +370,13 @@ export interface Task {
   title: string;
   body: string | null;
   pod_role: string;
-  status: string; // queued | active | done | blocked | cancelled
+  status: string; // queued | active | done | blocked | cancelled | needs
   result: string | null;
   created_at: string;
   claimed_at: string | null;
   finished_at: string | null;
+  workflow_instance_id: string | null;
+  workflow_step: string | null;
 }
 
 const TASK_FLOW: Record<string, string[]> = {
@@ -376,10 +388,13 @@ const TASK_FLOW: Record<string, string[]> = {
   cancelled: [],
 };
 
-export function insertTask(store: Store, t: { id: string; title: string; body: string | null; podRole: string }): void {
+export function insertTask(
+  store: Store,
+  t: { id: string; title: string; body: string | null; podRole: string; workflowInstanceId?: string | null; workflowStep?: string | null },
+): void {
   dbOf(store)
-    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso());
+    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso(), t.workflowInstanceId ?? null, t.workflowStep ?? null);
   dbOf(store)
     .prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, NULL, ?, ?, ?)')
     .run(t.id, 'queued', 'created', nowIso());
@@ -437,4 +452,68 @@ export function listTaskTransitions(store: Store, taskId: string): unknown[] {
   return dbOf(store)
     .prepare('SELECT * FROM task_transitions WHERE task_id = ? ORDER BY id ASC')
     .all(taskId);
+}
+
+// ---------- workflows (multi-step pipelines over the task queue) ----------
+
+export interface Workflow {
+  id: string;
+  name: string;
+  spec: string; // JSON {steps: [{id, role, title?}]}
+  created_at: string;
+}
+
+export interface WorkflowInstance {
+  id: string;
+  workflow_id: string;
+  payload: string | null;
+  state: string; // running | done | blocked | cancelled
+  current_step: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export function insertWorkflow(store: Store, w: { id: string; name: string; spec: string }): void {
+  dbOf(store).prepare('INSERT INTO workflows(id, name, spec, created_at) VALUES (?, ?, ?, ?)').run(w.id, w.name, w.spec, nowIso());
+}
+
+export function getWorkflow(store: Store, nameOrId: string): Workflow | null {
+  const byId = dbOf(store).prepare('SELECT * FROM workflows WHERE id = ?').get(nameOrId) as Workflow | undefined;
+  if (byId) return byId;
+  const byName = dbOf(store).prepare('SELECT * FROM workflows WHERE name = ?').get(nameOrId) as Workflow | undefined;
+  return byName ?? null;
+}
+
+export function listWorkflows(store: Store): Workflow[] {
+  return dbOf(store).prepare('SELECT * FROM workflows ORDER BY created_at DESC, rowid DESC').all() as unknown as Workflow[];
+}
+
+export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null }): void {
+  dbOf(store)
+    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at) VALUES (?, ?, ?, 'running', ?)")
+    .run(i.id, i.workflowId, i.payload, nowIso());
+}
+
+export function getWorkflowInstance(store: Store, id: string): WorkflowInstance | null {
+  const r = dbOf(store).prepare('SELECT * FROM workflow_instances WHERE id = ?').get(id) as WorkflowInstance | undefined;
+  return r ?? null;
+}
+
+export function listWorkflowInstances(store: Store): WorkflowInstance[] {
+  return dbOf(store)
+    .prepare('SELECT * FROM workflow_instances ORDER BY created_at DESC, rowid DESC LIMIT 100')
+    .all() as unknown as WorkflowInstance[];
+}
+
+export function setWorkflowInstanceState(store: Store, id: string, state: string, currentStep?: string | null): void {
+  const terminal = state !== 'running';
+  dbOf(store)
+    .prepare('UPDATE workflow_instances SET state = ?, current_step = COALESCE(?, current_step), finished_at = ? WHERE id = ?')
+    .run(state, currentStep ?? null, terminal ? nowIso() : null, id);
+}
+
+export function listTasksForInstance(store: Store, instanceId: string): Task[] {
+  return dbOf(store)
+    .prepare('SELECT * FROM tasks WHERE workflow_instance_id = ? ORDER BY created_at ASC, rowid ASC')
+    .all(instanceId) as unknown as Task[];
 }

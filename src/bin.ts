@@ -1,10 +1,32 @@
+import os from 'node:os';
+import path from 'node:path';
 import { coreUp, coreDown, coreStatus, healthz, readToken } from './core/up.js';
 
-const USAGE = `flock — core CLI (stage 0)
+// multi-flock: `flock -p <name> <cmd>...` (or FLOCK_PROFILE env) runs against
+// an isolated core instance: own home (~/.flock/<name>), port, tmux session.
+// ponytail: port = 7461 + stable hash(name) % 499; override with FLOCK_PORT.
+{
+  const argv = process.argv.slice(2);
+  let profile = process.env.FLOCK_PROFILE ?? '';
+  if (argv[0] === '-p' || argv[0] === '--profile') {
+    profile = argv[1] ?? '';
+    process.argv.splice(2, 2);
+  }
+  if (profile) {
+    process.env.FLOCK_HOME = path.join(os.homedir(), '.flock', profile);
+    if (!process.env.FLOCK_PORT) {
+      process.env.FLOCK_PORT = String(7461 + ([...profile].reduce((a, c) => a + c.charCodeAt(0), 0) % 499));
+    }
+  }
+}
+
+const USAGE = `flock — core CLI
+  [global: -p <profile> — отдельный core-инстанс (multi-flock)]
 
   flock core up | down | status
   flock healthz
-  flock pod spawn <role> [--dir d] [--cmd c]
+  flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--cmd c]
+      agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
   flock pod status [role]
   flock pod send <role> <text...>
   flock pod capture <role> [--lines N]
@@ -21,10 +43,14 @@ const USAGE = `flock — core CLI (stage 0)
   flock task add <role> <title...> [--body TEXT]
   flock task ls [status]
   flock task history <id>
-  flock task done <id>
+  flock task done <id> [result...]
   flock task blocked <id> [reason...]
   flock task needs <id> [reason...]
   flock task cancel <id>
+  flock workflow define <name> --steps "id1:role1,id2:role2"
+  flock workflow start <name> [payload...]
+  flock workflow ls
+  flock workflow status <instance_id>
   flock terminal check`;
 
 const [, , cmd, sub, ...rest] = process.argv;
@@ -91,6 +117,7 @@ async function main(): Promise<void> {
           type: 'pod_spawn',
           role,
           dir: flag(flags, '--dir'),
+          agent: flag(flags, '--agent'),
           cmd: flag(flags, '--cmd'),
         }));
       } else if (action === 'status') {
@@ -196,12 +223,39 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'task_history', id: args[0] }));
       } else if (action === 'done' || action === 'blocked' || action === 'needs' || action === 'cancel') {
         const op =
-          action === 'done' ? { type: 'task_done', id: args[0] } :
+          action === 'done' ? { type: 'task_done', id: args[0], result: args.slice(1).join(' ') } :
           action === 'blocked' ? { type: 'task_blocked', id: args[0], reason: args.slice(1).join(' ') } :
           action === 'needs' ? { type: 'task_needs', id: args[0], reason: args.slice(1).join(' ') } :
           { type: 'task_cancel', id: args[0] };
         // from inside a pod window attribute the report to the pod
         print(await api('POST', '/api/ops', { ...op, ...(process.env.FLOCK_POD_ROLE ? { registeredBy: process.env.FLOCK_POD_ROLE } : {}) }));
+      } else {
+        console.log(USAGE);
+      }
+      return;
+    }
+
+    case 'workflow': {
+      const action = sub;
+      const args = rest;
+      if (action === 'define') {
+        const name = args[0];
+        const stepsRaw = flag(args, '--steps');
+        if (!name || !stepsRaw) {
+          console.error('usage: flock workflow define <name> --steps "id1:role1,id2:role2"');
+          process.exit(1);
+        }
+        const steps = stepsRaw.split(',').map((s) => {
+          const [id, role, ...t] = s.trim().split(':');
+          return t.length ? { id, role, title: t.join(':') } : { id, role };
+        });
+        print(await api('POST', '/api/ops', { type: 'workflow_define', name, steps }));
+      } else if (action === 'start') {
+        print(await api('POST', '/api/ops', { type: 'workflow_start', name: args[0], payload: args.slice(1).join(' ') || undefined }));
+      } else if (action === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'workflow_ls' }));
+      } else if (action === 'status') {
+        print(await api('POST', '/api/ops', { type: 'workflow_status', id: args[0] }));
       } else {
         console.log(USAGE);
       }

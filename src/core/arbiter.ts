@@ -1,5 +1,6 @@
 import * as store from './store.js';
 import * as terminal from './terminal.js';
+import { advanceWorkflow } from './ops.js';
 import type { CoreCtx } from './ops.js';
 
 // arbiter — the pipeline engine (stage 1). One tick does three things:
@@ -35,6 +36,7 @@ export async function runArbiterTick(ctx: CoreCtx): Promise<void> {
       try {
         store.setTaskStatus(ctx.store, task.id, 'blocked', { reason: 'pod lost (not live)', result: 'pod lost (not live)' });
         ctx.emit?.({ type: 'task_blocked', taskId: task.id, pod: task.pod_role, reason: 'pod lost' });
+        advanceWorkflow(ctx, task.id);
       } catch {
         // already transitioned by a concurrent op; harmless
       }

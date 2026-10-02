@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { serve } from '@hono/node-server';
-import { openStore, crashStaleRuns, listPods } from './store.js';
+import { openStore, crashStaleRuns, listPods, currentRun, endRun } from './store.js';
 import { Ticks } from './ticks.js';
 import { createHttp } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
@@ -54,6 +54,28 @@ const { app, injectWebSocket, emit } = createHttp(ctx);
 ctx.emit = emit;
 // stage 1: arbiter — claim/verify/handoff of the task queue
 ticks.register('arbiter', ARBITER_INTERVAL_MS, () => runArbiterTick(ctx));
+// runkeeper (5s): the agent process is dead -> mark the run crashed fast.
+// Fast detection layer for "window alive, agent dead" (OpenRig's
+// seat-identity reconciler, in our naming: run = the live occupant).
+function checkRunLiveness(): void {
+  for (const pod of listPods(store)) {
+    if (pod.state !== 'live') continue;
+    const run = currentRun(store, pod.role);
+    if (!run || run.ended_at || !run.pid) continue;
+    let alive = true;
+    try {
+      process.kill(run.pid, 0);
+    } catch (e) {
+      alive = (e as NodeJS.ErrnoException).code !== 'ESRCH'; // EPERM = alive
+    }
+    if (!alive) {
+      endRun(store, run.id, 'crashed');
+      console.log(`[core] runkeeper: pid ${run.pid} (pod ${pod.role}, run ${run.id}) dead -> crashed`);
+      ctx.emit?.({ type: 'run_crashed', pod: pod.role, run: run.id, pid: run.pid });
+    }
+  }
+}
+ticks.register('runkeeper', 5000, checkRunLiveness);
 // watchdog: declarative checks registered by agents/CLI (1s tick, OpenRig-style)
 ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 
