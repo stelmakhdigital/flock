@@ -35,6 +35,9 @@ const USAGE = `flock — core CLI
   flock pod answer <role> <n|текст>   # ответ оператором на dialog (gate) в pi-поде
   flock pod capture <role> [--lines N]
   flock pod close <role>
+  flock pm up                          # поднять pm-под (goal loop)
+  flock pm state                       # снимок pipeline для pm
+  flock pm intent '<json>'             # typed intent: {"op":"task_done","id":"t_x"} или {"intents":[...]}
   flock health ls                      # built-in health-алерты (gate/idle)
   flock watchdog add --policy <marker|timer|stall|file> --target <role> [opts]
       marker: --text T [--lines N] [--repeat]
@@ -185,6 +188,28 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'pod_close', role }));
       } else {
         console.log(USAGE);
+      }
+      return;
+    }
+
+    case 'pm': {
+      if (sub === 'up') {
+        print(await api('POST', '/api/ops', { type: 'pm_up' }));
+      } else if (sub === 'state') {
+        print(await api('POST', '/api/ops', { type: 'pm_state' }));
+      } else if (sub === 'intent') {
+        const json = rest.join(' ');
+        let intents: unknown;
+        try {
+          intents = JSON.parse(json);
+        } catch {
+          console.error('usage: flock pm intent \'<json>\'  (опт или {"intents":[...]})');
+          process.exit(1);
+        }
+        const body = Array.isArray(intents) ? { type: 'pm_intents', intents } : { type: 'pm_intents', intents: [intents] };
+        print(await api('POST', '/api/ops', body));
+      } else {
+        console.log('usage: flock pm up | state | intent \'<json>\'');
       }
       return;
     }

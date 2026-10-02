@@ -3,6 +3,7 @@ import * as terminal from './terminal.js';
 import { frameMessage } from './runner-protocol.js';
 import { advanceWorkflow } from './ops.js';
 import type { CoreCtx } from './ops.js';
+import { podRuntime } from './agent.js';
 
 // arbiter — the pipeline engine (stage 1). One tick does three things:
 //   claim   a free pod takes the oldest queued task for its role
@@ -62,7 +63,7 @@ function claimTask(ctx: CoreCtx, role: string, taskId: string): void {
   store.setTaskStatus(ctx.store, taskId, 'active', { reason: 'claimed' });
   const task = store.getTask(ctx.store, taskId)!;
   const pod = store.getPodByRole(ctx.store, role)!;
-  const isRunner = pod.agent === 'pi'; // flock-rpc bridge: typed delivery ack
+  const isRunner = podRuntime(pod.agent) === 'pi'; // flock-rpc bridge: typed delivery ack
   const text = claimPrompt(task);
   const wire = isRunner ? frameMessage(text) : text;
   // Fire-and-forget the send; the verified send() may retry a few times.

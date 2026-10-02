@@ -9,6 +9,8 @@ import { createHttp, startPodSocket } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
 import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
 import { runHealthTick } from './health.js';
+import { pmTick, pmNotify } from './pm.js';
+import { podRuntime } from './agent.js';
 import { writePodAgentsMd } from './ops.js';
 import type { CoreCtx } from './ops.js';
 
@@ -95,13 +97,14 @@ function checkRunLiveness(): void {
     // shell while THIS run's sidecar has no typed exit = the runner died
     // untyped (killed -9, OOM, ...). Relaunch never leaves an unended run
     // during the stop->paste gap, so "at shell" here is a real death.
-    if (pod.agent === 'pi' && launchId && st && st.launchId === launchId && !st.exited) {
+    if (podRuntime(pod.agent) === 'pi' && launchId && st && st.launchId === launchId && !st.exited) {
       void (async () => {
         const fg = await paneCommand(pod.terminal_target!).catch(() => '');
         if (!SHELL_COMMANDS.has(fg)) return;
         endRun(store, run.id, 'crashed(runner gone, pane at shell)');
         console.log(`[core] runkeeper: run ${run.id} (pod ${pod.role}) runner gone (pane at shell) -> crashed`);
         ctx.emit?.({ type: 'run_crashed', pod: pod.role, run: run.id });
+        void pmNotify(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: runner умер нетипизированно (pane на shell)` }).catch(() => {});
       })();
       continue;
     }
@@ -118,10 +121,13 @@ function checkRunLiveness(): void {
       endRun(store, run.id, 'crashed');
       console.log(`[core] runkeeper: pid ${run.pid} (pod ${pod.role}, run ${run.id}) dead -> crashed`);
       ctx.emit?.({ type: 'run_crashed', pod: pod.role, run: run.id, pid: run.pid });
+      void pmNotify(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: процесс агента (pid ${run.pid}) умер` }).catch(() => {});
     }
   }
 }
 ticks.register('runkeeper', 5000, checkRunLiveness);
+// pm (goal loop, 5min): sweep the pipeline, wake the pm pod only on change
+ticks.register('pm', 60_000, () => pmTick(ctx));
 // watchdog: declarative checks registered by agents/CLI (1s tick, OpenRig-style)
 ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 

@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
-import { resolveAgent, loadAgents, firstUserModel, manifestRuntime } from './agent.js';
+import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
 import { seatPaths, frameMessage } from './runner-protocol.js';
 import { getAdapter, mergeManagedBlock, type PodBinding, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
+import { validateIntent, applyIntents, pmDigest, pmNotify } from './pm.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -85,13 +86,23 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
     case 'task_history':
       return taskHistory(o, ctx);
     case 'task_cancel':
+      await pmNotifyMaybe(ctx, 'task_cancelled', o, 'cancelled');
       return taskReport(o, ctx, 'cancelled');
     case 'task_done':
+      await pmNotifyMaybe(ctx, 'task_done', o, 'done');
       return taskReport(o, ctx, 'done');
     case 'task_blocked':
+      await pmNotifyMaybe(ctx, 'task_blocked', o, 'blocked');
       return taskReport(o, ctx, 'blocked');
     case 'task_needs':
+      await pmNotifyMaybe(ctx, 'task_needs', o, 'needs');
       return taskReport(o, ctx, 'needs');
+    case 'pm_up':
+      return pmUp(ctx);
+    case 'pm_state':
+      return { pm: pmDigest(ctx), alerts: listAlerts(ctx) };
+    case 'pm_intents':
+      return pmIntents(o, ctx);
     case 'health_list':
       return { alerts: listAlerts(ctx) };
     case 'terminal_check':
@@ -296,7 +307,7 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const text = String(op.text ?? '');
   if (!text.trim()) throw new OpError(400, 'text required');
   const pod = requireLivePod(ctx, role);
-  if (pod.agent === 'pi') {
+  if (podRuntime(pod.agent) === 'pi') {
     // runner bridge: framed message + raw paste, verified by the sidecar ack
     // (the visual probe breaks on long/wrapped lines in a TTY line editor).
     const wire = frameMessage(text);
@@ -349,7 +360,7 @@ async function podAnswer(op: Record<string, unknown>, ctx: CoreCtx): Promise<unk
   const arg = String(op.arg ?? '1').trim();
   if (!arg) throw new OpError(400, 'arg required (option number or value)');
   const pod = requireLivePod(ctx, role);
-  if (pod.agent !== 'pi') throw new OpError(400, `pod_answer is for pi pods (this is: ${pod.agent ?? 'unknown'})`);
+  if (podRuntime(pod.agent) !== 'pi') throw new OpError(400, `pod_answer is for pi-runtime pods (this is: ${podRuntime(pod.agent)})`);
   const res = await terminal.send(pod.terminal_target!, `/answer ${arg}`, { raw: true });
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) {
@@ -437,6 +448,7 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const id = store.newId('t');
   store.insertTask(ctx.store, { id, title, body: op.body ? String(op.body) : null, podRole: role });
   ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
+  void pmNotify(ctx, { type: 'task_added', detail: `таск ${id} "${title.slice(0, 80)}" → pod ${role} (очередь)` }).catch(() => {});
   return store.getTask(ctx.store, id);
 }
 
@@ -445,6 +457,43 @@ async function taskHistory(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   const task = store.getTask(ctx.store, id);
   if (!task) throw new OpError(404, `no task: ${id}`);
   return { task, transitions: store.listTaskTransitions(ctx.store, id) };
+}
+
+// pm (goal loop): wake on a task status change — but only when the report
+// came from outside the pm itself (the pm's own intents must not re-wake it).
+async function pmNotifyMaybe(ctx: CoreCtx, trigger: string, o: Record<string, unknown>, to: string): Promise<void> {
+  try {
+    const id = String(o.id ?? '');
+    const task = id ? store.getTask(ctx.store, id) : null;
+    if (!task) return;
+    if (o.by === 'pm' || o.registeredBy === 'pm') return;
+    const reason = o.reason ? ` — ${String(o.reason).slice(0, 120)}` : '';
+    await pmNotify(ctx, { type: trigger, detail: `таск ${task.id} "${task.title.slice(0, 80)}" → ${to}${reason}` });
+  } catch {
+    /* pm wake is best-effort; the task op itself already committed */
+  }
+}
+
+// pm (goal loop): ensure the pm pod exists and is live (spawn or relaunch).
+async function pmUp(ctx: CoreCtx): Promise<unknown> {
+  const pod = store.getPodByRole(ctx.store, 'pm');
+  if (pod && pod.state === 'live') return { pm: pod, action: 'already_live' };
+  const dir = pod?.dir ?? path.join(ctx.store.home, 'pods', 'pm');
+  if (pod && pod.state === 'closed') {
+    return apply({ type: 'pod_relaunch', role: 'pm' }, ctx);
+  }
+  return apply({ type: 'pod_spawn', role: 'pm', dir, agent: 'pm' }, ctx);
+}
+
+// pm (goal loop): typed intent batch — whitelist-validated, applied through
+// the single mutation path, per-intent results back to the caller.
+async function pmIntents(o: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const raw = Array.isArray(o.intents) ? o.intents : Array.isArray(o) ? (o as Record<string, unknown>[]) : null;
+  if (!raw || raw.length === 0) throw new OpError(400, 'intents: non-empty array required (one object or {"intents":[...]})');
+  if (raw.length > 20) throw new OpError(400, 'intents: max 20 per batch');
+  const results = await applyIntents(ctx, raw);
+  const failed = results.filter((r) => !r.ok);
+  return { ok: failed.length === 0, results, applied: results.length - failed.length, failed: failed.length };
 }
 
 async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string): Promise<unknown> {

@@ -23,6 +23,7 @@ import type { CoreCtx } from './ops.js';
 import { apply } from './ops.js';
 import * as store from './store.js';
 import { readRunnerState } from './terminal.js';
+import { podRuntime } from './agent.js';
 
 export interface HealthOpts {
   gateDetectMin: number; // dialog pending longer than this -> alert
@@ -182,7 +183,7 @@ export async function runHealthTick(ctx: CoreCtx): Promise<void> {
   const opts = healthOptsFromEnv();
   const nowMs = Date.now();
   for (const pod of store.listPods(ctx.store)) {
-    if (pod.state !== 'live' || pod.agent !== 'pi') continue; // only runner pods
+    if (pod.state !== 'live' || podRuntime(pod.agent) !== 'pi') continue; // only runner pods
     try {
       await checkPod(ctx, pod.role, opts, nowMs);
     } catch (e) {

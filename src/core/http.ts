@@ -10,6 +10,7 @@ import { resolveAgent, manifestRuntime } from './agent.js';
 import { getAdapter, type AdapterEnv } from './runtime-adapter.js';
 import { apply, OpError, type CoreCtx } from './ops.js';
 import { listAlerts, healthOptsFromEnv } from './health.js';
+import { pmDigest } from './pm.js';
 
 const safeJson = (s: string): unknown => {
   try {
@@ -84,6 +85,10 @@ export function createHttp(ctx: CoreCtx) {
   app.get('/api/health', (c) => {
     const alerts = listAlerts(ctx);
     return c.json({ alerts, opts: healthOptsFromEnv() });
+  });
+
+  app.get('/api/pm', (c) => {
+    return c.json({ pm: pmDigest(ctx), alerts: listAlerts(ctx) });
   });
 
   app.get('/api/watchdog', (c) => {

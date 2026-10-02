@@ -45,9 +45,21 @@ export interface AgentManifest {
   firstPrompt?: string;
 }
 
+import { PM_PROTOCOL } from './pm-protocol.js';
+
 export const BUILTIN_AGENTS: Record<string, AgentManifest> = {
   pi: { id: 'pi', command: 'pi', modelFlag: '--model', runner: 'flock-rpc', trust: 'approve', trustLevel: 'dev' },
   bash: { id: 'bash', command: 'bash' },
+  // goal-loop lead: wakes on triggers, issues typed intents (whitelist) via the CLI
+  pm: {
+    id: 'pm',
+    command: 'pi',
+    modelFlag: '--model',
+    runner: 'flock-rpc',
+    trust: 'approve',
+    trustLevel: 'dev',
+    guidance: [{ id: 'pm-protocol', content: PM_PROTOCOL }],
+  },
 };
 
 // user-defined manifests: <FLOCK_HOME>/agents/*.json (override builtins by id)
@@ -99,6 +111,15 @@ export function manifestRuntime(m: AgentManifest): string {
   if (m.runner === 'flock-rpc') return 'pi';
   if (m.command === 'bash') return 'bash';
   return 'cmd';
+}
+
+// The runtime of a pod by its stored agent id (the id may be 'pm', 'pi', a
+// custom manifest, or 'cmd' for raw commands — the runtime comes from the
+// manifest, not from the id).
+export function podRuntime(agentId: string | null): string {
+  if (!agentId || agentId === 'cmd') return 'cmd';
+  const r = resolveAgent(agentId, null);
+  return r ? manifestRuntime(r.manifest) : 'cmd';
 }
 
 // ── Config projection (flock's analogue of OpenRig's project(), symlinked) ──

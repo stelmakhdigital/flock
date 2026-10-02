@@ -139,6 +139,11 @@ reconciler в лексике run/pod.
   **gate** (dialog ждёт человека: `flock pod answer <role> <n|текст>`) и
   **idle** (агент на паузе с active-задачей: nudge → `task needs`);
   `flock health ls` / `/api/health`, алерты в `health_alerts`;
+- **goal loop / pm** (этап 4.2): `flock pm up` — LLM-lead под, который на
+  триггерах (task add/done/needs/blocked/cancel, pod crash, 5min sweep)
+  читает pipeline и решает через typed intents (whitelist: task_*, pod_*,
+  workflow_start) — единый `apply`, audit в session pm; sweep будит pm
+  только при изменениях (тихий pipeline = 0 LLM-стоимости);
 - **изоляция**: per-pod конфиг pi (`PI_CODING_AGENT_DIR`/`SESSION_DIR`,
   симлинки моделей/auth), `--no-context-files` + `--append-system-prompt
   <pod>/AGENTS.md` — home-AGENTS.md (и родительские context-файлы) в под
