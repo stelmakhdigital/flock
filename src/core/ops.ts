@@ -61,6 +61,18 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return watchdogCancel(o, ctx);
     case 'watchdog_list':
       return { jobs: store.listWatchdogJobs(ctx.store) };
+    case 'task_add':
+      return taskAdd(o, ctx);
+    case 'task_list':
+      return { tasks: store.listTasks(ctx.store, o.status ? String(o.status) : undefined) };
+    case 'task_history':
+      return taskHistory(o, ctx);
+    case 'task_cancel':
+      return taskReport(o, ctx, 'cancelled');
+    case 'task_done':
+      return taskReport(o, ctx, 'done');
+    case 'task_blocked':
+      return taskReport(o, ctx, 'blocked');
     case 'terminal_check':
       return terminalCheck(ctx);
     default:
@@ -137,6 +149,40 @@ async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 
 async function terminalCheck(ctx: CoreCtx): Promise<unknown> {
   return terminal.checkTransport(ctx.store.home);
+}
+
+async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const title = String(op.title ?? '').trim();
+  if (!title) throw new OpError(400, 'title required');
+  // only enqueue for pods that exist (spawned or closed-then-reopenable)
+  if (!store.getPodByRole(ctx.store, role)) throw new OpError(404, `no pod: ${role}`);
+  const id = store.newId('t');
+  store.insertTask(ctx.store, { id, title, body: op.body ? String(op.body) : null, podRole: role });
+  ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
+  return store.getTask(ctx.store, id);
+}
+
+async function taskHistory(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '');
+  const task = store.getTask(ctx.store, id);
+  if (!task) throw new OpError(404, `no task: ${id}`);
+  return { task, transitions: store.listTaskTransitions(ctx.store, id) };
+}
+
+async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string): Promise<unknown> {
+  const id = String(op.id ?? '');
+  const task = store.getTask(ctx.store, id);
+  if (!task) throw new OpError(404, `no task: ${id}`);
+  const by = op.registeredBy ? String(op.registeredBy) : 'cli';
+  const reason = to === 'blocked' && op.reason ? String(op.reason).slice(0, 200) : to === 'cancelled' ? 'cancelled' : `reported by ${by}`;
+  try {
+    store.setTaskStatus(ctx.store, id, to, { reason, result: to === 'blocked' ? reason : null });
+  } catch (e) {
+    throw new OpError(409, e instanceof Error ? e.message : String(e));
+  }
+  ctx.emit?.({ type: `task_${to}`, taskId: id, pod: task.pod_role, reason });
+  return store.getTask(ctx.store, id);
 }
 
 async function watchdogRegister(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {

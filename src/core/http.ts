@@ -44,6 +44,11 @@ export function createHttp(ctx: CoreCtx) {
     return c.json({ job, history: store.listWatchdogHistory(ctx.store, job.id) });
   });
 
+  app.get('/api/tasks', (c) => {
+    const status = c.req.query('status');
+    return c.json({ tasks: store.listTasks(ctx.store, status) });
+  });
+
   app.post('/api/ops', async (c) => {
     const op = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
     if (!op || typeof op !== 'object' || Array.isArray(op)) {

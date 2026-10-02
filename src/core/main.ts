@@ -6,6 +6,7 @@ import { openStore, crashStaleRuns } from './store.js';
 import { Ticks } from './ticks.js';
 import { createHttp } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
+import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
 import type { CoreCtx } from './ops.js';
 
 export const FLOCK_HOME = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
@@ -37,13 +38,14 @@ if (crashed > 0) console.log(`[core] marked ${crashed} stale run(s) crashed`);
 const ticks = new Ticks();
 // stage 0: heartbeat only (liveness proof for /healthz).
 ticks.register('heartbeat', 10_000, () => {});
-// stage 1+: arbiter 10s (claim/handoff/verify)
-// stage 3:   health 30s (stall/retry/re-wake)
+// stage 3:   health 30s (stall/retry/re-wake) — will become built-in watchdog jobs
 // stage 4:   PM 5min (pipeline/intake) + goal loop (LLM lead, on trigger)
 
 const ctx: CoreCtx = { store, ticks, startedAt };
 const { app, injectWebSocket, emit } = createHttp(ctx);
 ctx.emit = emit;
+// stage 1: arbiter — claim/verify/handoff of the task queue
+ticks.register('arbiter', ARBITER_INTERVAL_MS, () => runArbiterTick(ctx));
 // watchdog: declarative checks registered by agents/CLI (1s tick, OpenRig-style)
 ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 

@@ -18,6 +18,12 @@ const USAGE = `flock — core CLI (stage 0)
   flock watchdog ls
   flock watchdog history <id>
   flock watchdog cancel <id>
+  flock task add <role> <title...> [--body TEXT]
+  flock task ls [status]
+  flock task history <id>
+  flock task done <id>
+  flock task blocked <id> [reason...]
+  flock task cancel <id>
   flock terminal check`;
 
 const [, , cmd, sub, ...rest] = process.argv;
@@ -158,6 +164,39 @@ async function main(): Promise<void> {
         print(await api('GET', `/api/watchdog/${encodeURIComponent(args[0] ?? '')}/history`));
       } else if (action === 'cancel') {
         print(await api('POST', '/api/ops', { type: 'watchdog_cancel', id: args[0] }));
+      } else {
+        console.log(USAGE);
+      }
+      return;
+    }
+
+    case 'task': {
+      const action = sub;
+      const args = rest;
+      if (action === 'add') {
+        const role = args[0];
+        const rest2 = args.slice(1);
+        const bi = rest2.indexOf('--body');
+        let body: string | undefined;
+        let titleArgs = rest2;
+        if (bi >= 0) {
+          body = rest2[bi + 1];
+          titleArgs = [...rest2.slice(0, bi), ...rest2.slice(bi + 2)];
+        }
+        const title = titleArgs.join(' ').trim();
+        if (!role || !title) {
+          console.error('usage: flock task add <role> <title...> [--body TEXT]');
+          process.exit(1);
+        }
+        print(await api('POST', '/api/ops', { type: 'task_add', role, title, body }));
+      } else if (action === 'ls') {
+        print(await api('GET', `/api/tasks${args[0] ? `?status=${encodeURIComponent(args[0])}` : ''}`));
+      } else if (action === 'history') {
+        print(await api('POST', '/api/ops', { type: 'task_history', id: args[0] }));
+      } else if (action === 'done' || action === 'blocked' || action === 'cancel') {
+        const op =
+          action === 'done' ? { type: 'task_done', id: args[0] } : action === 'blocked' ? { type: 'task_blocked', id: args[0], reason: args.slice(1).join(' ') } : { type: 'task_cancel', id: args[0] };
+        print(await api('POST', '/api/ops', op));
       } else {
         console.log(USAGE);
       }

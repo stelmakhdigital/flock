@@ -122,6 +122,33 @@ CREATE TABLE IF NOT EXISTS watchdog_history(
 CREATE INDEX IF NOT EXISTS watchdog_history_job_idx ON watchdog_history(job_id, id);
 `,
   },
+  {
+    name: '003_tasks',
+    sql: `
+CREATE TABLE IF NOT EXISTS tasks(
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT,
+  pod_role TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  result TEXT,
+  created_at TEXT NOT NULL,
+  claimed_at TEXT,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS tasks_pod_idx ON tasks(pod_role, status);
+CREATE TABLE IF NOT EXISTS task_transitions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  reason TEXT,
+  ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_transitions_task_idx ON task_transitions(task_id, id);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -324,4 +351,89 @@ export function listWatchdogHistory(store: Store, jobId: string): unknown[] {
   return dbOf(store)
     .prepare('SELECT * FROM watchdog_history WHERE job_id = ? ORDER BY id DESC LIMIT 100')
     .all(jobId);
+}
+
+// ---------- tasks (stage 1) ----------
+
+export interface Task {
+  id: string;
+  title: string;
+  body: string | null;
+  pod_role: string;
+  status: string; // queued | active | done | blocked | cancelled
+  result: string | null;
+  created_at: string;
+  claimed_at: string | null;
+  finished_at: string | null;
+}
+
+const TASK_FLOW: Record<string, string[]> = {
+  queued: ['active', 'cancelled'],
+  active: ['done', 'blocked', 'cancelled', 'queued'], // queued = claim delivery failed
+  done: [],
+  blocked: [],
+  cancelled: [],
+};
+
+export function insertTask(store: Store, t: { id: string; title: string; body: string | null; podRole: string }): void {
+  dbOf(store)
+    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso());
+  dbOf(store)
+    .prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, NULL, ?, ?, ?)')
+    .run(t.id, 'queued', 'created', nowIso());
+}
+
+export function getTask(store: Store, id: string): Task | null {
+  const r = dbOf(store).prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | undefined;
+  return r ?? null;
+}
+
+export function listTasks(store: Store, status?: string): Task[] {
+  if (status) {
+    return dbOf(store)
+      .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC, rowid ASC')
+      .all(status) as unknown as Task[];
+  }
+  return dbOf(store).prepare('SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT 100').all() as unknown as Task[];
+}
+
+export function oldestQueuedTask(store: Store, podRole: string): Task | null {
+  const r = dbOf(store)
+    .prepare("SELECT * FROM tasks WHERE status = 'queued' AND pod_role = ? ORDER BY created_at ASC, rowid ASC LIMIT 1")
+    .get(podRole) as Task | undefined;
+  return r ?? null;
+}
+
+export function activeTaskForPod(store: Store, podRole: string): Task | null {
+  const r = dbOf(store)
+    .prepare("SELECT * FROM tasks WHERE status = 'active' AND pod_role = ? LIMIT 1")
+    .get(podRole) as Task | undefined;
+  return r ?? null;
+}
+
+export function setTaskStatus(store: Store, id: string, to: string, opts?: { reason?: string; result?: string | null }): void {
+  const now = nowIso();
+  const cur = dbOf(store).prepare('SELECT status FROM tasks WHERE id = ?').get(id) as { status: string } | undefined;
+  if (!cur) throw new Error(`no task: ${id}`);
+  if (!TASK_FLOW[cur.status]?.includes(to)) {
+    throw new Error(`bad task transition: ${cur.status} -> ${to}`);
+  }
+  const sets: string[] = ['status = ?'];
+  const vals: SQLInputValue[] = [to];
+  if (to === 'active') { sets.push('claimed_at = ?'); vals.push(now); }
+  if (to === 'queued') { sets.push('claimed_at = NULL', 'result = NULL'); }
+  if (to === 'done' || to === 'blocked' || to === 'cancelled') { sets.push('finished_at = ?'); vals.push(now); }
+  if (opts?.result !== undefined) { sets.push('result = ?'); vals.push(opts.result); }
+  vals.push(id);
+  dbOf(store).prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  dbOf(store)
+    .prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, ?, ?, ?, ?)')
+    .run(id, cur.status, to, opts?.reason ?? null, now);
+}
+
+export function listTaskTransitions(store: Store, taskId: string): unknown[] {
+  return dbOf(store)
+    .prepare('SELECT * FROM task_transitions WHERE task_id = ? ORDER BY id ASC')
+    .all(taskId);
 }

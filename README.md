@@ -21,6 +21,24 @@ npm run build
 
 Состояние: `~/.flock/` (flock.db, core.pid, core.log, token).
 
+## Очередь задач (этап 1)
+
+Одна активная задача на pod. Arbiter (тик 10с) самовольно claim'ит
+очередную задачу на свободного pod, доставляет её verified-send'ом и следит,
+что активная задача не осталась без pod.
+
+```sh
+./bin/flock task add dev "создай hello.txt" --body "слово flock внутри"
+./bin/flock task ls [queued|active|done|blocked|cancelled]
+./bin/flock task history <id>     # все переходы: created/claimed/done/...
+./bin/flock task done <id>
+./bin/flock task blocked <id> "почему"
+./bin/flock task cancel <id>
+```
+
+Статусы: `queued → active → done|blocked|cancelled` (+ `active → queued`
+при неудачной доставке). Каждый переход — строка в `task_transitions`.
+
 ## Watchdog (W1+W2)
 
 Декларативные проверки: кто угодно (CLI/агент в pod) регистрирует job, core
