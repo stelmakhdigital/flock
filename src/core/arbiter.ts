@@ -42,6 +42,19 @@ export async function runArbiterTick(ctx: CoreCtx): Promise<void> {
   }
 }
 
+function claimPrompt(task: store.Task): string {
+  const body = [task.title, task.body ?? ''].join('\n');
+  return [
+    `[flock-task ${task.id}]`,
+    body,
+    '',
+    'Протокол: когда закончишь — выполни в bash одну из команд:',
+    `  flock task done ${task.id}`,
+    `  flock task blocked ${task.id} '<краткая причина>'`,
+    `  flock task needs ${task.id} '<что нужно от человека>'`,
+  ].join('\n');
+}
+
 function claimTask(ctx: CoreCtx, role: string, taskId: string): void {
   store.setTaskStatus(ctx.store, taskId, 'active', { reason: 'claimed' });
   const task = store.getTask(ctx.store, taskId)!;
@@ -49,7 +62,7 @@ function claimTask(ctx: CoreCtx, role: string, taskId: string): void {
   // Fire-and-forget the send; the verified send() may retry a few times.
   // If the pod is gone it throws — swallow, the verify pass will block it.
   void terminal
-    .send(pod.terminal_target!, `[flock] task ${taskId}: ${task.title}${task.body ? '\n' + task.body : ''}`)
+    .send(pod.terminal_target!, claimPrompt(task))
     .then((r) => {
       if (!r.delivered) {
         store.setTaskStatus(ctx.store, taskId, 'blocked', { reason: 'delivery not verified' });

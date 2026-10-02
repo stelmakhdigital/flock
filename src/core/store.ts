@@ -369,7 +369,8 @@ export interface Task {
 
 const TASK_FLOW: Record<string, string[]> = {
   queued: ['active', 'cancelled'],
-  active: ['done', 'blocked', 'cancelled', 'queued'], // queued = claim delivery failed
+  active: ['done', 'blocked', 'cancelled', 'queued', 'needs'],
+  needs: ['active', 'done', 'blocked', 'cancelled'], // human resolved / closed
   done: [],
   blocked: [],
   cancelled: [],

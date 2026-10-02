@@ -33,11 +33,19 @@ npm run build
 ./bin/flock task history <id>     # все переходы: created/claimed/done/...
 ./bin/flock task done <id>
 ./bin/flock task blocked <id> "почему"
+./bin/flock task needs <id> "что нужно"
 ./bin/flock task cancel <id>
 ```
 
-Статусы: `queued → active → done|blocked|cancelled` (+ `active → queued`
-при неудачной доставке). Каждый переход — строка в `task_transitions`.
+Статусы: `queued → active → done|blocked|cancelled|needs` (+ `active → queued`
+при неудачной доставке; `needs → active|done|blocked|cancelled`). Каждый
+переход — строка в `task_transitions`.
+
+Агент отчитывается сам: текст задачи несёт протокол, агент выполняет
+`flock task done|blocked|needs <id>` в своём bash (attribution через
+`FLOCK_POD_ROLE`). Per-pod `AGENTS.md` (пишет core) описывает протокол.
+`needs` = нужен человек/решение — оператор видит в `task ls`, отвечает
+подсказкой, агент (или оператор) закрывает задачу.
 
 ## Watchdog (W1+W2)
 

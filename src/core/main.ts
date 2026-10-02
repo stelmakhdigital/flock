@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { serve } from '@hono/node-server';
-import { openStore, crashStaleRuns } from './store.js';
+import { openStore, crashStaleRuns, listPods } from './store.js';
 import { Ticks } from './ticks.js';
 import { createHttp } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
 import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
+import { writePodAgentsMd } from './ops.js';
 import type { CoreCtx } from './ops.js';
 
 export const FLOCK_HOME = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
@@ -34,6 +35,13 @@ writeFlockShim(FLOCK_HOME);
 // No special recovery code — the same logic continues from the DB.
 const crashed = crashStaleRuns(store);
 if (crashed > 0) console.log(`[core] marked ${crashed} stale run(s) crashed`);
+
+// Refresh the protocol doc for every existing pod dir (pi reads it on start).
+for (const p of listPods(store)) {
+  try {
+    writePodAgentsMd(p.dir, p.role);
+  } catch {}
+}
 
 const ticks = new Ticks();
 // stage 0: heartbeat only (liveness proof for /healthz).

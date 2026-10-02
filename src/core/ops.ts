@@ -73,6 +73,8 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return taskReport(o, ctx, 'done');
     case 'task_blocked':
       return taskReport(o, ctx, 'blocked');
+    case 'task_needs':
+      return taskReport(o, ctx, 'needs');
     case 'terminal_check':
       return terminalCheck(ctx);
     default:
@@ -88,6 +90,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   }
   const dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
   fs.mkdirSync(dir, { recursive: true });
+  writePodAgentsMd(dir, role);
   const cmd = op.cmd ? String(op.cmd) : 'pi';
   const { target, pid } = await terminal.spawnPod({ role, dir, cmd });
   store.openPod(ctx.store, {
@@ -151,6 +154,43 @@ async function terminalCheck(ctx: CoreCtx): Promise<unknown> {
   return terminal.checkTransport(ctx.store.home);
 }
 
+// Per-pod protocol doc: pi reads AGENTS.md from its cwd on startup.
+// Overwritten on every spawn/boot so protocol updates propagate.
+export function podAgentsMd(role: string): string {
+  return `# Pod ${role} — протокол flock
+
+Ты — агент в pod'е системы flock. Демон core управляет тобой, оператор
+видит и управляет всем через CLI flock (команды доступны тебе в bash).
+
+## Задачи
+Core присылает задачи сообщением вида:
+
+    [flock-task <id>] <название>
+    <текст задачи>
+
+Выполни работу, затем отчитайся ИМЕННО командой (не просто текстом в ответе):
+
+- задача выполнена:        flock task done <id>
+- заблокирован:            flock task blocked <id> '<краткая причина>'
+- нужен человек/решение:    flock task needs <id> '<что именно нужно>'
+
+Не решай за оператора то, что решает только он: спроси через task needs.
+
+## Watchdog
+Можешь ставить слежку за собой/окружением: flock watchdog add ... (marker,
+timer, stall, file). Полезно ждать CI/файлы, пока не завис.
+
+## Правила
+- Разрушительные операции — только после подтверждения (bash-guard спросит —
+  это нормально, оператор разрешит).
+- Статус задачи меняется ТОЛЬКО через flock CLI, не словами.
+`;
+}
+
+export function writePodAgentsMd(dir: string, role: string): void {
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), podAgentsMd(role));
+}
+
 async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const title = String(op.title ?? '').trim();
@@ -175,9 +215,11 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
   const task = store.getTask(ctx.store, id);
   if (!task) throw new OpError(404, `no task: ${id}`);
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
-  const reason = to === 'blocked' && op.reason ? String(op.reason).slice(0, 200) : to === 'cancelled' ? 'cancelled' : `reported by ${by}`;
+  const reason =
+    (to === 'blocked' || to === 'needs') && op.reason ? String(op.reason).slice(0, 200) :
+    to === 'cancelled' ? 'cancelled' : `reported by ${by}`;
   try {
-    store.setTaskStatus(ctx.store, id, to, { reason, result: to === 'blocked' ? reason : null });
+    store.setTaskStatus(ctx.store, id, to, { reason, result: to === 'blocked' || to === 'needs' ? reason : null });
   } catch (e) {
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }

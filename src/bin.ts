@@ -23,6 +23,7 @@ const USAGE = `flock — core CLI (stage 0)
   flock task history <id>
   flock task done <id>
   flock task blocked <id> [reason...]
+  flock task needs <id> [reason...]
   flock task cancel <id>
   flock terminal check`;
 
@@ -193,10 +194,14 @@ async function main(): Promise<void> {
         print(await api('GET', `/api/tasks${args[0] ? `?status=${encodeURIComponent(args[0])}` : ''}`));
       } else if (action === 'history') {
         print(await api('POST', '/api/ops', { type: 'task_history', id: args[0] }));
-      } else if (action === 'done' || action === 'blocked' || action === 'cancel') {
+      } else if (action === 'done' || action === 'blocked' || action === 'needs' || action === 'cancel') {
         const op =
-          action === 'done' ? { type: 'task_done', id: args[0] } : action === 'blocked' ? { type: 'task_blocked', id: args[0], reason: args.slice(1).join(' ') } : { type: 'task_cancel', id: args[0] };
-        print(await api('POST', '/api/ops', op));
+          action === 'done' ? { type: 'task_done', id: args[0] } :
+          action === 'blocked' ? { type: 'task_blocked', id: args[0], reason: args.slice(1).join(' ') } :
+          action === 'needs' ? { type: 'task_needs', id: args[0], reason: args.slice(1).join(' ') } :
+          { type: 'task_cancel', id: args[0] };
+        // from inside a pod window attribute the report to the pod
+        print(await api('POST', '/api/ops', { ...op, ...(process.env.FLOCK_POD_ROLE ? { registeredBy: process.env.FLOCK_POD_ROLE } : {}) }));
       } else {
         console.log(USAGE);
       }
