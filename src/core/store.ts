@@ -5,9 +5,8 @@ import crypto from 'node:crypto';
 
 // ---------- types (rows) ----------
 
-export interface Post {
+export interface Pod {
   id: string;
-  pod: string;
   role: string;
   dir: string;
   terminal_target: string | null;
@@ -18,7 +17,7 @@ export interface Post {
 
 export interface Run {
   id: string;
-  post_role: string;
+  pod_role: string;
   pid: number | null;
   started_at: string;
   ended_at: string | null;
@@ -46,9 +45,8 @@ const MIGRATIONS: { name: string; sql: string }[] = [
   {
     name: '001_init',
     sql: `
-CREATE TABLE IF NOT EXISTS posts(
+CREATE TABLE IF NOT EXISTS pods(
   id TEXT PRIMARY KEY,
-  pod TEXT NOT NULL,
   role TEXT NOT NULL UNIQUE,
   dir TEXT NOT NULL,
   terminal_target TEXT,
@@ -58,14 +56,14 @@ CREATE TABLE IF NOT EXISTS posts(
 );
 CREATE TABLE IF NOT EXISTS runs(
   id TEXT PRIMARY KEY,
-  post_role TEXT NOT NULL REFERENCES posts(role),
+  pod_role TEXT NOT NULL REFERENCES pods(role),
   pid INTEGER,
   started_at TEXT NOT NULL,
   ended_at TEXT,
   exit_state TEXT,
   meta TEXT NOT NULL DEFAULT '[]'
 );
-CREATE INDEX IF NOT EXISTS runs_post_idx ON runs(post_role, started_at);
+CREATE INDEX IF NOT EXISTS runs_pod_idx ON runs(pod_role, started_at);
 CREATE TABLE IF NOT EXISTS tasks(
   id TEXT PRIMARY KEY,
   spec TEXT NOT NULL,
@@ -82,9 +80,9 @@ CREATE TABLE IF NOT EXISTS task_transitions(
   meta TEXT
 );
 CREATE INDEX IF NOT EXISTS transitions_task_idx ON task_transitions(task_id, id);
-CREATE TABLE IF NOT EXISTS post_notes(
+CREATE TABLE IF NOT EXISTS pod_notes(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  post_role TEXT NOT NULL REFERENCES posts(role),
+  pod_role TEXT NOT NULL REFERENCES pods(role),
   body TEXT NOT NULL,
   ts TEXT NOT NULL
 );
@@ -127,52 +125,52 @@ export function openStore(home: string): Store {
   return { home, token, db };
 }
 
-// ---------- posts ----------
+// ---------- pods ----------
 
 function dbOf(store: Store): DatabaseSync {
   return store.db;
 }
 
-export function openPost(
+export function openPod(
   store: Store,
-  p: { id: string; pod: string; role: string; dir: string; terminalTarget: string; model: string | null },
+  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null },
 ): void {
   dbOf(store)
     .prepare(
-      `INSERT INTO posts(id, pod, role, dir, terminal_target, model, state, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'live', ?)
+      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at)
+       VALUES (?, ?, ?, ?, ?, 'live', ?)
        ON CONFLICT(role) DO UPDATE SET
-         pod = excluded.pod, dir = excluded.dir,
+         dir = excluded.dir,
          terminal_target = excluded.terminal_target, model = excluded.model, state = 'live'`,
     )
-    .run(p.id, p.pod, p.role, p.dir, p.terminalTarget, p.model, nowIso());
+    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso());
 }
 
-export function getPostByRole(store: Store, role: string): Post | null {
-  const r = dbOf(store).prepare('SELECT * FROM posts WHERE role = ?').get(role) as Post | undefined;
+export function getPodByRole(store: Store, role: string): Pod | null {
+  const r = dbOf(store).prepare('SELECT * FROM pods WHERE role = ?').get(role) as Pod | undefined;
   return r ?? null;
 }
 
-export function listPosts(store: Store): Post[] {
-  return dbOf(store).prepare('SELECT * FROM posts ORDER BY role').all() as unknown as Post[];
+export function listPods(store: Store): Pod[] {
+  return dbOf(store).prepare('SELECT * FROM pods ORDER BY role').all() as unknown as Pod[];
 }
 
-export function setPostState(store: Store, role: string, state: string): void {
-  dbOf(store).prepare('UPDATE posts SET state = ? WHERE role = ?').run(state, role);
+export function setPodState(store: Store, role: string, state: string): void {
+  dbOf(store).prepare('UPDATE pods SET state = ? WHERE role = ?').run(state, role);
 }
 
 // ---------- runs ----------
 
-export function insertRun(store: Store, r: { id: string; postRole: string; pid: number | null }): Run {
+export function insertRun(store: Store, r: { id: string; podRole: string; pid: number | null }): Run {
   dbOf(store)
-    .prepare('INSERT INTO runs(id, post_role, pid, started_at) VALUES (?, ?, ?, ?)')
-    .run(r.id, r.postRole, r.pid, nowIso());
-  return currentRun(store, r.postRole)!;
+    .prepare('INSERT INTO runs(id, pod_role, pid, started_at) VALUES (?, ?, ?, ?)')
+    .run(r.id, r.podRole, r.pid, nowIso());
+  return currentRun(store, r.podRole)!;
 }
 
 export function currentRun(store: Store, role: string): Run | null {
   const r = dbOf(store)
-    .prepare('SELECT * FROM runs WHERE post_role = ? ORDER BY started_at DESC, rowid DESC LIMIT 1')
+    .prepare('SELECT * FROM runs WHERE pod_role = ? ORDER BY started_at DESC, rowid DESC LIMIT 1')
     .get(role) as Run | undefined;
   return r ?? null;
 }
@@ -193,7 +191,7 @@ export function crashStaleRuns(store: Store): number {
 export function listRuns(store: Store, role?: string): Run[] {
   if (role) {
     return dbOf(store)
-      .prepare('SELECT * FROM runs WHERE post_role = ? ORDER BY started_at DESC, rowid DESC LIMIT 50')
+      .prepare('SELECT * FROM runs WHERE pod_role = ? ORDER BY started_at DESC, rowid DESC LIMIT 50')
       .all(role) as unknown as Run[];
   }
   return dbOf(store)

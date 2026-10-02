@@ -1,7 +1,7 @@
 # flock
 
 Множественная агентная автоматизация разработки: **core** (демон, единственная
-власть) + **post**'ы (агенты в терминалах) + очередь задач.
+власть) + **pod**'ы (агенты в терминалах) + очередь задач.
 
 Архитектура и глоссарий — в `docs/` (не коммитится в гит по соглашению проекта).
 
@@ -12,9 +12,9 @@ npm install
 npm run build
 ./bin/flock core up
 ./bin/flock healthz
-./bin/flock post spawn dev          # tmux-окно flock:flock-dev с pi
-./bin/flock post send dev "напиши слово hello"
-./bin/flock post capture dev
+./bin/flock pod spawn dev           # tmux-окно flock:flock-dev с pi
+./bin/flock pod send dev "напиши слово hello"
+./bin/flock pod capture dev
 ./bin/flock core status
 ./bin/flock core down
 ```

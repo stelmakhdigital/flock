@@ -26,12 +26,12 @@ export function createHttp(ctx: CoreCtx) {
       pid: process.pid,
       startedAt: ctx.startedAt,
       ticks: ctx.ticks.all(),
-      posts: store.listPosts(ctx.store),
+      pods: store.listPods(ctx.store),
     });
   });
 
-  app.get('/api/posts', (c) => {
-    return c.json({ posts: store.listPosts(ctx.store), runs: store.listRuns(ctx.store) });
+  app.get('/api/pods', (c) => {
+    return c.json({ pods: store.listPods(ctx.store), runs: store.listRuns(ctx.store) });
   });
 
   app.post('/api/ops', async (c) => {

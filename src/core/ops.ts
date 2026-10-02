@@ -6,7 +6,7 @@ import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
 // Ticks, CLI, and (stage 4) LLM intents all mutate the world through ops.
-// Delivery ops (post_send) are transport actions, not state mutations:
+// Delivery ops (pod_send) are transport actions, not state mutations:
 // they are audited in runs.meta, while state transitions are logged in
 // *_transitions (from stage 1, with tasks).
 
@@ -34,26 +34,26 @@ function requireRole(op: Record<string, unknown>): string {
   return role;
 }
 
-function requireLivePost(ctx: CoreCtx, role: string): store.Post {
-  const post = store.getPostByRole(ctx.store, role);
-  if (!post || post.state !== 'live' || !post.terminal_target) {
-    throw new OpError(404, `no live post: ${role}`);
+function requireLivePod(ctx: CoreCtx, role: string): store.Pod {
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod || pod.state !== 'live' || !pod.terminal_target) {
+    throw new OpError(404, `no live pod: ${role}`);
   }
-  return post;
+  return pod;
 }
 
 export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): Promise<unknown> {
   const o = op ?? {};
   const t = String(o.type ?? '');
   switch (t) {
-    case 'post_spawn':
-      return postSpawn(o, ctx);
-    case 'post_send':
-      return postSend(o, ctx);
-    case 'post_capture':
-      return postCapture(o, ctx);
-    case 'post_close':
-      return postClose(o, ctx);
+    case 'pod_spawn':
+      return podSpawn(o, ctx);
+    case 'pod_send':
+      return podSend(o, ctx);
+    case 'pod_capture':
+      return podCapture(o, ctx);
+    case 'pod_close':
+      return podClose(o, ctx);
     case 'terminal_check':
       return terminalCheck(ctx);
     default:
@@ -61,57 +61,55 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
   }
 }
 
-async function postSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
-  const existing = store.getPostByRole(ctx.store, role);
+  const existing = store.getPodByRole(ctx.store, role);
   if (existing && existing.state !== 'closed') {
-    throw new OpError(409, `post ${role} already ${existing.state}`);
+    throw new OpError(409, `pod ${role} already ${existing.state}`);
   }
-  const pod = String(op.pod ?? 'default');
-  const dir = String(op.dir ?? path.join(ctx.store.home, 'posts', role));
+  const dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
   fs.mkdirSync(dir, { recursive: true });
   const cmd = op.cmd ? String(op.cmd) : 'pi';
-  const { target, pid } = await terminal.spawnPost({ role, dir, cmd });
-  store.openPost(ctx.store, {
-    id: store.newId('post'),
-    pod,
+  const { target, pid } = await terminal.spawnPod({ role, dir, cmd });
+  store.openPod(ctx.store, {
+    id: store.newId('pod'),
     role,
     dir,
     terminalTarget: target,
     model: op.model ? String(op.model) : null,
   });
-  const run = store.insertRun(ctx.store, { id: store.newId('run'), postRole: role, pid });
-  ctx.emit?.({ type: 'post_spawned', role, target, run: run.id });
-  return { post: store.getPostByRole(ctx.store, role), run };
+  const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: role, pid });
+  ctx.emit?.({ type: 'pod_spawned', role, target, run: run.id });
+  return { pod: store.getPodByRole(ctx.store, role), run };
 }
 
-async function postSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const text = String(op.text ?? '');
   if (!text.trim()) throw new OpError(400, 'text required');
-  const post = requireLivePost(ctx, role);
-  await terminal.paste(post.terminal_target!, text);
-  await terminal.sendEnter(post.terminal_target!);
+  const pod = requireLivePod(ctx, role);
+  await terminal.paste(pod.terminal_target!, text);
+  await terminal.sendEnter(pod.terminal_target!);
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) {
     store.appendRunMeta(ctx.store, run.id, { kind: 'sent', bytes: Buffer.byteLength(text) });
   }
-  ctx.emit?.({ type: 'post_sent', role, bytes: Buffer.byteLength(text) });
+  ctx.emit?.({ type: 'pod_sent', role, bytes: Buffer.byteLength(text) });
   return { ok: true };
 }
 
-async function postCapture(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+async function podCapture(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const lines = Math.max(10, Math.min(2000, Number(op.lines ?? 200)));
-  const post = requireLivePost(ctx, role);
-  const text = await terminal.capture(post.terminal_target!, lines);
+  const pod = requireLivePod(ctx, role);
+  const text = await terminal.capture(pod.terminal_target!, lines);
   return { role, text };
 }
 
-async function postClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
-  const post = store.getPostByRole(ctx.store, role);
-  if (!post) throw new OpError(404, `no post: ${role}`);
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod) throw new OpError(404, `no pod: ${role}`);
   try {
     await terminal.killWindow(role);
   } catch {
@@ -119,8 +117,8 @@ async function postClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unk
   }
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'done');
-  store.setPostState(ctx.store, role, 'closed');
-  ctx.emit?.({ type: 'post_closed', role });
+  store.setPodState(ctx.store, role, 'closed');
+  ctx.emit?.({ type: 'pod_closed', role });
   return { ok: true };
 }
 

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// tmux transport: one window per post.
+// tmux transport: one window per pod.
 // Text delivery = load-buffer + paste-buffer (NOT send-keys with text):
 // long prompts via send-keys are slow and break on special characters.
 // send-keys is used only for Enter.
@@ -70,12 +70,12 @@ export interface SpawnOpts {
   cmd?: string;
 }
 
-export async function spawnPost(o: SpawnOpts): Promise<{ target: string; pid: number | null }> {
+export async function spawnPod(o: SpawnOpts): Promise<{ target: string; pid: number | null }> {
   await ensureSession();
   const list = await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_name}']);
   const names = list.out.trim().split('\n').filter(Boolean);
   if (names.includes(winName(o.role))) {
-    throw new Error(`post window already exists: ${winName(o.role)}`);
+    throw new Error(`pod window already exists: ${winName(o.role)}`);
   }
   await newWindow(winName(o.role), o.dir, o.cmd ?? 'pi');
   await sleep(300);

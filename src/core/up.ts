@@ -99,11 +99,11 @@ export async function coreStatus(): Promise<string> {
   const b = hz.body as {
     db: string;
     ticks: { name: string; runs: number; lastError: string | null }[];
-    posts: { role: string; state: string }[];
+    pods: { role: string; state: string }[];
   };
   const ticks = b.ticks
     .map((t) => `${t.name} ${t.runs}x${t.lastError ? ` ERR ${t.lastError}` : ''}`)
     .join(', ');
-  const posts = b.posts.map((p) => `${p.role}:${p.state}`).join(', ') || 'none';
-  return `running: pid ${pid}, port ${port()}, db ${b.db}, ticks [${ticks}], posts: ${posts}`;
+  const pods = b.pods.map((p) => `${p.role}:${p.state}`).join(', ') || 'none';
+  return `running: pid ${pid}, port ${port()}, db ${b.db}, ticks [${ticks}], pods: ${pods}`;
 }

@@ -4,11 +4,11 @@ const USAGE = `flock — core CLI (stage 0)
 
   flock core up | down | status
   flock healthz
-  flock post spawn <role> [--pod p] [--dir d] [--cmd c]
-  flock post status [role]
-  flock post send <role> <text...>
-  flock post capture <role> [--lines N]
-  flock post close <role>
+  flock pod spawn <role> [--dir d] [--cmd c]
+  flock pod status [role]
+  flock pod send <role> <text...>
+  flock pod capture <role> [--lines N]
+  flock pod close <role>
   flock terminal check`;
 
 const [, , cmd, sub, ...rest] = process.argv;
@@ -66,29 +66,28 @@ async function main(): Promise<void> {
       return;
     }
 
-    case 'post': {
+    case 'pod': {
       const action = sub;
       const role = rest[0];
       if (action === 'spawn') {
         const flags = rest.slice(1);
         print(await api('POST', '/api/ops', {
-          type: 'post_spawn',
+          type: 'pod_spawn',
           role,
-          pod: flag(flags, '--pod'),
           dir: flag(flags, '--dir'),
           cmd: flag(flags, '--cmd'),
         }));
       } else if (action === 'status') {
-        const data = await api('GET', '/api/posts');
-        const posts = rest[1] ? data.posts.filter((p: { role: string }) => p.role === rest[1]) : data.posts;
-        print({ posts, runs: data.runs });
+        const data = await api('GET', '/api/pods');
+        const pods = rest[1] ? data.pods.filter((p: { role: string }) => p.role === rest[1]) : data.pods;
+        print({ pods, runs: data.runs });
       } else if (action === 'send') {
-        print(await api('POST', '/api/ops', { type: 'post_send', role, text: rest.slice(1).join(' ') }));
+        print(await api('POST', '/api/ops', { type: 'pod_send', role, text: rest.slice(1).join(' ') }));
       } else if (action === 'capture') {
         const flags = rest.slice(1);
-        print(await api('POST', '/api/ops', { type: 'post_capture', role, lines: numFlag(flags, '--lines', 200) }));
+        print(await api('POST', '/api/ops', { type: 'pod_capture', role, lines: numFlag(flags, '--lines', 200) }));
       } else if (action === 'close') {
-        print(await api('POST', '/api/ops', { type: 'post_close', role }));
+        print(await api('POST', '/api/ops', { type: 'pod_close', role }));
       } else {
         console.log(USAGE);
       }
