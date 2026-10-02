@@ -34,6 +34,16 @@ export function createHttp(ctx: CoreCtx) {
     return c.json({ pods: store.listPods(ctx.store), runs: store.listRuns(ctx.store) });
   });
 
+  app.get('/api/watchdog', (c) => {
+    return c.json({ jobs: store.listWatchdogJobs(ctx.store) });
+  });
+
+  app.get('/api/watchdog/:id/history', (c) => {
+    const job = store.getWatchdogJob(ctx.store, c.req.param('id'));
+    if (!job) return c.json({ error: `no watchdog job: ${c.req.param('id')}` }, 404);
+    return c.json({ job, history: store.listWatchdogHistory(ctx.store, job.id) });
+  });
+
   app.post('/api/ops', async (c) => {
     const op = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
     if (!op || typeof op !== 'object' || Array.isArray(op)) {

@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server';
 import { openStore, crashStaleRuns } from './store.js';
 import { Ticks } from './ticks.js';
 import { createHttp } from './http.js';
+import { runWatchdogTick } from './watchdog.js';
 import type { CoreCtx } from './ops.js';
 
 export const FLOCK_HOME = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
@@ -28,6 +29,8 @@ ticks.register('heartbeat', 10_000, () => {});
 const ctx: CoreCtx = { store, ticks, startedAt };
 const { app, injectWebSocket, emit } = createHttp(ctx);
 ctx.emit = emit;
+// watchdog: declarative checks registered by agents/CLI (1s tick, OpenRig-style)
+ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 
 const pidFile = path.join(FLOCK_HOME, 'core.pid');
 

@@ -21,7 +21,25 @@ npm run build
 
 Состояние: `~/.flock/` (flock.db, core.pid, core.log, token).
 
-## Этап 0 (текущее)
+## Watchdog (W1)
+
+Декларативные проверки: кто угодно (CLI/агент) регистрирует job, core
+оценивает по расписанию (tick 1с) и будит нужный pod.
+
+```sh
+./bin/flock watchdog add --policy timer  --after 30 --target dev
+./bin/flock watchdog add --policy marker --text "CI:OK" --target dev --repeat
+./bin/flock watchdog add --policy stall  --idle 120 --target dev --wake-interval 300
+./bin/flock watchdog ls
+./bin/flock watchdog history <job_id>
+./bin/flock watchdog cancel <job_id>
+```
+
+Политики: `marker` (текст в capture pod), `timer` (разбудить через N сек),
+`stall` (экран не меняется N сек). Quiet-period (`--wake-interval`), timeout
+(`--timeout`), история доставок. Архитектура — docs/04-watchdog.md.
+
+## Этап 0 (готово)
 
 core: HTTP+WS (Hono, bearer), node:sqlite с миграциями, единый путь мутаций
 `apply(op)`, tick-реестр с /healthz-доказательствами, tmux-транспорт

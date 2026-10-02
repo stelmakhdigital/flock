@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
+import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -54,6 +55,12 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return podCapture(o, ctx);
     case 'pod_close':
       return podClose(o, ctx);
+    case 'watchdog_register':
+      return watchdogRegister(o, ctx);
+    case 'watchdog_cancel':
+      return watchdogCancel(o, ctx);
+    case 'watchdog_list':
+      return { jobs: store.listWatchdogJobs(ctx.store) };
     case 'terminal_check':
       return terminalCheck(ctx);
     default:
@@ -124,4 +131,40 @@ async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 
 async function terminalCheck(ctx: CoreCtx): Promise<unknown> {
   return terminal.checkTransport(ctx.store.home);
+}
+
+async function watchdogRegister(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const policy = String(op.policy ?? '');
+  if (!WATCHDOG_POLICIES.includes(policy as PolicyName)) {
+    throw new OpError(400, `unknown policy: ${policy || '(empty)'} (want ${WATCHDOG_POLICIES.join(' | ')})`);
+  }
+  const targetPod = String(op.target ?? '');
+  if (!ROLE_RE.test(targetPod)) throw new OpError(400, `bad target pod (want [a-z0-9-]): ${targetPod || '(empty)'}`);
+  const specObj = (op.spec && typeof op.spec === 'object' ? op.spec : {}) as Record<string, unknown>;
+  const specErr = validateSpec(policy as PolicyName, specObj);
+  if (specErr) throw new OpError(400, specErr);
+  const intervalSeconds = Math.max(1, Math.min(3600, Number(op.intervalSeconds ?? 5)));
+  const wake = op.activeWakeIntervalSeconds != null ? Math.max(1, Number(op.activeWakeIntervalSeconds)) : null;
+  const id = store.newId('wd');
+  store.insertWatchdogJob(ctx.store, {
+    id,
+    policy,
+    spec: JSON.stringify(specObj),
+    targetPod,
+    intervalSeconds,
+    activeWakeIntervalSeconds: wake,
+    registeredBy: String(op.registeredBy ?? 'cli'),
+  });
+  ctx.emit?.({ type: 'watchdog_registered', jobId: id, policy, targetPod });
+  return store.getWatchdogJob(ctx.store, id);
+}
+
+async function watchdogCancel(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '');
+  const job = store.getWatchdogJob(ctx.store, id);
+  if (!job) throw new OpError(404, `no watchdog job: ${id}`);
+  if (job.state === 'active') {
+    terminateJob(ctx, job, 'cancelled', new Date().toISOString());
+  }
+  return { ok: true, job: store.getWatchdogJob(ctx.store, id) };
 }

@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -86,6 +86,40 @@ CREATE TABLE IF NOT EXISTS pod_notes(
   body TEXT NOT NULL,
   ts TEXT NOT NULL
 );
+`,
+  },
+  {
+    name: '002_watchdog',
+    sql: `
+CREATE TABLE IF NOT EXISTS watchdog_jobs(
+  id TEXT PRIMARY KEY,
+  policy TEXT NOT NULL,
+  spec TEXT NOT NULL,
+  target_pod TEXT NOT NULL,
+  interval_seconds INTEGER NOT NULL,
+  active_wake_interval_seconds INTEGER,
+  state TEXT NOT NULL DEFAULT 'active',
+  actionable INTEGER NOT NULL DEFAULT 0,
+  last_evaluation_at TEXT,
+  last_fire_at TEXT,
+  last_actionable_at TEXT,
+  last_state TEXT,
+  last_skip_reason TEXT,
+  registered_by TEXT NOT NULL,
+  registered_at TEXT NOT NULL,
+  terminal_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS watchdog_jobs_state_idx ON watchdog_jobs(state);
+CREATE TABLE IF NOT EXISTS watchdog_history(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL REFERENCES watchdog_jobs(id),
+  evaluated_at TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  skip_reason TEXT,
+  delivery_status TEXT,
+  delivery_message TEXT
+);
+CREATE INDEX IF NOT EXISTS watchdog_history_job_idx ON watchdog_history(job_id, id);
 `,
   },
 ];
@@ -211,4 +245,83 @@ export function appendRunMeta(store: Store, runId: string, entry: Record<string,
   arr.push({ ts: nowIso(), ...entry });
   if (arr.length > 100) arr = arr.slice(-100);
   dbOf(store).prepare('UPDATE runs SET meta = ? WHERE id = ?').run(JSON.stringify(arr), runId);
+}
+
+// ---------- watchdog ----------
+
+export interface WatchdogJob {
+  id: string;
+  policy: string;
+  spec: string; // JSON
+  target_pod: string;
+  interval_seconds: number;
+  active_wake_interval_seconds: number | null;
+  state: string; // active | terminal
+  actionable: number;
+  last_evaluation_at: string | null;
+  last_fire_at: string | null;
+  last_actionable_at: string | null;
+  last_state: string | null; // policy memory (JSON)
+  last_skip_reason: string | null;
+  registered_by: string;
+  registered_at: string;
+  terminal_reason: string | null;
+}
+
+const WD_FIELDS = [
+  'policy', 'spec', 'target_pod', 'interval_seconds', 'active_wake_interval_seconds',
+  'state', 'actionable', 'last_evaluation_at', 'last_fire_at', 'last_actionable_at',
+  'last_state', 'last_skip_reason', 'terminal_reason',
+] as const;
+
+export function insertWatchdogJob(
+  store: Store,
+  j: { id: string; policy: string; spec: string; targetPod: string; intervalSeconds: number; activeWakeIntervalSeconds: number | null; registeredBy: string },
+): void {
+  dbOf(store)
+    .prepare(
+      `INSERT INTO watchdog_jobs(id, policy, spec, target_pod, interval_seconds, active_wake_interval_seconds, state, registered_by, registered_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+    )
+    .run(j.id, j.policy, j.spec, j.targetPod, j.intervalSeconds, j.activeWakeIntervalSeconds, j.registeredBy, nowIso());
+}
+
+export function getWatchdogJob(store: Store, id: string): WatchdogJob | null {
+  const r = dbOf(store).prepare('SELECT * FROM watchdog_jobs WHERE id = ?').get(id) as WatchdogJob | undefined;
+  return r ?? null;
+}
+
+export function listWatchdogJobs(store: Store, state?: string): WatchdogJob[] {
+  if (state) {
+    return dbOf(store)
+      .prepare('SELECT * FROM watchdog_jobs WHERE state = ? ORDER BY registered_at DESC, rowid DESC')
+      .all(state) as unknown as WatchdogJob[];
+  }
+  return dbOf(store)
+    .prepare('SELECT * FROM watchdog_jobs ORDER BY registered_at DESC, rowid DESC LIMIT 100')
+    .all() as unknown as WatchdogJob[];
+}
+
+export function watchdogUpdate(store: Store, id: string, fields: Record<string, unknown>): void {
+  const keys = Object.keys(fields).filter((k) => (WD_FIELDS as readonly string[]).includes(k));
+  if (!keys.length) return;
+  const sets = keys.map((k) => `${k} = ?`).join(', ');
+  dbOf(store).prepare(`UPDATE watchdog_jobs SET ${sets} WHERE id = ?`).run(...(keys.map((k) => fields[k]) as SQLInputValue[]), id);
+}
+
+export function addWatchdogHistory(
+  store: Store,
+  h: { jobId: string; outcome: string; skipReason?: string | null; deliveryStatus?: string | null; deliveryMessage?: string | null },
+): void {
+  dbOf(store)
+    .prepare(
+      'INSERT INTO watchdog_history(job_id, evaluated_at, outcome, skip_reason, delivery_status, delivery_message) VALUES (?, ?, ?, ?, ?, ?)',
+    )
+    .run(h.jobId, nowIso(), h.outcome, h.skipReason ?? null, h.deliveryStatus ?? null, h.deliveryMessage ?? null);
+}
+
+export function listWatchdogHistory(store: Store, jobId: string): unknown[] {
+  return dbOf(store)
+    .prepare('SELECT * FROM watchdog_history WHERE job_id = ? ORDER BY id DESC LIMIT 100')
+    .all(jobId);
 }

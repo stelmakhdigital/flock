@@ -9,6 +9,14 @@ const USAGE = `flock — core CLI (stage 0)
   flock pod send <role> <text...>
   flock pod capture <role> [--lines N]
   flock pod close <role>
+  flock watchdog add --policy <marker|timer|stall> --target <role> [opts]
+      marker: --text T [--lines N] [--repeat]
+      timer:  --after N
+      stall:  --idle N [--lines N]
+      common: [--interval N] [--wake-interval N] [--timeout N]
+  flock watchdog ls
+  flock watchdog history <id>
+  flock watchdog cancel <id>
   flock terminal check`;
 
 const [, , cmd, sub, ...rest] = process.argv;
@@ -88,6 +96,59 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'pod_capture', role, lines: numFlag(flags, '--lines', 200) }));
       } else if (action === 'close') {
         print(await api('POST', '/api/ops', { type: 'pod_close', role }));
+      } else {
+        console.log(USAGE);
+      }
+      return;
+    }
+
+    case 'watchdog': {
+      const action = sub;
+      const args = rest;
+      if (action === 'add') {
+        const flags = args;
+        const policy = flag(flags, '--policy');
+        const target = flag(flags, '--target');
+        if (!policy || !target) {
+          console.error('usage: flock watchdog add --policy <marker|timer|stall> --target <role> [--text T] [--after N] [--idle N] [--lines N] [--interval N] [--wake-interval N] [--timeout N] [--repeat]');
+          process.exit(1);
+        }
+        const specObj: Record<string, unknown> = {};
+        if (policy === 'marker') {
+          const text = flag(flags, '--text');
+          if (!text) { console.error('marker: --text required'); process.exit(1); }
+          specObj.text = text;
+          if (flags.includes('--repeat')) specObj.once = false;
+        } else if (policy === 'timer') {
+          const after = flag(flags, '--after');
+          if (!after) { console.error('timer: --after required'); process.exit(1); }
+          specObj.afterSeconds = Number(after);
+        } else if (policy === 'stall') {
+          const idle = flag(flags, '--idle');
+          if (!idle) { console.error('stall: --idle required'); process.exit(1); }
+          specObj.idleSeconds = Number(idle);
+        } else {
+          console.error(`unknown policy: ${policy} (want marker | timer | stall)`);
+          process.exit(1);
+        }
+        const lines = flag(flags, '--lines');
+        if (lines) specObj.lines = Number(lines);
+        const timeout = flag(flags, '--timeout');
+        if (timeout) specObj.timeoutSeconds = Number(timeout);
+        print(await api('POST', '/api/ops', {
+          type: 'watchdog_register',
+          policy,
+          target,
+          spec: specObj,
+          intervalSeconds: numFlag(flags, '--interval', 5),
+          activeWakeIntervalSeconds: flag(flags, '--wake-interval') ? Number(flag(flags, '--wake-interval')) : null,
+        }));
+      } else if (action === 'ls') {
+        print(await api('GET', '/api/watchdog'));
+      } else if (action === 'history') {
+        print(await api('GET', `/api/watchdog/${encodeURIComponent(args[0] ?? '')}/history`));
+      } else if (action === 'cancel') {
+        print(await api('POST', '/api/ops', { type: 'watchdog_cancel', id: args[0] }));
       } else {
         console.log(USAGE);
       }
