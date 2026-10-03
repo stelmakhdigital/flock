@@ -118,12 +118,15 @@ const FLOCK_VARS = ['FLOCK_HOME', 'FLOCK_PORT', 'FLOCK_POD_ROLE'];
 
 export function buildPiChildEnv(
   source: NodeJS.ProcessEnv,
-  opts: { agentDir: string; sessionsDir: string; trustFile?: string },
+  opts: { agentDir: string; sessionsDir: string; trustFile?: string; extra?: Record<string, string> },
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of [...ENV_BASELINE, ...FLOCK_VARS]) {
     if (source[name] !== undefined) env[name] = source[name];
   }
+  // flock-managed pod env (manifest env, e.g. BASH_GUARD_AUTO_ALLOW for
+  // worktree pods): wins over the operator's own shell environment
+  for (const [k, v] of Object.entries(opts.extra ?? {})) env[k] = v;
   env.PI_CODING_AGENT_DIR = opts.agentDir;
   env.PI_CODING_AGENT_SESSION_DIR = opts.sessionsDir;
   if (opts.trustFile) env.PI_SANDBOX_TRUST_FILE = opts.trustFile;
@@ -144,6 +147,7 @@ export interface RunnerArgs {
   forkRef?: string; // fork from a session file/id
   trustOption?: string; // fallback: option substring for an unexpected trust dialog
   trustLevel?: string; // sandbox trust level pre-seeded for the pod dir
+  extraEnv?: string[]; // flock-managed env for the pi child (K=V, wins over operator shell)
 }
 
 // The command typed into the pod's tmux pane (shell-quoted).
@@ -163,10 +167,15 @@ export function buildRunnerCommand(o: RunnerArgs): string {
   if (o.model) parts.push('--model', q(o.model));
   if (o.sessionFile) parts.push('--session-file', q(o.sessionFile));
   if (o.forkRef) parts.push('--fork-ref', q(o.forkRef));
+  for (const kv of o.extraEnv ?? []) {
+    const i = kv.indexOf('=');
+    if (i > 0) parts.push('--env', q(kv.slice(0, i)), q(kv.slice(i + 1)));
+  }
   return parts.join(' ');
 }
 
 export interface PiChildArgs {
+  autoAllow?: boolean; // worktree pods: --bash-guard-auto-allow
   sessionsDir: string;
   role: string;
   model?: string;
@@ -192,6 +201,11 @@ export function buildPiChildArgs(o: PiChildArgs): string[] {
     '--session-dir', o.sessionsDir,
     o.trust === 'approve' ? '--approve' : '--no-approve',
     '--no-context-files',
+    // worktree pods: routine git (commit/pull) is the job — bash-guard's
+    // interactive prompt is a no-op in RPC mode, so run autonomous
+    // (--bash-guard-disabled: its hard floor still blocks rm -rf /
+    // reset --hard / push --force)
+    ...(o.autoAllow ? ['--bash-guard-disabled'] : []),
   ];
   if (o.agentsMdPath) args.push('--append-system-prompt', o.agentsMdPath);
   if (o.model) args.push('--model', o.model);

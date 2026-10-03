@@ -10,6 +10,8 @@ import { runWatchdogTick } from './watchdog.js';
 import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
 import { runHealthTick } from './health.js';
 import { pmTick, pmNotify } from './pm.js';
+import { ingestUsage } from './usage.js';
+import { runRetentionSweep } from './retention.js';
 import { podRuntime } from './agent.js';
 import { writePodAgentsMd } from './ops.js';
 import type { CoreCtx } from './ops.js';
@@ -142,6 +144,26 @@ function checkRunLiveness(): void {
 ticks.register('runkeeper', 5000, checkRunLiveness);
 // pm (goal loop, 5min): sweep the pipeline, wake the pm pod only on change
 ticks.register('pm', 60_000, () => pmTick(ctx));
+// usage (economy, 60s): ingest pi-runner usage events into usage_events
+ticks.register('usage', 60_000, () => {
+  try {
+    const r = ingestUsage({ store, home: FLOCK_HOME }, listPods(store).map((p) => p.role));
+    if (r.events > 0) console.log(`[core] usage: +${r.events} event(s)`);
+  } catch (e) {
+    console.warn('[core] usage tick failed:', e instanceof Error ? e.message : e);
+  }
+});
+// retention (24h): archive old runs, head-trim activity logs, rotate core.log
+ticks.register('retention', 24 * 3600_000, () => {
+  try {
+    const r = runRetentionSweep({ store, home: FLOCK_HOME });
+    if (r.archivedRuns || r.trimmedActivity.length || r.coreLogRotated) {
+      console.log(`[core] retention: runs=${r.archivedRuns} activity=${r.trimmedActivity.join(',') || '-'} log=${r.coreLogRotated ? 'rotated' : '-'}`);
+    }
+  } catch (e) {
+    console.warn('[core] retention tick failed:', e instanceof Error ? e.message : e);
+  }
+});
 // watchdog: declarative checks registered by agents/CLI (1s tick)
 ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 

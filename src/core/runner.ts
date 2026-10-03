@@ -38,6 +38,7 @@ interface ParsedArgs {
   forkRef?: string;
   trustOption: string;
   trustLevel: string;
+  extraEnv: Record<string, string>;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -56,6 +57,9 @@ function parseArgs(argv: string[]): ParsedArgs {
     forkRef: get('--fork-ref'),
     trustOption: get('--trust-option') ?? 'untrusted',
     trustLevel: get('--trust-level') ?? 'dev',
+    extraEnv: Object.fromEntries(
+      argv.flatMap((a, i) => (a === '--env' ? [[argv[i + 1], argv[i + 2]] as [string, string]] : [])),
+    ) as Record<string, string>,
   };
   if (!args.stateRoot || !args.role || !args.launchId) {
     throw new Error('missing required args: --state-root --role --launch-id');
@@ -195,6 +199,20 @@ export class RunnerCore {
           if (message.stopReason === 'error') {
             const err = typeof message.errorMessage === 'string' ? message.errorMessage : 'assistant message error';
             this.io.mirrorLine(`${RUNNER_ERROR_MARKER} ${err.split('\n')[0]}`);
+          }
+          // usage: per-message tokens (pi carries them on the assistant
+          // message) — the economy signal for cost per task/run/pipeline
+          const u = message.usage as Record<string, number> | undefined;
+          if (u && typeof u.input === 'number') {
+            this.io.appendActivity({
+              event: 'usage',
+              input: u.input,
+              output: u.output ?? 0,
+              cacheRead: u.cacheRead ?? 0,
+              cacheWrite: u.cacheWrite ?? 0,
+              totalTokens: u.totalTokens ?? u.input + (u.output ?? 0),
+              model: typeof message.model === 'string' ? message.model : undefined,
+            });
           }
         }
         break;
@@ -390,6 +408,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,
     agentsMdPath: fs.existsSync(agentsMd) ? agentsMd : undefined,
+    autoAllow: args.extraEnv['BASH_GUARD_AUTO_ALLOW'] === '1',
   });
   // Pre-seed the per-pod sandbox trust store: the project-trust DIALOG in RPC
   // mode kills the session (pi exits after the dialog resolves), so we never
@@ -402,7 +421,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   } catch {
     /* best-effort: the dialog auto-answer fallback remains */
   }
-  const childEnv = buildPiChildEnv(process.env, { agentDir: paths.agentDir, sessionsDir: paths.sessionsDir, trustFile });
+  const childEnv = buildPiChildEnv(process.env, { agentDir: paths.agentDir, sessionsDir: paths.sessionsDir, trustFile, extra: args.extraEnv });
 
   console.log(`[flock-runner] starting pi --mode rpc (pod ${args.role}, launch ${args.launchId})`);
   console.log(`[flock-runner] input: plain lines; "/abort" cancels; "/followup <text>" queues after the turn`);

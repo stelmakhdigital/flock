@@ -106,7 +106,13 @@ export function createHttp(ctx: CoreCtx) {
   });
 
   app.get('/api/pm', (c) => {
-    return c.json({ pm: pmDigest(ctx), alerts: listAlerts(ctx) });
+    return c.json({ pm: pmDigest(ctx), alerts: listAlerts(ctx), usage: store.usageSummary(ctx.store) });
+  });
+
+  app.get('/api/usage', (c) => {
+    const role = c.req.query('role') ?? undefined;
+    const since = c.req.query('since') ?? undefined;
+    return c.json({ usage: store.usageSummary(ctx.store, { role, since }) });
   });
 
   app.get('/api/watchdog', (c) => {

@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
+import * as gitops from './gitops.js';
+import { parseTeamYaml, TeamParseError } from './team.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
@@ -78,6 +80,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_spawn: { group: 'pod', scopes: ['operator'], summary: 'spawn a pod (agent manifest, optional --repo worktree)', run: (o, c) => podSpawn(o, c) },
   pod_relaunch: { group: 'pod', scopes: ['operator'], summary: 'new run on the same pod (honest resume, --fork)', run: (o, c) => podRelaunch(o, c) },
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
+  team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
+  pod_merge_status: { group: 'pod', scopes: ['operator', 'pod'], summary: 'worktree pod: ahead/behind/dirty vs base', run: (o, c) => podMergeStatus(o, c) },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
   pod_answer: { group: 'pod', scopes: ['operator'], summary: 'answer a pending dialog (gate) in a pod', run: (o, c) => podAnswer(o, c) },
   pod_capture: { group: 'pod', scopes: ['operator'], summary: 'capture pod pane text', run: (o, c) => podCapture(o, c) },
@@ -133,6 +137,10 @@ async function spawnAgent(ctx: CoreCtx, o: {
   posture?: 'floor' | 'full_bypass';
   profile?: string | null;
   freshStart?: boolean;
+  repo?: string | null;
+  repoBase?: string | null;
+  branch?: string | null;
+  teamGuidance?: string; // team file: extra AGENTS.md block (managed, id team:<role>)
 }): Promise<{ pod: store.Pod; run: store.Run }> {
   fs.mkdirSync(o.dir, { recursive: true });
   let target: string;
@@ -158,6 +166,16 @@ async function spawnAgent(ctx: CoreCtx, o: {
     const adapter = getAdapter(manifest, adapterEnv(ctx));
     if (!adapter) throw new OpError(400, `agent ${agentId}: no runtime adapter (manifest needs a supported "runtime")`);
 
+    // Worktree pod (pi): two things the sandbox/guard combo cannot do:
+    //  1) git — the main repo sits outside the bwrap-visible workspace
+    //     (/home is masked), so the worktree's .git link dangles in-sandbox;
+    //     2) bash-guard — its interactive prompt is a no-op in RPC mode.
+    // Trust boundary for a worktree pod = git itself: the S0 merge gate is
+    // fast-forward-only, unmerged work stays a branch, and bash-guard's
+    // autonomous floor still blocks rm -rf / reset --hard / push --force.
+    const childEnv: Record<string, string> = { ...(manifest.env ?? {}) };
+    if (o.repo && adapter.runtime === 'pi') childEnv['BASH_GUARD_AUTO_ALLOW'] = '1';
+
     if (adapter.runtime === 'pi' && !model) model = firstUserModel();
     if (adapter.runtime === 'claude' && !model) {
       // pi config uses provider/model syntax; claude wants the bare model id
@@ -170,6 +188,10 @@ async function spawnAgent(ctx: CoreCtx, o: {
       model: model ?? undefined,
       launchPosture: o.posture ?? manifest.launchPosture,
       permissionMode: manifest.permissionMode,
+      extraEnv: Object.keys(childEnv).length ? childEnv : undefined,
+      seatRoot: path.join(ctx.store.home, 'pods', o.role),
+      // the base repo cannot be made visible inside the sandbox -> no bwrap
+      trustLevel: o.repo && adapter.runtime === 'pi' ? 'off' : manifest.trustLevel,
     };
     // listInstalled: a clear spawn error instead of a dead window.
     const installed = await adapter.listInstalled(binding);
@@ -193,9 +215,13 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (pre.failed.length) {
       throw new OpError(500, `startup delivery failed: ${pre.failed.map((f) => `${f.path}: ${f.error}`).join('; ')}`);
     }
+    // team file: extra guidance block (pi reads it at process start)
+    if (o.teamGuidance) {
+      mergeManagedBlock(path.join(o.dir, 'AGENTS.md'), `team:${o.role}`, o.teamGuidance);
+    }
     // guidance hygiene: drop managed blocks the current manifest no longer
     // provides (e.g. left over from a previous profile)
-    pruneManagedBlocks(path.join(o.dir, 'AGENTS.md'), new Set(['flock-protocol', ...(manifest.guidance ?? []).map((g) => g.id)]));
+    pruneManagedBlocks(path.join(o.dir, 'AGENTS.md'), new Set(['flock-protocol', 'team:' + o.role, ...(manifest.guidance ?? []).map((g) => g.id)]));
 
     let launchId = store.newId('la');
     let launch = await adapter.launchHarness(binding, {
@@ -236,6 +262,9 @@ async function spawnAgent(ctx: CoreCtx, o: {
     model,
     agent: agentStored,
     profile: o.profile ?? null,
+    repo: o.repo ?? null,
+    repoBase: o.repoBase ?? null,
+    branch: o.branch ?? null,
   });
   const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: o.role, pid, meta: runMeta });
   startPodSocket(ctx, o.dir); // pod-local API socket (sandbox-visible)
@@ -251,7 +280,33 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   if (existing && existing.state !== 'closed') {
     throw new OpError(409, `pod ${role} already ${existing.state}`);
   }
-  const dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
+  // worktree pod: --repo <path> [--base <ref>] — the pod works in its own
+  // checkout on branch flock/<role>; task done = merge candidate (S0 ff)
+  let dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
+  let repo: string | null = null;
+  let repoBase: string | null = null;
+  let branch: string | null = null;
+  if (op.repo !== undefined) {
+    const repoPath = path.resolve(String(op.repo));
+    if (!gitops.isGitRepo(repoPath)) throw new OpError(400, `--repo: not a git repo: ${repoPath}`);
+    repo = repoPath;
+    repoBase = op.base ? String(op.base) : (await gitops.currentBranch(repoPath)) ?? 'HEAD';
+    branch = gitops.branchName(role);
+    dir = path.join(ctx.store.home, 'pods', role, 'work');
+  } else if (existing?.repo && existing.repo_base && existing.branch) {
+    // re-spawn of a previously closed worktree pod: same layout
+    repo = existing.repo;
+    repoBase = existing.repo_base;
+    branch = existing.branch;
+    if (op.dir === undefined) dir = path.join(ctx.store.home, 'pods', role, 'work');
+  }
+  if (repo) {
+    try {
+      await gitops.worktreeAttach(repo, dir, branch!, repoBase!);
+    } catch (e) {
+      throw new OpError(500, `worktree attach failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   const { pod, run } = await spawnAgent(ctx, {
     role,
     dir,
@@ -261,8 +316,11 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
     forkRef: op.fork ? resolveForkRef(ctx, String(op.fork)) : undefined,
     posture: op.posture === 'full_bypass' || op.posture === 'floor' ? op.posture : undefined,
     profile: op.profile ? String(op.profile) : null,
+    repo,
+    repoBase,
+    branch,
   });
-  return { pod, run };
+  return { pod, run, repo: repo ?? undefined, branch: branch ?? undefined };
 }
 
 // relaunch: agent dies (or operator wants a fresh one) -> new run on the same
@@ -275,20 +333,36 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod) throw new OpError(404, `no pod: ${role}`);
+  // A stale relaunch may have wiped the repo fields (pre-fix rows): the
+  // worktree on disk is the source of truth — recover the binding from it.
+  if (!pod.repo && !pod.branch && fs.existsSync(path.join(pod.dir, '.git'))) {
+    const link = fs.readFileSync(path.join(pod.dir, '.git'), 'utf8').trim();
+    const m = link.match(/^gitdir:\s*(.+)$/);
+    if (m) {
+      const wm = m[1].match(/^(.*)\.git\/(worktrees\/.+)$/);
+      if (wm) {
+        const repo = wm[1];
+        const headBranch = (await gitops.git(pod.dir, 'branch', '--show-current').catch(() => '')) || null;
+        store.setPodRepo(ctx.store, role, repo, null, headBranch);
+      }
+    }
+  }
+  const cur = store.getPodByRole(ctx.store, role);
+  if (!cur) throw new OpError(404, `no pod: ${role}`);
   if (pod.agent === 'cmd') throw new OpError(400, `relaunch not supported for raw-cmd pods (cmd is not stored)`);
   const run = store.currentRun(ctx.store, role);
   if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'replaced');
   // PERSISTENT PANE: no killWindow — the adapter typed-stops the old runner
   // (C-c) and launches into the same window.
-  const profile = op.profile !== undefined ? String(op.profile) : (pod.profile ?? undefined);
+  const profile = op.profile !== undefined ? String(op.profile) : (cur.profile ?? undefined);
   store.setPodProfile(ctx.store, role, profile || null);
-  const resolved = resolveAgent(pod.agent ?? undefined, null, profile);
+  const resolved = resolveAgent(cur.agent ?? undefined, null, profile);
   const runtime = resolved ? manifestRuntime(resolved.manifest) : 'cmd';
   const isPi = runtime === 'pi';
   const isClaude = runtime === 'claude';
   // pinned resume token wins; otherwise the latest session (honest resume).
   // Token shape is per-runtime: pi = session file path, claude = transcript uuid.
-  const pinned = isPi || isClaude ? (pod.resume_token ?? undefined) : undefined;
+  const pinned = isPi || isClaude ? (cur.resume_token ?? undefined) : undefined;
   const tokenValid = isPi ? validateResumeToken(pinned!) : validateClaudeSessionToken(pinned!);
   if (pinned && !tokenValid) {
     throw new OpError(400, `pinned resume token is invalid: ${pinned} (flock pod resume-token ${role} reset)`);
@@ -299,17 +373,22 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
     resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
   } else if (isClaude) {
     const adapter = getAdapter(resolved!.manifest, adapterEnv(ctx));
-    resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: pod.dir })) ?? undefined;
+    resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: cur.dir })) ?? undefined;
   }
   const res = await spawnAgent(ctx, {
     role,
-    dir: pod.dir,
-    model: op.model ? String(op.model) : (pod.model ?? undefined),
-    agentId: pod.agent ?? undefined,
+    dir: cur.dir,
+    model: op.model ? String(op.model) : (cur.model ?? undefined),
+    agentId: cur.agent ?? undefined,
     resumeToken,
     forkRef,
     profile: profile ?? null,
     freshStart: !resumeToken && !forkRef,
+    // worktree pod: keep the repo/branch binding across relaunches (S0 merge
+    // + bash-guard autonomy depend on these)
+    repo: cur.repo,
+    repoBase: cur.repo_base,
+    branch: cur.branch,
   });
   ctx.emit?.({ type: 'pod_relaunched', role, run: res.run.id });
   let mode: string | null = null;
@@ -347,7 +426,7 @@ function resolveForkRef(ctx: CoreCtx, ref: string): string {
     if (!s) throw new OpError(404, `no session for pod ${ref} (no transcript yet)`);
     return s.token;
   }
-  const dir = path.join(pod.dir, '.pi', 'sessions');
+  const dir = seatPaths(ctx.store.home, ref).sessionsDir;
   let files: string[] = [];
   try {
     files = fs.readdirSync(dir).filter((f) => f.endsWith(`_${ref}.jsonl`)).sort();
@@ -366,7 +445,7 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   if (podRuntime(pod.agent) === 'claude') {
     // claude TUI: raw paste; the per-pod transcript is the typed ack (it grows
     // when the prompt lands, independent of turn duration).
-    const projectsDir = claudeProjectsDir(claudeConfigDir(pod.dir), pod.dir);
+    const projectsDir = claudeProjectsDir(claudeConfigDir(path.join(ctx.store.home, 'pods', pod.role)), pod.dir);
     const before = claudeTranscriptFp(projectsDir);
     const res = await terminal.send(pod.terminal_target!, text, { raw: true });
     const { grown } = await waitForTranscriptGrowth(projectsDir, before, 30000);
@@ -467,8 +546,19 @@ async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'done');
   stopPodSocket(pod.dir);
   store.setPodState(ctx.store, role, 'closed');
+  // --purge: remove the worktree (the BRANCH survives — it is the merge
+  // candidate); default keeps the checkout as the pod's memory
+  let purged: string | null = null;
+  if (op.purge === true && pod.repo && pod.branch) {
+    try {
+      await gitops.worktreeRemove(pod.repo, pod.dir);
+      purged = pod.dir;
+    } catch (e) {
+      throw new OpError(500, `worktree purge failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   ctx.emit?.({ type: 'pod_closed', role });
-  return { ok: true };
+  return { ok: true, purged };
 }
 
 async function terminalCheck(ctx: CoreCtx): Promise<unknown> {
@@ -577,20 +667,122 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
   const task = store.getTask(ctx.store, id);
   if (!task) throw new OpError(404, `no task: ${id}`);
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
+  // S0 merge: a worktree pod's done task is a merge candidate. Auto fast-
+  // forward ONLY (branch == base + commits, base not moved, clean tree);
+  // everything else is skipped with a reason — the branch stays a human
+  // merge candidate. The outcome is audited in the transition reason.
+  let mergeNote: string | null = null;
+  if (to === 'done') {
+    mergeNote = await mergeWorktreeIfEligible(ctx, task.pod_role);
+  }
   const reason =
     (to === 'blocked' || to === 'needs') && op.reason ? String(op.reason).slice(0, 200) :
     to === 'cancelled' ? 'cancelled' : `reported by ${by}`;
   // done: optional result text (carried into the next workflow step)
   const result = to === 'blocked' || to === 'needs' ? reason :
     to === 'done' && op.result ? String(op.result).slice(0, 400) : null;
+  const finalReason = mergeNote ? `${reason}${reason ? ' · ' : ''}${mergeNote}` : reason;
   try {
-    store.setTaskStatus(ctx.store, id, to, { reason, result });
+    store.setTaskStatus(ctx.store, id, to, { reason: finalReason, result });
   } catch (e) {
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
-  ctx.emit?.({ type: `task_${to}`, taskId: id, pod: task.pod_role, reason });
+  ctx.emit?.({ type: `task_${to}`, taskId: id, pod: task.pod_role, reason: finalReason });
   advanceWorkflow(ctx, id);
   return store.getTask(ctx.store, id);
+}
+
+// S0: try an auto fast-forward merge for a worktree pod's finished task.
+// Returns a short audit note (null = not a worktree pod / no merge action).
+// Never throws: a merge problem must not fail the task report.
+async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string): Promise<string | null> {
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod?.repo || !pod.branch) return null;
+  let base = pod.repo_base;
+  if (!base) {
+    // no recorded base (recovered row): the base repo's checked-out branch
+    // is the obvious target — record it and proceed
+    base = await gitops.currentBranch(pod.repo).catch(() => null);
+    if (base && base !== 'HEAD') store.setPodRepo(ctx.store, role, pod.repo, base, pod.branch);
+  }
+  if (!base || base === 'HEAD') return 'merge skipped (no base branch recorded)';
+  const wt = pod.dir; // worktree pod: pod.dir IS the worktree checkout
+  try {
+    if (!gitops.isGitWorkdir(wt)) return 'merge skipped (worktree missing)';
+    const st = await gitops.worktreeStatus(pod.repo, wt, pod.branch, base);
+    if (st.ahead === 0) return 'merge skipped (no commits ahead of base)';
+    if (st.dirty) return `merge skipped (worktree dirty: commit first) — ${st.ahead} commit(s) unmerged`;
+    if (st.behind > 0) return `merge skipped (base moved: ${st.behind} behind) — rebase/merge by hand`;
+    const r = await gitops.ffMerge(pod.repo, pod.branch, base);
+    return r.ok ? `auto-merged (ff, ${st.ahead} commit(s))` : `merge skipped (${r.error})`;
+  } catch (e) {
+    return `merge error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+// merge-status: ahead/behind/dirty of a worktree pod vs its base branch
+async function podMergeStatus(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod?.repo || !pod.branch || !pod.repo_base) throw new OpError(400, `pod ${role} is not a worktree pod (spawn with --repo)`);
+  const wt = pod.dir; // worktree pod: pod.dir IS the worktree checkout
+  if (!gitops.isGitWorkdir(wt)) throw new OpError(409, 'worktree missing on disk');
+  const st = await gitops.worktreeStatus(pod.repo, wt, pod.branch, pod.repo_base);
+  return { role, repo: pod.repo, base: pod.repo_base, branch: pod.branch, ...st };
+}
+
+// ---------- team ----------
+
+// `flock team up <pods.yaml>`: reconcile a declared team. Live pods are only
+// refreshed (guidance re-merged, picked up at next launch); missing or closed
+// pods are spawned. Never kills a live pod — a team file change takes effect
+// on relaunch/close, which the operator does deliberately.
+async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const file = path.resolve(String(op.file ?? 'pods.yaml'));
+  let src: string;
+  try {
+    src = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    throw new OpError(400, `cannot read team file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  let spec;
+  try {
+    spec = parseTeamYaml(src);
+  } catch (e) {
+    if (e instanceof TeamParseError) throw new OpError(400, e.message);
+    throw e;
+  }
+  const results: Record<string, unknown> = {};
+  for (const [role, s] of Object.entries(spec.pods)) {
+    const existing = store.getPodByRole(ctx.store, role);
+    if (existing && existing.state === 'live') {
+      let refreshed = false;
+      if (s.guidance && podRuntime(existing.agent) === 'pi') {
+        mergeManagedBlock(path.join(existing.dir, 'AGENTS.md'), `team:${role}`, s.guidance);
+        refreshed = true;
+      }
+      results[role] = { action: 'live', guidance: refreshed ? 'refreshed (applies at next launch)' : undefined };
+      continue;
+    }
+    try {
+      const res = (await apply({
+        type: 'pod_spawn',
+        role,
+        agent: s.agent,
+        model: s.model,
+        profile: s.profile,
+        repo: s.repo,
+        base: s.base,
+        posture: s.posture,
+        teamGuidance: s.guidance,
+      }, ctx)) as { run?: { id: string } };
+      results[role] = { action: existing ? 'respawned' : 'spawned', run: res?.run?.id };
+    } catch (e) {
+      results[role] = { action: 'failed', error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  ctx.emit?.({ type: 'team_up', file, pods: Object.keys(spec.pods) });
+  return { file, results };
 }
 
 // ---------- workflows ----------

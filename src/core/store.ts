@@ -15,6 +15,9 @@ export interface Pod {
   state: string; // live | idle | closed
   resume_token: string | null; // pinned session file (honest resume override)
   profile: string | null; // manifest profile applied at spawn (survives relaunch)
+  repo: string | null; // base git repo for a worktree pod
+  repo_base: string | null; // base branch the worktree branch ff-merges into
+  branch: string | null; // worktree branch (flock/<role>)
   created_at: string;
 }
 
@@ -188,6 +191,42 @@ ALTER TABLE pods ADD COLUMN resume_token TEXT;
 ALTER TABLE pods ADD COLUMN profile TEXT;
 `,
   },
+  {
+    name: '008_repo',
+    sql: `
+ALTER TABLE pods ADD COLUMN repo TEXT;
+ALTER TABLE pods ADD COLUMN repo_base TEXT;
+ALTER TABLE pods ADD COLUMN branch TEXT;
+`,
+  },
+  {
+    name: '009_usage',
+    sql: `
+CREATE TABLE IF NOT EXISTS usage_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  role TEXT NOT NULL,
+  at TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  input INTEGER NOT NULL DEFAULT 0,
+  output INTEGER NOT NULL DEFAULT 0,
+  cache_read INTEGER NOT NULL DEFAULT 0,
+  cache_write INTEGER NOT NULL DEFAULT 0,
+  model TEXT,
+  UNIQUE(role, at, input, output, cache_read, cache_write)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_role_ts ON usage_events(role, ts);
+CREATE TABLE IF NOT EXISTS runs_archive(
+  id TEXT PRIMARY KEY,
+  pod_role TEXT NOT NULL,
+  pid INTEGER,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  exit_state TEXT,
+  meta TEXT,
+  archived_at TEXT NOT NULL
+);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -233,18 +272,19 @@ function dbOf(store: Store): DatabaseSync {
 
 export function openPod(
   store: Store,
-  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null },
+  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null; repo?: string | null; repoBase?: string | null; branch?: string | null },
 ): void {
   dbOf(store)
     .prepare(
-      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile)
-       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?)
+      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile, repo, repo_base, branch)
+       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?)
        ON CONFLICT(role) DO UPDATE SET
          dir = excluded.dir,
          terminal_target = excluded.terminal_target, model = excluded.model,
-         agent = excluded.agent, profile = excluded.profile, state = 'live'`,
+         agent = excluded.agent, profile = excluded.profile, state = 'live',
+         repo = excluded.repo, repo_base = excluded.repo_base, branch = excluded.branch`,
     )
-    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null);
+    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null, p.repo ?? null, p.repoBase ?? null, p.branch ?? null);
 }
 
 export function getPodByRole(store: Store, role: string): Pod | null {
@@ -262,6 +302,12 @@ export function setPodProfile(store: Store, role: string, profile: string | null
   dbOf(store)
     .prepare('UPDATE pods SET profile = ? WHERE role = ?')
     .run(profile, role);
+}
+
+export function setPodRepo(store: Store, role: string, repo: string | null, repoBase: string | null, branch: string | null): void {
+  dbOf(store)
+    .prepare('UPDATE pods SET repo = ?, repo_base = ?, branch = ? WHERE role = ?')
+    .run(repo, repoBase, branch, role);
 }
 
 export function listPods(store: Store): Pod[] {
@@ -583,4 +629,78 @@ export function listTasksForInstance(store: Store, instanceId: string): Task[] {
   return dbOf(store)
     .prepare('SELECT * FROM tasks WHERE workflow_instance_id = ? ORDER BY created_at ASC, rowid ASC')
     .all(instanceId) as unknown as Task[];
+}
+
+// ---------- usage (economy) ----------
+
+export interface UsageEvent {
+  role: string;
+  runId: string | null;
+  ts: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  model: string | null;
+}
+
+export function insertUsageEventDeduped(
+  store: Store,
+  e: { role: string; at: string; ts?: string; input: number; output: number; cacheRead?: number; cacheWrite?: number; model?: string | null },
+): void {
+  dbOf(store)
+    .prepare(
+      'INSERT INTO usage_events(role, at, ts, input, output, cache_read, cache_write, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    )
+    .run(e.role, e.at, e.ts ?? e.at, e.input, e.output, e.cacheRead ?? 0, e.cacheWrite ?? 0, e.model ?? null);
+}
+
+export interface UsageSummary {
+  role: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  messages: number;
+  model: string | null;
+  since: string | null;
+}
+
+export function usageSummary(store: Store, opts?: { role?: string; since?: string }): UsageSummary[] {
+  const where: string[] = [];
+  const args: string[] = [];
+  if (opts?.role) {
+    where.push('role = ?');
+    args.push(opts.role);
+  }
+  if (opts?.since) {
+    where.push('ts >= ?');
+    args.push(opts.since);
+  }
+  const sql = `SELECT role, SUM(input) input, SUM(output) output, SUM(cache_read) cacheRead, SUM(cache_write) cacheWrite, COUNT(*) messages,
+    (SELECT model FROM usage_events u2 WHERE u2.role = usage_events.role ${opts?.since ? 'AND u2.ts >= ? ' : ''}ORDER BY u2.ts DESC LIMIT 1) model,
+    MIN(ts) since
+    FROM usage_events ${where.length ? 'WHERE ' + where.join(' AND ') : ''} GROUP BY role ORDER BY input + output DESC`;
+  if (opts?.since) args.push(opts.since);
+  return dbOf(store).prepare(sql).all(...args) as unknown as UsageSummary[];
+}
+
+export function deleteUsageBefore(store: Store, ts: string): number {
+  const r = dbOf(store).prepare('DELETE FROM usage_events WHERE ts < ?').run(ts);
+  return Number(r.changes);
+}
+
+// retention: finished runs older than N days -> runs_archive (archive, not
+// delete: the meta carries launch/resume/usage history the operator audits)
+export function archiveOldRuns(store: Store, olderThanIso: string): number {
+  const db = dbOf(store);
+  const rows = db
+    .prepare('SELECT id, pod_role, pid, started_at, ended_at, exit_state, meta FROM runs WHERE ended_at IS NOT NULL AND started_at < ?')
+    .all(olderThanIso) as { id: string; pod_role: string; pid: number | null; started_at: string; ended_at: string | null; exit_state: string | null; meta: string | null }[];
+  for (const r of rows) {
+    db.prepare('INSERT OR IGNORE INTO runs_archive(id, pod_role, pid, started_at, ended_at, exit_state, meta, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.id, r.pod_role, r.pid, r.started_at, r.ended_at, r.exit_state, r.meta, nowIso());
+    db.prepare('DELETE FROM runs WHERE id = ?').run(r.id);
+  }
+  return rows.length;
 }

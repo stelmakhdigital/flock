@@ -70,6 +70,9 @@ export interface PodBinding {
   model?: string;
   launchPosture?: LaunchPosture;
   permissionMode?: string;
+  extraEnv?: Record<string, string>; // flock-managed env for the harness child
+  seatRoot?: string; // canonical pod state dir (home/pods/<role>); != cwd for worktree pods
+  trustLevel?: string; // sandbox trust level (overrides manifest; e.g. off for worktree pods)
 }
 
 export interface StartupFile {
@@ -287,10 +290,11 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       launchId: opts.launchId,
       trust,
       trustOption: this.m.trustOption,
-      trustLevel: this.m.trustLevel,
+      trustLevel: binding.trustLevel ?? this.m.trustLevel,
       model: binding.model,
       sessionFile: mode.mode === 'resume' ? mode.sessionFile : undefined,
       forkRef: mode.mode === 'fork' ? mode.forkRef : undefined,
+      extraEnv: binding.extraEnv ? Object.entries(binding.extraEnv).map(([k, v]) => `${k}=${v}`) : undefined,
     });
     // PERSISTENT PANE: the window outlives the runner.
     // Alive -> typed-stop the old foreground (C-c -> runner writes the
@@ -391,8 +395,9 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
     private env: AdapterEnv,
   ) {}
 
-  projectsDir(cwd: string): string {
-    return claudeProjectsDir(claudeConfigDir(cwd), cwd);
+  // transcripts are keyed by the CWD slug, config lives in the seat
+  projectsDir(configDir: string, cwd: string): string {
+    return claudeProjectsDir(configDir, cwd);
   }
 
   async listInstalled(): Promise<{ installed: boolean; version?: string; detail?: string }> {
@@ -409,7 +414,7 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
     // root-owned ~/.claude). Auth is env-based (manifest env: ANTHROPIC_*).
     // Pre-seed onboarding state: a fresh config hard-fails the first-launch
     // api.anthropic.com connectivity check (observed live).
-    const cfg = claudeConfigDir(binding.cwd);
+    const cfg = claudeConfigDir(binding.seatRoot ?? binding.cwd);
     fs.mkdirSync(cfg, { recursive: true });
     seedClaudeConfig(cfg, this.m.env?.ANTHROPIC_API_KEY);
     installPodCli(binding.cwd, this.env.token);
@@ -443,7 +448,7 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
 
   // The session token of the last run on this pod (newest transcript).
   async latestSessionToken(binding: PodBinding): Promise<string | null> {
-    return latestClaudeSession(this.projectsDir(binding.cwd))?.token ?? null;
+    return latestClaudeSession(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd))?.token ?? null;
   }
 
   async launchHarness(
@@ -457,7 +462,7 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
     if (mode !== 'fresh' && (!token || !validateClaudeSessionToken(token))) {
       return { ok: false, error: `invalid claude session token: ${token ?? '(empty)'}`, recovery: 'attention_required' };
     }
-    if (mode !== 'fresh' && !fs.existsSync(path.join(this.projectsDir(binding.cwd), `${token}.jsonl`))) {
+    if (mode !== 'fresh' && !fs.existsSync(path.join(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd), `${token}.jsonl`))) {
       return { ok: false, error: `resume: transcript not found: ${token}`, recovery: 'retry_fresh' };
     }
     // permission axis (claude-native): manifest permissionMode, binding
@@ -483,7 +488,7 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
     if (!(await terminal.windowExists(binding.role))) {
       await terminal.spawnPod({ role: binding.role, dir: binding.cwd });
     }
-    const cfg = claudeConfigDir(binding.cwd);
+    const cfg = claudeConfigDir(binding.seatRoot ?? binding.cwd);
     const extraEnv = { ...CLAUDE_FIXED_ENV, CLAUDE_CONFIG_DIR: cfg, ...(this.m.env ?? {}) };
     await terminal.launchInWindow(binding.role, cmd, binding.cwd, extraEnv);
 

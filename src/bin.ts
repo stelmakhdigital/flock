@@ -24,9 +24,10 @@ import { coreUp, coreDown, coreStatus, healthz, readToken } from './core/up.js';
 const USAGE = `flock — core CLI
   [global: -p <profile> — отдельный core-инстанс (multi-flock)]
 
-  flock core up | down | status
+  flock core up | down | restart | status
   flock healthz
   flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--posture floor|full_bypass] [--cmd c]
+      [--repo <git-path>] [--base <branch>]   # worktree-под: свой checkout + ветка flock/<role>
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
       pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
   flock pod relaunch <role> [--model M] [--fork [role]] [--profile P]   # --fork (без аргумента) = форк своей сессии
@@ -36,7 +37,10 @@ const USAGE = `flock — core CLI
   flock pod send <role> <text...>
   flock pod answer <role> <n|текст>   # ответ оператором на dialog (gate) в pi-поде
   flock pod capture <role> [--lines N]
-  flock pod close <role>
+  flock pod merge-status <role>               # worktree: ahead/behind/dirty к base
+  flock pod close <role> [--purge]            # --purge: удалить worktree (ветка остаётся)
+  flock team up [pods.yaml]              # team-реконсиляция: spawn недостающих, refresh живых
+  flock usage [role]                     # токены по подам (экономия pipeline)
   flock pm up                          # поднять pm-под (goal loop)
   flock pm down                        # остановить goal loop (close pm-пода)
   flock pm state                       # снимок pipeline для pm
@@ -150,6 +154,10 @@ async function main(): Promise<void> {
     case 'core':
       if (sub === 'up') console.log(await coreUp());
       else if (sub === 'down') console.log(await coreDown());
+      else if (sub === 'restart') {
+        await coreDown();
+        console.log(await coreUp());
+      }
       else if (sub === 'status') console.log(await coreStatus());
       else console.log(USAGE);
       return;
@@ -175,6 +183,8 @@ async function main(): Promise<void> {
           fork: flag(flags, '--fork'),
           posture: flag(flags, '--posture'),
           profile: flag(flags, '--profile'),
+          repo: flag(flags, '--repo'),
+          base: flag(flags, '--base'),
         }));
       } else if (action === 'relaunch') {
         const flags = rest.slice(1);
@@ -193,10 +203,28 @@ async function main(): Promise<void> {
         const flags = rest.slice(1);
         print(await api('POST', '/api/ops', { type: 'pod_capture', role, lines: numFlag(flags, '--lines', 200) }));
       } else if (action === 'close') {
-        print(await api('POST', '/api/ops', { type: 'pod_close', role }));
+        const flags = rest.slice(1);
+        print(await api('POST', '/api/ops', { type: 'pod_close', role, purge: flags.includes('--purge') }));
+      } else if (action === 'merge-status') {
+        print(await api('POST', '/api/ops', { type: 'pod_merge_status', role }));
       } else {
         console.log(USAGE);
       }
+      return;
+    }
+
+    case 'team': {
+      if (sub === 'up') {
+        print(await api('POST', '/api/ops', { type: 'team_up', file: rest[0] }));
+      } else {
+        console.log(USAGE);
+      }
+      return;
+    }
+
+    case 'usage': {
+      const q = rest[0] ? `?role=${encodeURIComponent(rest[0])}` : '';
+      print(await api('GET', `/api/usage${q}`));
       return;
     }
 
