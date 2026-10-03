@@ -13,6 +13,7 @@ assert.strictEqual(validateIntent({ op: 'pod_spawn', role: 'new' }), null);
 assert.strictEqual(validateIntent({ op: 'pod_close', role: 'dev' }), null);
 assert.strictEqual(validateIntent({ op: 'workflow_start', name: 'wf' }), null);
 assert.strictEqual(validateIntent({ op: 'task_cancel', id: 't_1' }), null);
+assert.strictEqual(validateIntent({ op: 'task_unblock', id: 't_1' }), null);
 
 // not in the whitelist: core ops, pm recursion, unknown
 assert.ok(validateIntent({ op: 'pod_relaunch_all', role: 'x' })?.includes('whitelist'));

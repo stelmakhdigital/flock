@@ -25,6 +25,7 @@ const INTENT_OPS = new Set([
   'task_blocked',
   'task_needs',
   'task_cancel',
+  'task_unblock',
   'pod_send',
   'pod_relaunch',
   'pod_spawn',
@@ -46,9 +47,9 @@ export function validateIntent(i: Record<string, unknown>): string | null {
     if (!String(i.title ?? '').trim()) return 'task_add: title required';
     if (i.pod_role !== undefined && !/^[a-z0-9][a-z0-9-]{0,30}$/.test(String(i.pod_role))) return 'task_add: bad pod_role';
   }
-  if (op === 'task_done' || op === 'task_blocked' || op === 'task_needs' || op === 'task_cancel') {
+  if (op === 'task_done' || op === 'task_blocked' || op === 'task_needs' || op === 'task_cancel' || op === 'task_unblock') {
     if (!String(i.id ?? '').trim()) return `${op}: id required`;
-    if (op !== 'task_cancel' && op !== 'task_done' && !String(i.reason ?? '').trim()) return `${op}: reason required`;
+    if (op === 'task_blocked' || op === 'task_needs') return String(i.reason ?? '').trim() ? null : `${op}: reason required`;
   }
   if (op === 'pod_send') {
     if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(String(i.role ?? ''))) return 'pod_send: bad role';

@@ -112,6 +112,10 @@ assert.strictEqual(parseAnswerLine('/answer2'), null);
 const sel: PendingDialog = { id: 'd1', index: 1, method: 'select', title: 't', options: ['Выполнить', 'Отменить'], at: 't' };
 assert.deepStrictEqual(dialogResponse(sel, { kind: 'index', n: 1 }), { value: 'Выполнить' });
 assert.deepStrictEqual(dialogResponse(sel, { kind: 'value', v: 'отменить' }), { value: 'Отменить' });
+// unambiguous substring (option carries "name — description")
+const sel2: PendingDialog = { id: 'd4', index: 4, method: 'select', title: 't', options: ['planner — planning', 'trivial — тестовый субагент', 'worker — implementation'], at: 't' };
+assert.deepStrictEqual(dialogResponse(sel2, { kind: 'value', v: 'trivial' }), { value: 'trivial — тестовый субагент' });
+assert.strictEqual(dialogResponse(sel2, { kind: 'value', v: 'r' }), null); // ambiguous: matches all three
 assert.strictEqual(dialogResponse(sel, { kind: 'index', n: 9 }), null);
 assert.strictEqual(dialogResponse(sel, { kind: 'value', v: 'нет такого' }), null);
 const conf: PendingDialog = { id: 'd2', index: 2, method: 'confirm', title: 't', at: 't' };

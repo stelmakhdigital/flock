@@ -312,8 +312,11 @@ export function dialogResponse(dialog: PendingDialog, arg: AnswerArg): { value?:
       const o = opts[arg.n - 1];
       return o !== undefined ? { value: o } : null;
     }
-    const o = opts.find((x) => x.toLowerCase() === arg.v.toLowerCase());
-    return o !== undefined ? { value: o } : null;
+    const exact = opts.find((x) => x.toLowerCase() === arg.v.toLowerCase());
+    if (exact !== undefined) return { value: exact };
+    // unambiguous substring match (options often carry "name — description")
+    const partial = opts.filter((x) => x.toLowerCase().includes(arg.v.toLowerCase()));
+    return partial.length === 1 ? { value: partial[0] } : null;
   }
   if (dialog.method === 'confirm') {
     if (arg.kind === 'index') return { confirmed: arg.n === 1 };

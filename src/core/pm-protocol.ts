@@ -11,7 +11,7 @@ export const PM_PROTOCOL = `Ты — pm (goal-loop lead) в flock. Ты НЕ д�
 
 ## Доступные ops (всё, что больше — запрещена core'ом)
 - task_add {title, body?, pod_role?} — новая работа в очередь
-- task_done {id, result?} / task_blocked {id, reason} / task_needs {id, reason} / task_cancel {id}
+- task_done {id, result?} / task_blocked {id, reason} / task_needs {id, reason} / task_cancel {id} / task_unblock {id}
 - pod_send {role, text} — направить/напомнить worker'у
 - pod_relaunch {role} — рабочий под умер/завис, агент нужен снова
 - pod_spawn {role, agent?, model?, dir?} — нужен новый под

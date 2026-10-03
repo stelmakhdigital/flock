@@ -255,8 +255,13 @@ export class RunnerCore {
     if (!DIALOGS.has(method)) {
       if (method === 'setStatus' && typeof record.statusKey === 'string') {
         this.io.mirrorLine(`[ext] ${record.statusKey}`);
+        this.io.appendActivity({ event: 'ext_ui', method, statusKey: record.statusKey });
+      } else if (method === 'notify' && typeof record.message === 'string') {
+        this.io.appendActivity({ event: 'ext_notify', message: record.message.slice(0, 200), notifyType: record.notifyType });
       }
-      this.io.appendActivity({ event: 'ext_ui', method, statusKey: record.statusKey });
+      // setWidget (per-second extension status chrome) is NOT an audit event:
+      // it floods activity.jsonl and would shrink the health tail window,
+      // dropping long-open dialogs out of gate detection.
       return;
     }
     if (method === 'select' && /доверя|trust/i.test(title) && id && options.length) {

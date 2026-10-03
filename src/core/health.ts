@@ -84,7 +84,7 @@ export function parseActivity(raw: string, maxLines = 400): ActivityLine[] {
   return out;
 }
 
-export function readActivity(stateRoot: string, role: string, maxLines = 400): ActivityLine[] {
+export function readActivity(stateRoot: string, role: string, maxLines = 2000): ActivityLine[] {
   let raw: string;
   try {
     raw = fs.readFileSync(path.join(seatPaths(stateRoot, role).activityPath), 'utf8');
@@ -197,9 +197,19 @@ async function checkPod(ctx: CoreCtx, role: string, opts: HealthOpts, nowMs: num
   const activity = readActivity(ctx.store.home, role);
 
   // --- gate: a dialog is waiting for a human ---------------------------------
-  const gate = detectGate(activity);
+  // A dialog is live only for the CURRENT run: activity is durable, and an
+  // unanswered dialog from a dead runner (relaunch/kill) has no response
+  // path and must not alert forever.
+  const run = store.currentRun(ctx.store, role);
+  const runStartMs = run ? Date.parse(run.started_at) : 0;
+  const gateRaw = detectGate(activity);
+  const gateAt = gateRaw && typeof gateRaw.at === 'string' ? Date.parse(gateRaw.at) : 0;
+  const gate = gateRaw && Number.isFinite(gateAt) && gateAt >= runStartMs ? gateRaw : null;
+  for (const a of listAlerts(ctx).filter((a) => a.pod_role === role && a.kind === 'gate')) {
+    if (!gate || a.ref !== gate.id) alertClear(ctx, role, 'gate', a.ref);
+  }
   if (gate && typeof gate.id === 'string') {
-    const at = Date.parse(typeof gate.at === 'string' ? gate.at : '') || nowMs;
+    const at = gateAt || nowMs;
     const ageMin = (nowMs - at) / 60000;
     const prev = db(ctx)
       .prepare('SELECT * FROM health_alerts WHERE pod_role = ? AND kind = ? AND ref = ?')
@@ -232,9 +242,6 @@ async function checkPod(ctx: CoreCtx, role: string, opts: HealthOpts, nowMs: num
       }
     }
     return; // a dialog-blocked agent is not "idle"
-  }
-  for (const a of listAlerts(ctx).filter((a) => a.pod_role === role && a.kind === 'gate')) {
-    alertClear(ctx, role, 'gate', a.ref);
   }
 
   // --- idle: at rest while a claimed task is still active ----------------------

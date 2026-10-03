@@ -88,6 +88,9 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
     case 'task_cancel':
       await pmNotifyMaybe(ctx, 'task_cancelled', o, 'cancelled');
       return taskReport(o, ctx, 'cancelled');
+    case 'task_unblock':
+      await pmNotifyMaybe(ctx, 'task_unblocked', o, 'queued');
+      return taskReport(o, ctx, 'queued');
     case 'task_done':
       await pmNotifyMaybe(ctx, 'task_done', o, 'done');
       return taskReport(o, ctx, 'done');

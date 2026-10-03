@@ -424,8 +424,8 @@ const TASK_FLOW: Record<string, string[]> = {
   queued: ['active', 'cancelled'],
   active: ['done', 'blocked', 'cancelled', 'queued', 'needs'],
   needs: ['active', 'done', 'blocked', 'cancelled'], // human resolved / closed
+  blocked: ['queued', 'active', 'done', 'cancelled'], // unblock (requeue/hand off), close
   done: [],
-  blocked: [],
   cancelled: [],
 };
 

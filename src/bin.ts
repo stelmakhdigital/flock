@@ -36,6 +36,7 @@ const USAGE = `flock — core CLI
   flock pod capture <role> [--lines N]
   flock pod close <role>
   flock pm up                          # поднять pm-под (goal loop)
+  flock pm down                        # остановить goal loop (close pm-пода)
   flock pm state                       # снимок pipeline для pm
   flock pm intent '<json>'             # typed intent: {"op":"task_done","id":"t_x"} или {"intents":[...]}
   flock health ls                      # built-in health-алерты (gate/idle)
@@ -55,6 +56,7 @@ const USAGE = `flock — core CLI
   flock task blocked <id> [reason...]
   flock task needs <id> [reason...]
   flock task cancel <id>
+  flock task unblock <id>               # blocked → queued (arbiter возьмёт заново)
   flock workflow define <name> --steps "id1:role1,id2:role2"
   flock workflow start <name> [payload...]
   flock workflow ls
@@ -195,6 +197,8 @@ async function main(): Promise<void> {
     case 'pm': {
       if (sub === 'up') {
         print(await api('POST', '/api/ops', { type: 'pm_up' }));
+      } else if (sub === 'down') {
+        print(await api('POST', '/api/ops', { type: 'pod_close', role: 'pm' }));
       } else if (sub === 'state') {
         print(await api('POST', '/api/ops', { type: 'pm_state' }));
       } else if (sub === 'intent') {
@@ -209,7 +213,7 @@ async function main(): Promise<void> {
         const body = Array.isArray(intents) ? { type: 'pm_intents', intents } : { type: 'pm_intents', intents: [intents] };
         print(await api('POST', '/api/ops', body));
       } else {
-        console.log('usage: flock pm up | state | intent \'<json>\'');
+        console.log('usage: flock pm up | down | state | intent \'<json>\'');
       }
       return;
     }
@@ -307,6 +311,8 @@ async function main(): Promise<void> {
         print(await api('GET', `/api/tasks${args[0] ? `?status=${encodeURIComponent(args[0])}` : ''}`));
       } else if (action === 'history') {
         print(await api('POST', '/api/ops', { type: 'task_history', id: args[0] }));
+      } else if (action === 'unblock') {
+        print(await api('POST', '/api/ops', { type: 'task_unblock', id: args[0] }));
       } else if (action === 'done' || action === 'blocked' || action === 'needs' || action === 'cancel') {
         const op =
           action === 'done' ? { type: 'task_done', id: args[0], result: args.slice(1).join(' ') } :
