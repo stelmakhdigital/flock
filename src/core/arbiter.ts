@@ -3,7 +3,7 @@ import * as store from './store.js';
 import * as terminal from './terminal.js';
 import * as gitops from './gitops.js';
 import { frameMessage, newNonce } from "./runner-protocol.js";
-import { advanceWorkflow, podRelaunch, type CoreCtx } from './ops.js';
+import { advanceWorkflow, checkWorkflowTimeouts, podRelaunch, type CoreCtx } from './ops.js';
 import { pmNotify } from './pm.js';
 import { podRuntime } from './agent.js';
 
@@ -89,6 +89,10 @@ export async function runArbiterTick(ctx: CoreCtx): Promise<void> {
       }
     }
   }
+
+  // 4) 5.4a: workflow step timeout/TTL (active step task outlived its
+  // step.timeoutMin -> blocked; the retry budget then re-queues or stops)
+  checkWorkflowTimeouts(ctx);
 }
 
 function claimPrompt(task: store.Task): string {

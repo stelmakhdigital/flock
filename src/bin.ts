@@ -65,9 +65,12 @@ const USAGE = `flock — core CLI
   flock task cancel <id>
   flock task unblock <id>               # blocked → queued (arbiter возьмёт заново)
   flock workflow define <name> --steps "id1:role1,id2:role2"
-  flock workflow start <name> [payload...]
+  flock workflow rm <name>
+  flock workflow define <name> --steps-json '[{"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2}]'
+  flock workflow start <name> [--priority N] [payload...]
   flock workflow ls
   flock workflow status <instance_id>
+  flock task add <role> "title" [--body ...] [--priority N]
   flock terminal check`;
 
 const [, , cmd, sub, ...rest] = process.argv;
@@ -344,12 +347,18 @@ async function main(): Promise<void> {
           body = rest2[bi + 1];
           titleArgs = [...rest2.slice(0, bi), ...rest2.slice(bi + 2)];
         }
+        const pi = rest2.indexOf('--priority');
+        let priority: number | undefined;
+        if (pi >= 0) {
+          priority = Number(rest2[pi + 1]);
+          titleArgs = titleArgs.filter((a) => a !== '--priority' && a !== String(priority));
+        }
         const title = titleArgs.join(' ').trim();
         if (!role || !title) {
-          console.error('usage: flock task add <role> <title...> [--body TEXT]');
+          console.error('usage: flock task add <role> <title...> [--body TEXT] [--priority N]');
           process.exit(1);
         }
-        print(await api('POST', '/api/ops', { type: 'task_add', role, title, body }));
+        print(await api('POST', '/api/ops', { type: 'task_add', role, title, body, priority }));
       } else if (action === 'ls') {
         print(await api('GET', `/api/tasks${args[0] ? `?status=${encodeURIComponent(args[0])}` : ''}`));
       } else if (action === 'history') {
@@ -373,20 +382,36 @@ async function main(): Promise<void> {
     case 'workflow': {
       const action = sub;
       const args = rest;
+      if (action === 'rm') {
+        print(await api('POST', '/api/ops', { type: 'workflow_rm', name: args[0] }));
+        return;
+      }
       if (action === 'define') {
         const name = args[0];
         const stepsRaw = flag(args, '--steps');
-        if (!name || !stepsRaw) {
-          console.error('usage: flock workflow define <name> --steps "id1:role1,id2:role2"');
+        const stepsJson = flag(args, '--steps-json');
+        if (!name || (!stepsRaw && !stepsJson)) {
+          console.error('usage: flock workflow define <name> --steps "id1:role1,id2:role2" | --steps-json \'[{id, role, ...}]\'');
           process.exit(1);
         }
-        const steps = stepsRaw.split(',').map((s) => {
-          const [id, role, ...t] = s.trim().split(':');
-          return t.length ? { id, role, title: t.join(':') } : { id, role };
-        });
+        const steps = stepsJson
+          ? JSON.parse(stepsJson)
+          : stepsRaw!.split(',').map((s) => {
+              const [id, role, ...t] = s.trim().split(':');
+              return t.length ? { id, role, title: t.join(':') } : { id, role };
+            });
         print(await api('POST', '/api/ops', { type: 'workflow_define', name, steps }));
       } else if (action === 'start') {
-        print(await api('POST', '/api/ops', { type: 'workflow_start', name: args[0], payload: args.slice(1).join(' ') || undefined }));
+        const priority = flag(args, '--priority');
+        const payloadArgs = args.slice(1).filter((a, i) => a !== '--priority' && args[i] !== '--priority');
+        print(
+          await api('POST', '/api/ops', {
+            type: 'workflow_start',
+            name: args[0],
+            priority: priority != null ? Number(priority) : undefined,
+            payload: payloadArgs.join(' ') || undefined,
+          }),
+        );
       } else if (action === 'ls') {
         print(await api('POST', '/api/ops', { type: 'workflow_ls' }));
       } else if (action === 'status') {

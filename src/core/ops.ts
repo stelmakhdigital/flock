@@ -102,6 +102,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   // -- workflows -------------------------------------------------------------
   workflow_define: { group: 'workflow', scopes: ['operator'], summary: 'define a workflow (named step list)', run: (o, c) => workflowDefine(o, c) },
   workflow_start: { group: 'workflow', scopes: ['operator'], summary: 'start a workflow instance', run: (o, c) => workflowStart(o, c) },
+  workflow_rm: { group: 'workflow', scopes: ['operator'], summary: 'delete a workflow definition (instances survive)', run: (o, c) => workflowRm(o, c) },
   workflow_ls: { group: 'workflow', scopes: ['operator'], summary: 'list workflows and instances', run: (_o, c) => ({ workflows: store.listWorkflows(c.store), instances: store.listWorkflowInstances(c.store) }) },
   workflow_status: { group: 'workflow', scopes: ['operator'], summary: 'instance status (steps, states)', run: (o, c) => workflowStatus(o, c) },
   // -- tasks -----------------------------------------------------------------
@@ -631,7 +632,13 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
     throw new OpError(403, `pod token ${ctx.caller.role}: cannot add a task for pod ${role}`);
   }
   const id = store.newId('t');
-  store.insertTask(ctx.store, { id, title, body: op.body ? String(op.body) : null, podRole: role });
+  store.insertTask(ctx.store, {
+    id,
+    title,
+    body: op.body ? String(op.body) : null,
+    podRole: role,
+    priority: op.priority != null ? Math.max(0, Math.min(10, Math.trunc(Number(op.priority)))) : 0,
+  });
   ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
   void pmNotify(ctx, { type: 'task_added', detail: `таск ${id} "${title.slice(0, 80)}" → pod ${role} (очередь)` }).catch(() => {});
   return store.getTask(ctx.store, id);
@@ -811,7 +818,15 @@ async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknow
 
 // ---------- workflows ----------
 
-interface WfStep { id: string; role: string; title?: string }
+interface WfStep {
+  id: string;
+  role: string;
+  title?: string;
+  // 5.4a: economy/reliability knobs
+  priority?: number; // 0..10, added to the instance priority for the step task
+  timeoutMin?: number; // 1..10080, active-task TTL -> blocked (step timeout)
+  retry?: number; // 0..5, auto re-queue on blocked/cancelled
+}
 
 function parseSteps(raw: unknown): WfStep[] {
   if (!Array.isArray(raw) || raw.length === 0) throw new OpError(400, 'steps: non-empty array required');
@@ -823,6 +838,15 @@ function parseSteps(raw: unknown): WfStep[] {
     }
     if (ids.has(s.id)) throw new OpError(400, `duplicate step id: ${s.id}`);
     ids.add(s.id);
+    if (s.priority != null && (!Number.isInteger(s.priority) || s.priority < 0 || s.priority > 10)) {
+      throw new OpError(400, `step ${s.id}: priority must be an integer 0..10`);
+    }
+    if (s.timeoutMin != null && (!Number.isInteger(s.timeoutMin) || s.timeoutMin < 1 || s.timeoutMin > 10080)) {
+      throw new OpError(400, `step ${s.id}: timeoutMin must be an integer 1..10080`);
+    }
+    if (s.retry != null && (!Number.isInteger(s.retry) || s.retry < 0 || s.retry > 5)) {
+      throw new OpError(400, `step ${s.id}: retry must be an integer 0..5`);
+    }
   }
   return steps;
 }
@@ -840,6 +864,7 @@ function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.W
     podRole: step.role,
     workflowInstanceId: inst.id,
     workflowStep: step.id,
+    priority: (inst.priority ?? 0) + (step.priority ?? 0),
   });
 }
 
@@ -866,9 +891,47 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
     store.setWorkflowInstanceState(ctx.store, inst.id, 'running', next.id);
     ctx.emit?.({ type: 'workflow_step', instanceId: inst.id, step: next.id, role: next.role });
   } else {
+    // failure (blocked/cancelled): retry budget per step, then stop the instance
+    const attempts = store.wfStepAttempts(ctx.store, inst.id, task.workflow_step!);
+    const retryBudget = steps.find((s) => s.id === task.workflow_step)?.retry ?? 0;
+    if (task.status !== 'cancelled' && attempts < retryBudget) {
+      store.bumpWfStepAttempts(ctx.store, inst.id, task.workflow_step!);
+      enqueueStepTask(ctx, inst, wf, steps.find((s) => s.id === task.workflow_step)!);
+      ctx.emit?.({ type: 'workflow_retry', instanceId: inst.id, step: task.workflow_step, attempt: store.wfStepAttempts(ctx.store, inst.id, task.workflow_step!), reason: task.result ?? task.status });
+      return;
+    }
     const state = task.status === 'cancelled' ? 'cancelled' : 'blocked';
     store.setWorkflowInstanceState(ctx.store, inst.id, state);
     ctx.emit?.({ type: `workflow_${state}`, instanceId: inst.id, reason: task.result ?? task.status });
+  }
+}
+
+// 5.4a: step timeout/TTL — an active workflow step task that outlived the
+// step's timeoutMin is blocked (step timeout); advanceWorkflow then applies
+// the retry budget (re-queue) or stops the instance. Plain tasks (no
+// workflow) have no TTL: a long human-in-the-loop task must not be killed.
+export function checkWorkflowTimeouts(ctx: CoreCtx): void {
+  const now = Date.now();
+  for (const task of store.listTasks(ctx.store, 'active')) {
+    if (!task.workflow_instance_id || !task.workflow_step) continue;
+    const inst = store.getWorkflowInstance(ctx.store, task.workflow_instance_id);
+    if (!inst || inst.state !== 'running') continue;
+    const wf = store.getWorkflow(ctx.store, inst.workflow_id);
+    if (!wf) continue;
+    const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
+    const step = steps.find((s) => s.id === task.workflow_step);
+    if (!step?.timeoutMin || !task.claimed_at) continue;
+    const claimed = Date.parse(task.claimed_at);
+    if (Number.isNaN(claimed)) continue;
+    if (now - claimed > step.timeoutMin * 60_000) {
+      try {
+        store.setTaskStatus(ctx.store, task.id, 'blocked', { reason: `step ${step.id} timeout (${step.timeoutMin} min)`, result: `step ${step.id} timeout (${step.timeoutMin} min)` });
+        ctx.emit?.({ type: 'task_blocked', taskId: task.id, pod: task.pod_role, reason: `step ${step.id} timeout` });
+        advanceWorkflow(ctx, task.id);
+      } catch {
+        // already transitioned by a concurrent op; harmless
+      }
+    }
   }
 }
 
@@ -888,10 +951,15 @@ async function workflowStart(op: Record<string, unknown>, ctx: CoreCtx): Promise
   const wf = store.getWorkflow(ctx.store, String(op.name ?? ''));
   if (!wf) throw new OpError(404, `no workflow: ${String(op.name ?? '')}`);
   const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
+  const rawPrio = op.priority;
+  const priority = rawPrio != null ? Math.max(0, Math.min(10, Math.trunc(Number(rawPrio)))) : 0;
+  if (rawPrio != null && (!Number.isInteger(Number(rawPrio)) || Number(rawPrio) < 0 || Number(rawPrio) > 10)) {
+    throw new OpError(400, `priority must be an integer 0..10: ${String(rawPrio)}`);
+  }
   const instId = store.newId('wfi');
-  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null });
+  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null, priority });
   store.setWorkflowInstanceState(ctx.store, instId, 'running', steps[0].id);
-  enqueueStepTask(ctx, { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null }, wf, steps[0]);
+  enqueueStepTask(ctx, { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null, priority }, wf, steps[0]);
   ctx.emit?.({ type: 'workflow_started', instanceId: instId, workflow: wf.name });
   return { instance: store.getWorkflowInstance(ctx.store, instId), workflow: wf };
 }
@@ -900,7 +968,16 @@ async function workflowStatus(op: Record<string, unknown>, ctx: CoreCtx): Promis
   const id = String(op.id ?? '');
   const inst = store.getWorkflowInstance(ctx.store, id);
   if (!inst) throw new OpError(404, `no workflow instance: ${id}`);
-  return { instance: inst, workflow: store.getWorkflow(ctx.store, inst.workflow_id), tasks: store.listTasksForInstance(ctx.store, id) };
+  return { instance: inst, workflow: store.getWorkflow(ctx.store, inst.workflow_id), tasks: store.listTasksForInstance(ctx.store, id), stepState: store.listWfStepStates(ctx.store, id) };
+}
+
+async function workflowRm(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '').trim();
+  const wf = store.getWorkflow(ctx.store, name);
+  if (!wf) throw new OpError(404, `no workflow: ${name}`);
+  store.deleteWorkflow(ctx.store, wf.id);
+  ctx.emit?.({ type: 'workflow_removed', name });
+  return { ok: true, name };
 }
 
 async function watchdogRegister(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {

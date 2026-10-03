@@ -227,6 +227,19 @@ CREATE TABLE IF NOT EXISTS runs_archive(
 );
 `,
   },
+  {
+    name: '010_wf2',
+    sql: `
+ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflow_instances ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS wf_step_state(
+  instance_id TEXT NOT NULL,
+  step TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (instance_id, step)
+);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -490,6 +503,7 @@ export interface Task {
   finished_at: string | null;
   workflow_instance_id: string | null;
   workflow_step: string | null;
+  priority: number;
 }
 
 const TASK_FLOW: Record<string, string[]> = {
@@ -503,11 +517,11 @@ const TASK_FLOW: Record<string, string[]> = {
 
 export function insertTask(
   store: Store,
-  t: { id: string; title: string; body: string | null; podRole: string; workflowInstanceId?: string | null; workflowStep?: string | null },
+  t: { id: string; title: string; body: string | null; podRole: string; workflowInstanceId?: string | null; workflowStep?: string | null; priority?: number },
 ): void {
   dbOf(store)
-    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso(), t.workflowInstanceId ?? null, t.workflowStep ?? null);
+    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso(), t.workflowInstanceId ?? null, t.workflowStep ?? null, t.priority ?? 0);
   dbOf(store)
     .prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, NULL, ?, ?, ?)')
     .run(t.id, 'queued', 'created', nowIso());
@@ -529,7 +543,7 @@ export function listTasks(store: Store, status?: string, limit = 100): Task[] {
 
 export function oldestQueuedTask(store: Store, podRole: string): Task | null {
   const r = dbOf(store)
-    .prepare("SELECT * FROM tasks WHERE status = 'queued' AND pod_role = ? ORDER BY created_at ASC, rowid ASC LIMIT 1")
+    .prepare("SELECT * FROM tasks WHERE status = 'queued' AND pod_role = ? ORDER BY priority DESC, created_at ASC, rowid ASC LIMIT 1")
     .get(podRole) as Task | undefined;
   return r ?? null;
 }
@@ -585,6 +599,7 @@ export interface WorkflowInstance {
   current_step: string | null;
   created_at: string;
   finished_at: string | null;
+  priority: number;
 }
 
 export function insertWorkflow(store: Store, w: { id: string; name: string; spec: string }): void {
@@ -602,10 +617,14 @@ export function listWorkflows(store: Store): Workflow[] {
   return dbOf(store).prepare('SELECT * FROM workflows ORDER BY created_at DESC, rowid DESC').all() as unknown as Workflow[];
 }
 
-export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null }): void {
+export function deleteWorkflow(store: Store, id: string): void {
+  dbOf(store).prepare('DELETE FROM workflows WHERE id = ?').run(id);
+}
+
+export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null; priority?: number }): void {
   dbOf(store)
-    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at) VALUES (?, ?, ?, 'running', ?)")
-    .run(i.id, i.workflowId, i.payload, nowIso());
+    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at, priority) VALUES (?, ?, ?, 'running', ?, ?)")
+    .run(i.id, i.workflowId, i.payload, nowIso(), i.priority ?? 0);
 }
 
 export function getWorkflowInstance(store: Store, id: string): WorkflowInstance | null {
@@ -630,6 +649,30 @@ export function listTasksForInstance(store: Store, instanceId: string): Task[] {
   return dbOf(store)
     .prepare('SELECT * FROM tasks WHERE workflow_instance_id = ? ORDER BY created_at ASC, rowid ASC')
     .all(instanceId) as unknown as Task[];
+}
+
+// per-step retry accounting: how many times a step of an instance has been
+// attempted (the first enqueue counts as attempt 0; each re-queue after a
+// failure increments it)
+export function wfStepAttempts(store: Store, instanceId: string, step: string): number {
+  const r = dbOf(store)
+    .prepare('SELECT attempts FROM wf_step_state WHERE instance_id = ? AND step = ?')
+    .get(instanceId, step) as { attempts: number } | undefined;
+  return r?.attempts ?? 0;
+}
+
+export function bumpWfStepAttempts(store: Store, instanceId: string, step: string): number {
+  const next = wfStepAttempts(store, instanceId, step) + 1;
+  dbOf(store)
+    .prepare('INSERT INTO wf_step_state(instance_id, step, attempts) VALUES (?, ?, ?) ON CONFLICT(instance_id, step) DO UPDATE SET attempts = ?')
+    .run(instanceId, step, next, next);
+  return next;
+}
+
+export function listWfStepStates(store: Store, instanceId: string): { step: string; attempts: number }[] {
+  return dbOf(store)
+    .prepare('SELECT step, attempts FROM wf_step_state WHERE instance_id = ? ORDER BY step')
+    .all(instanceId) as { step: string; attempts: number }[];
 }
 
 // ---------- usage (economy) ----------

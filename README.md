@@ -282,9 +282,39 @@ pods:
 ./bin/flock usage dev        # один под
 ```
 
+## Workflow 5.4a: приоритет + timeout + retry (этап 5.4a)
+
+Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):
+
+```json
+[
+  {"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2},
+  {"id":"rev","role":"rev"}
+]
+```
+
+- **priority** (0..10): шаг-таск получает `priority = instance + step`; арбитер
+  берёт из очереди **сначала приоритет, потом FIFO**. У `flock task add`
+  тоже `--priority N`, у `flock workflow start` — `--priority N` (базовый
+  уровень инстанса);
+- **timeoutMin** (1..10080): TTL активного step-таска (счёт с `claimed_at`).
+  Превышение → таск `blocked (step timeout)`; plain-таски (не workflow) TTL
+  не имеют — долгий human-in-the-loop не режется;
+- **retry** (0..5): бюджет повторных попыток на blocked/cancelled шаг. Пока
+  бюджет не исчерпан — шаг ре-квизится (новый таск), инстанс `running`;
+  исчерпан → инстанс `blocked` (оператор: `flock task unblock`). Счётчик —
+  `wf_step_state`, виден в `flock workflow status`.
+
+```sh
+./bin/flock workflow define pipe --steps-json '[{"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2},{"id":"rev","role":"rev"}]'
+./bin/flock workflow start pipe "фича X" --priority 3
+./bin/flock workflow status <instance_id>   # state + stepState (attempts)
+./bin/flock workflow rm <name>              # удалить определение (инстансы живут)
+```
+
 ## Pod-scoped авторизация (этап 5.3)
 
-Однако-токен core, но **scope зависит от сокета**: запросы, пришедшие на
+Один токен core, но **scope зависит от сокета**: запросы, пришедшие на
 unix-сокет пода (`<pod>/core.sock`), видят только ops со scope `pod`
 (чтение + свои задачи: add/report/unblock/merge-status/capture/close
 своего пода). Operator-only ops (spawn/relaunch/watchdog/…) через сокет
