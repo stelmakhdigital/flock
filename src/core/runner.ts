@@ -1,8 +1,7 @@
-// flock-runner — pane-hosted bridge for the pi runtime (flock's analogue of
-// OpenRig's pi-runner). Spawns `pi --mode rpc`, mirrors a human-readable
-// transcript to the pane, keeps a typed sidecar (runner-state.json) + a
-// durable activity log (activity.jsonl), and forwards pane stdin to pi RPC
-// (prompt / steer / follow_up / abort).
+// flock-runner — pane-hosted bridge for the pi runtime. Spawns `pi --mode rpc`,
+// mirrors a human-readable transcript to the pane, keeps a typed sidecar
+// (runner-state.json) + a durable activity log (activity.jsonl), and forwards
+// pane stdin to pi RPC (prompt / steer / follow_up / abort).
 //
 // Node builtins + runner-protocol only: runnable standalone as
 //   node dist/core/runner.js --state-root ... --role ... --cwd ... --launch-id ...

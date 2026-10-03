@@ -1,7 +1,6 @@
 // Agent adapters: ONE generic implementation + declarative manifests.
 // Adding a runtime (claude, codex, ...) = a JSON manifest in <FLOCK_HOME>/agents/,
-// not new code. This mirrors OpenRig's shape (RuntimeAdapter interface +
-// agent.yaml spec), reduced to what our v1 actually needs.
+// not new code: a RuntimeAdapter per runtime + a manifest describing it.
 //
 // Manifest = the "interface" a new agent implements:
 //   {
@@ -33,7 +32,7 @@ export interface AgentManifest {
   trustOption?: string; // fallback: trust dialog option substring
   trustLevel?: 'off' | 'dev' | 'untrusted' | 'vm'; // sandbox level pre-seeded per pod
   // v3.1: launch posture — 'full_bypass' forces full resource trust
-  // (OpenRig YOLO semantics). Default 'floor' respects `trust`.
+  // (YOLO semantics). Default 'floor' respects `trust`.
   launchPosture?: 'floor' | 'full_bypass';
   // v3.1: permission mode slot (claude/codex style). The pi adapter REJECTS
   // a set value: pi resource trust is a separate mechanism (trust/posture).
@@ -122,7 +121,7 @@ export function podRuntime(agentId: string | null): string {
   return r ? manifestRuntime(r.manifest) : 'cmd';
 }
 
-// ── Config projection (flock's analogue of OpenRig's project(), symlinked) ──
+// ── Config projection (per-pod PI_CODING_AGENT_DIR, symlinked) ──────────
 // Per-pod PI_CODING_AGENT_DIR needs the provider/model config + extension
 // cache. Symlinks keep ONE source of truth (no secret copies).
 

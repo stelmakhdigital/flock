@@ -61,8 +61,8 @@ ticks.register('arbiter', ARBITER_INTERVAL_MS, () => runArbiterTick(ctx));
 // stage 4.1: built-in pod health (gate/idle wake-ladder, 20s)
 ticks.register('health', 20_000, () => runHealthTick(ctx));
 // runkeeper (5s): the agent process is dead -> mark the run crashed fast.
-// Fast detection layer for "window alive, agent dead" (OpenRig's
-// seat-identity reconciler, in our naming: run = the live occupant).
+// Fast detection layer for "window alive, agent dead": the persistent pane
+// outlives the runner, so pid-liveness alone would miss it.
 // runkeeper (5s): the agent process is dead -> mark the run crashed fast.
 // Two signals: (1) typed — the runner sidecar records the pi exit code,
 // launchId-scoped; (2) pid liveness — covers non-runner pods and pane death.
@@ -128,7 +128,7 @@ function checkRunLiveness(): void {
 ticks.register('runkeeper', 5000, checkRunLiveness);
 // pm (goal loop, 5min): sweep the pipeline, wake the pm pod only on change
 ticks.register('pm', 60_000, () => pmTick(ctx));
-// watchdog: declarative checks registered by agents/CLI (1s tick, OpenRig-style)
+// watchdog: declarative checks registered by agents/CLI (1s tick)
 ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 
 const pidFile = path.join(FLOCK_HOME, 'core.pid');

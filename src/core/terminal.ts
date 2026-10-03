@@ -46,8 +46,8 @@ async function newWindow(name: string, dir: string, cmd: string | undefined, rol
   // cmd set: the window's process IS the command, with the env prefix (flock
   // CLI on PATH, instance identity) — bash/cmd pods: the agent is the shell,
   // its life = the window's life.
-  // cmd undefined: bare interactive shell — the PERSISTENT pane (OpenRig seat
-  // model): it outlives the runner, each launch is pasted into it.
+  // cmd undefined: bare interactive shell — the PERSISTENT pane:
+  // it outlives the runner, each launch is pasted into it.
   let line = cmd;
   if (line !== undefined && role) {
     const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
@@ -180,7 +180,7 @@ export async function paneAlive(role: string): Promise<boolean> {
 
 // Foreground process of the pod pane. A runner-sidecar "ready" (or a READY
 // marker in scrollback) only counts while the foreground is NOT a shell —
-// a dead runner leaves the pane at the shell (OpenRig's stale-artifact guard).
+// a dead runner leaves the pane at the shell (stale-artifact guard).
 export const SHELL_COMMANDS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh']);
 export async function paneCommand(target: string): Promise<string> {
   const r = await tmux(['display-message', '-p', '-t', target, '#{pane_current_command}']);

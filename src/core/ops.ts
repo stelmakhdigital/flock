@@ -180,8 +180,8 @@ async function spawnAgent(ctx: CoreCtx, o: {
     }
     adapter.project(binding);
     const pre = await adapter.deliverStartup(startup, binding, 'pre_launch');
-    // required startup files are launch-blocking (OpenRig contract: a failed
-    // required file is a startup error, not a warning)
+    // required startup files are launch-blocking: a failed required file is a
+    // startup error, not a warning
     if (pre.failed.length) {
       throw new OpError(500, `startup delivery failed: ${pre.failed.map((f) => `${f.path}: ${f.error}`).join('; ')}`);
     }

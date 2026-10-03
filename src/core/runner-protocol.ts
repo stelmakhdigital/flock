@@ -1,7 +1,6 @@
 // flock-runner protocol: the shared PURE contract between the pane-hosted
 // runner (runner.ts) and core. No side effects — constants, builders, parsers
-// — so tests can assert it hermetically (borrowed from OpenRig's
-// pi-runner-protocol design).
+// — so tests can assert it hermetically.
 //
 // What the runner does (in the pod's tmux pane):
 //   pane stdin (flockmsg / human typing)  -> pi RPC prompt / steer / follow_up
@@ -81,7 +80,7 @@ export function parseRunnerState(raw: string): RunnerState | null {
   }
 }
 
-// ── Child env: deny-by-default allowlist (OpenRig BR-3 analogue). Only
+// ── Child env: deny-by-default allowlist. Only
 // baseline vars + flock identity cross the boundary; config isolation via
 // PI_CODING_AGENT_DIR / PI_CODING_AGENT_SESSION_DIR; provider key only if
 // the model's declared provider needs one (env, not copied files).
@@ -157,7 +156,7 @@ export interface PiChildArgs {
 //   the session; fork yields a NEW session file (uuid), resume keeps the
 //   exact file — never an interactive picker.
 // - --no-context-files + --append-system-prompt <pod AGENTS.md>: full
-//   isolation from ancestor/home context files (improvement over OpenRig).
+//   isolation from ancestor/home context files.
 export function buildPiChildArgs(o: PiChildArgs): string[] {
   const args = [
     '--mode', 'rpc',
@@ -174,9 +173,9 @@ export function buildPiChildArgs(o: PiChildArgs): string[] {
 }
 
 // ── Window launch command ─────────────────────────────────────────────────────
-// The persistent shell pane (OpenRig seat model): the window outlives the
-// runner; each launch is a new foreground process pasted into the pane with
-// the env prefix (flock CLI on PATH, instance identity).
+// The persistent shell pane: the window outlives the runner; each launch is a
+// new foreground process pasted into the pane with env prefix (flock CLI on
+// PATH, instance identity) + the runtime command. One line, JSON-quoted.
 export function buildWindowLaunchCmd(
   cmd: string,
   o: { role: string; dir: string; home: string; port: string; basePath: string; extraEnv?: Record<string, string> },
@@ -194,8 +193,7 @@ export function buildWindowLaunchCmd(
 
 // ── Launch posture + resource trust ─────────────────────────────────────────
 // pi --approve/--no-approve governs RESOURCE TRUST (context files), not a
-// permission policy (that distinction is OpenRig's, we keep it). The resolved
-// launch posture is authoritative: full_bypass forces full resource trust
+// permission policy. The resolved launch posture is authoritative: full_bypass forces full resource trust
 // (their YOLO semantics); floor respects the configured value.
 export type LaunchPosture = 'floor' | 'full_bypass';
 
@@ -204,13 +202,13 @@ export function resolveTrust(
   posture: LaunchPosture | undefined,
 ): 'approve' | 'no-approve' {
   if (posture === 'full_bypass') return 'approve';
-  // flock default: managed, per-pod-isolated pods -> approve (OpenRig's seat
-  // default is no-approve; ours are sandboxes, not user projects).
+  // flock default: managed, per-pod-isolated pods -> approve. Our pods are
+  // sandboxes, not user projects, so the floor trusts their own context.
   return configured ?? 'approve';
 }
 
 // ── Resume token = the persisted pi session file ────────────────────────────
-// HONEST resume (OpenRig BR-6): relaunch with the exact file, never an
+// HONEST resume: relaunch with the exact file, never an
 // interactive picker. A missing file is retry_fresh — the caller decides,
 // never a silent fresh start.
 const MAX_RESUME_TOKEN_LEN = 512;
@@ -231,9 +229,9 @@ export function validateResumeToken(raw: unknown): ResumeTokenCheck {
 }
 
 // ── Fork source ─────────────────────────────────────────────────────────────
-// v1: kind "native_id" only (parent session file path or session id),
-// as in OpenRig's pi adapter. The captured resumeToken after a fork is the
-// NEW post-fork session, never the parent's (the adapter enforces this).
+// v1: kind "native_id" only (parent session file path or session id).
+// The captured resumeToken after a fork is the NEW post-fork session,
+// never the parent's (the adapter enforces this).
 export interface ForkSource {
   kind: 'native_id' | 'artifact_path' | 'name' | 'last';
   value?: string;

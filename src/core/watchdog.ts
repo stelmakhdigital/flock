@@ -9,7 +9,7 @@ import type { WatchdogJob } from './store.js';
 
 // watchdog: declarative checks registered by agents/CLI; core evaluates them
 // on schedule and wakes the target pod. One runner, one tick, policy registry.
-// (OpenRig-style architecture, see docs/04-watchdog.md.)
+// (see docs/04-watchdog.md.)
 
 export const WATCHDOG_POLICIES = ['marker', 'timer', 'stall', 'file'] as const;
 export type PolicyName = (typeof WATCHDOG_POLICIES)[number];

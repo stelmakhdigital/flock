@@ -1,5 +1,5 @@
 // RuntimeAdapter — the contract core uses to launch, project and check a
-// runtime (OpenRig's 5-method contract, flock vocabulary):
+// runtime (5-method contract):
 //
 //   listInstalled  — is the runtime usable at all? (clear error at spawn)
 //   project        — per-pod config projection (isolation, CLI snapshot)
@@ -50,7 +50,7 @@ export interface AdapterEnv {
   runnerPath: string; // dist/core/runner.js
 }
 
-// The pod's launch coordinates (OpenRig NodeBinding analogue). tmux target is
+// The pod's launch coordinates. tmux target is
 // derived from the role (terminal.winTarget) — no separate field needed.
 export interface PodBinding {
   role: string;
@@ -248,7 +248,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       sessionFile: mode.mode === 'resume' ? mode.sessionFile : undefined,
       forkRef: mode.mode === 'fork' ? mode.forkRef : undefined,
     });
-    // PERSISTENT PANE (OpenRig seat model): the window outlives the runner.
+    // PERSISTENT PANE: the window outlives the runner.
     // Alive -> typed-stop the old foreground (C-c -> runner writes the
     // sidecar `exited`, pane returns to the shell); gone -> create it.
     // On failure we do NOT kill the window: the operator keeps the pane
@@ -316,7 +316,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     }
     // Secondary signals (runner-authored markers in scrollback) only when the
     // sidecar has no answer — a stale marker from a prior launch cannot
-    // override a live sidecar. Negative markers first (OpenRig ordering).
+    // override a live sidecar. Negative markers first.
     if (!state) {
       const out = await terminal.capture(target, 80).catch(() => '');
       if (out.includes(RUNNER_ERROR_MARKER)) return { ready: false, reason: 'runner error marker in pane', code: 'runner_error' };

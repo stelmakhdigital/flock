@@ -94,8 +94,8 @@ Auto-registration: core кладёт `flock` в `~/.flock/bin` (на PATH в о�
 instance останавливается. DAG/зависимости/retry — при первом реальном случае.
 
 **Runkeeper** (тик 5с) — pid агента умер → run `crashed` за один тик
-(«окно живо, агент мёртв»). Это наше название OpenRig seat-identity-
-reconciler в лексике run/pod.
+(«окно живо, агент мёртв»: постоянный pane переживает runner, поэтому
+одного pid-проверки недостаточно).
 
 **Агент-адаптеры** — manifest-driven: один generic-реализатор + декларация
 `{id, command, modelFlag?, args?, env?}`. Встроенные: `pi`, `bash`;
@@ -131,7 +131,7 @@ reconciler в лексике run/pod.
   перезапускает ТОЧНЫЙ persisted session-файл (`--session <file>`);
   файла нет → retry_fresh с записью в meta, никогда silent fresh;
   `--fork <role|file>` — форк в новую сессию (новая, не родительская);
-- **постоянный pane** (OpenRig seat-модель): окно пода — постоянный shell,
+- **постоянный pane**: окно пода — постоянный shell,
   relaunch = typed stop старого runner'а (C-c → sidecar `exited`) + новая
   команда в то же окно; скроллбек живёт через агентов, pane_pid неизменен;
   runkeeper детектит нетипизированную смерть: `runner gone (pane at shell)`;
@@ -165,7 +165,7 @@ trust/resume/fork-решения; hermetic-тест `npm test`) +
 
 ## RuntimeAdapter + honest resume (этап 3.1)
 
-Запуск рантайма — через 5-методный **RuntimeAdapter** (как у OpenRig):
+Запуск рантайма — через 5-методный **RuntimeAdapter**:
 `listInstalled / project / deliverStartup / launchHarness / checkReady`.
 pi — RPC-мост с typed session identity; bash — plain window. Новый рантайм
 = адаптер + manifest (`runtime` в JSON).
