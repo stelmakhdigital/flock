@@ -28,6 +28,18 @@ export async function git(repo: string, ...args: string[]): Promise<string> {
   }
 }
 
+// git with stdout on non-zero exit too (merge-tree reports conflicts on
+// stdout with exit 1 — the normal git() wrapper would drop it)
+export async function gitRaw(repo: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const r = await execFileP('git', ['-C', repo, ...args], { timeout: 15_000 });
+    return { code: 0, stdout: r.stdout, stderr: r.stderr };
+  } catch (e) {
+    const err = e as { code?: number; stdout?: string; stderr?: string; message?: string };
+    return { code: Number(err.code ?? 1), stdout: String(err.stdout ?? ''), stderr: String(err.stderr ?? err.message ?? '') };
+  }
+}
+
 export function isGitRepo(p: string): boolean {
   try {
     return fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, '.git'));
@@ -129,6 +141,84 @@ export async function ffMerge(repo: string, branch: string, baseRef: string): Pr
       throw new GitError(`base branch ${baseName} not checked out (HEAD is ${headRef})`);
     }
     await git(repo, 'merge', '--ff-only', branch);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// S1 (5.4b): merge-tree dry-run — a conflict-free proof BEFORE touching the
+// base. git >= 2.38: `merge-tree --write-tree base branch` exits 0 (clean,
+// first line = the merged tree) or 1 (conflicts, details in the tail).
+// A conflict here means the squash merge would not apply — the task goes
+// blocked (merge conflict) with the summary, zero half-states.
+export async function mergeTreeCheck(
+  repo: string,
+  baseRef: string,
+  branch: string,
+): Promise<{ clean: boolean; info: string }> {
+  const r = await gitRaw(repo, 'merge-tree', '--write-tree', baseRef, branch);
+  if (r.code === 0) return { clean: true, info: '' };
+  if (r.code === 1) {
+    // conflict report: keep the CONFLICT lines (the diff summary the
+    // operator needs to decide)
+    const lines = r.stdout.split('\n').filter((l) => l.startsWith('CONFLICT') || l.startsWith('Auto-merging'));
+    const info = (lines.length ? lines : r.stdout.split('\n').filter(Boolean)).slice(0, 8).join(' | ').slice(0, 400);
+    return { clean: false, info: info || 'conflict detected' };
+  }
+  return { clean: false, info: `merge-tree failed (exit ${r.code}): ${r.stderr.trim().split('\n').pop() ?? ''}` };
+}
+
+// S1: squash merge — the branch's changes land on base as ONE commit
+// flock(<task-id>): <title> (the agent's wip history never reaches main).
+// Requires the base branch checked out at the repo (same precondition as S0
+// ff: the operator's repo is the integration point). A conflicted squash is
+// aborted (git merge --abort) — no half-state, the worktree branch survives.
+export async function squashMerge(
+  repo: string,
+  branch: string,
+  baseRef: string,
+  message: string,
+  worktree?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const headRef = (await git(repo, 'rev-parse', '--abbrev-ref', 'HEAD')).split('\n')[0];
+    const probe = await git(repo, 'rev-parse', '--symbolic', '--quiet', '--verify', baseRef).catch(() => '');
+    const baseName = (probe.split('\n')[0] || '').trim().split('/').pop()!;
+    if (!baseName) throw new GitError(`base ${baseRef} not found`);
+    if (headRef !== baseName) {
+      throw new GitError(`base branch ${baseName} not checked out (HEAD is ${headRef})`);
+    }
+    // protect the operator: the squash touches the repo's working tree; a
+    // conflicted squash is cleaned with `reset --hard`, so the tree must be
+    // clean (tracked) BEFORE we start
+    const dirty = await git(repo, 'status', '--porcelain', '--untracked-files=no').catch(() => '?');
+    if (dirty) throw new GitError('base repo has uncommitted changes — commit them first (operator work is protected)');
+    try {
+      await git(repo, 'merge', '--squash', branch);
+    } catch (e) {
+      // a conflicted SQUASH leaves no MERGE_HEAD: merge --abort cannot undo
+      // it. The pre-check above guarantees a clean tree, so reset --hard
+      // restores exactly the pre-merge state (untracked files untouched)
+      const rr = await gitRaw(repo, 'reset', '--hard');
+      if (rr.code !== 0) {
+        throw new GitError(`squash conflicted AND cleanup failed (exit ${rr.code}) — the base repo working tree needs manual attention`);
+      }
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+    await git(repo, 'commit', '-m', message);
+    // advance the worktree branch onto the squash commit: the wip history
+    // must NOT survive on the branch — the next merge would re-detect the
+    // squashed changes as add/add conflicts (the classic squash trap). The
+    // worktree is clean (precondition upstream), so this is safe.
+    if (worktree) {
+      const newHead = await git(repo, 'rev-parse', 'HEAD');
+      const rr = await gitRaw(worktree, 'reset', '--hard', newHead);
+      if (rr.code !== 0) {
+        // the base merge already landed — do not roll it back; report loudly
+        throw new GitError(`squash landed on ${baseName}, but advancing the branch failed (exit ${rr.code}) — the branch needs a manual reset`);
+      }
+    }
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };

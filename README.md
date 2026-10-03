@@ -282,6 +282,41 @@ pods:
 ./bin/flock usage dev        # один под
 ```
 
+## Merge-гейт S1+S2 (этап 5.4b)
+
+Worktree-под при `task done` проходит **merge-гейт** — merge решает гейт,
+а не самооценка агента:
+
+- **S1 — merge policy** (`--merge ff|squash|never` при spawn, `merge:` в team
+  file, `merge` в agent-манифесте; default `ff` = S0):
+  - `ff` — S0: fast-forward только, все отклонения — skip с причиной;
+  - `squash` — **dry-run `git merge-tree base branch` ДО merge**: конфликт →
+    таск `blocked (merge conflict)` + CONFLICT-суммарий в result (ноль
+    полу-состояний); чисто → один коммит `flock(<task-id>): <title>` на base
+    (wip-история агента в main не попадает). После squash **ветка
+    передвигается на squash-коммит** (иначе следующий merge ловит add/add
+    конфликт на уже-смерженных файлах);
+  - `never` — ветка всегда остаётся ручным merge-кандидатом;
+  - защита оператора: base-репо с незакоммиченными изменениями → merge
+    отклоняется (squash чистится через `reset --hard`, только после pre-check
+    чистоты);
+- **S2 — quality gate**: workflow с `--require-test` (или `requireTest` в
+  `--steps-json`-спеке/flag при start) — перед merge core запускает `testCmd`
+  из agent-манифеста **в worktree**: green → merge, red/timeout → таск
+  `blocked (quality gate: tests failed)` + лог (tail 4KB) в `run.meta`
+  (`kind: quality_gate`). Требует гейт, но `testCmd` не задан → merge со
+  заметкой о дыре в конфиге (не молча).
+
+```sh
+# squash-под + workflow с тестовым гейтом
+./bin/flock pod spawn dev --agent pi --repo ~/Code/myrepo --base main --merge squash
+./bin/flock workflow define ship --steps "dev:dev,rev:rev" --require-test
+./bin/flock workflow start ship "фича X"          # red gate -> blocked (tests failed)
+```
+
+Agent-манифесты: `merge` и `testCmd` поля (например `~/.flock/agents/pi.json`:
+`"testCmd": "npm test"`). Таймаут гейта: `FLOCK_TEST_TIMEOUT_S` (default 600).
+
 ## Workflow 5.4a: приоритет + timeout + retry (этап 5.4a)
 
 Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):

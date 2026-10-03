@@ -18,6 +18,7 @@ export interface Pod {
   repo: string | null; // base git repo for a worktree pod
   repo_base: string | null; // base branch the worktree branch ff-merges into
   branch: string | null; // worktree branch (flock/<role>)
+  merge_policy: string | null; // 5.4b S1: ff (default) | squash | never
   created_at: string;
 }
 
@@ -240,6 +241,15 @@ CREATE TABLE IF NOT EXISTS wf_step_state(
 );
 `,
   },
+  {
+    // 5.4b S1+S2: merge policy per pod (ff|squash|never, default ff) and the
+    // quality-gate flag per workflow instance (require: test)
+    name: '011_merge',
+    sql: `
+ALTER TABLE pods ADD COLUMN merge_policy TEXT;
+ALTER TABLE workflow_instances ADD COLUMN require_test INTEGER NOT NULL DEFAULT 0;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -285,19 +295,20 @@ function dbOf(store: Store): DatabaseSync {
 
 export function openPod(
   store: Store,
-  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null; repo?: string | null; repoBase?: string | null; branch?: string | null },
+  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null; repo?: string | null; repoBase?: string | null; branch?: string | null; mergePolicy?: string | null },
 ): void {
   dbOf(store)
     .prepare(
-      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile, repo, repo_base, branch)
-       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?)
+      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile, repo, repo_base, branch, merge_policy)
+       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(role) DO UPDATE SET
          dir = excluded.dir,
          terminal_target = excluded.terminal_target, model = excluded.model,
          agent = excluded.agent, profile = excluded.profile, state = 'live',
-         repo = excluded.repo, repo_base = excluded.repo_base, branch = excluded.branch`,
+         repo = excluded.repo, repo_base = excluded.repo_base, branch = excluded.branch,
+         merge_policy = excluded.merge_policy`,
     )
-    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null, p.repo ?? null, p.repoBase ?? null, p.branch ?? null);
+    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null, p.repo ?? null, p.repoBase ?? null, p.branch ?? null, p.mergePolicy ?? null);
 }
 
 export function getPodByRole(store: Store, role: string): Pod | null {
@@ -600,6 +611,7 @@ export interface WorkflowInstance {
   created_at: string;
   finished_at: string | null;
   priority: number;
+  require_test: number; // 5.4b S2: quality gate (test) required before merge
 }
 
 export function insertWorkflow(store: Store, w: { id: string; name: string; spec: string }): void {
@@ -621,10 +633,10 @@ export function deleteWorkflow(store: Store, id: string): void {
   dbOf(store).prepare('DELETE FROM workflows WHERE id = ?').run(id);
 }
 
-export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null; priority?: number }): void {
+export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null; priority?: number; requireTest?: boolean }): void {
   dbOf(store)
-    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at, priority) VALUES (?, ?, ?, 'running', ?, ?)")
-    .run(i.id, i.workflowId, i.payload, nowIso(), i.priority ?? 0);
+    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at, priority, require_test) VALUES (?, ?, ?, 'running', ?, ?, ?)")
+    .run(i.id, i.workflowId, i.payload, nowIso(), i.priority ?? 0, i.requireTest ? 1 : 0);
 }
 
 export function getWorkflowInstance(store: Store, id: string): WorkflowInstance | null {
