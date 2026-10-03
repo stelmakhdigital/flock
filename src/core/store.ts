@@ -13,6 +13,8 @@ export interface Pod {
   model: string | null;
   agent: string | null; // runtime adapter id (pi | bash | ...)
   state: string; // live | idle | closed
+  resume_token: string | null; // pinned session file (honest resume override)
+  profile: string | null; // manifest profile applied at spawn (survives relaunch)
   created_at: string;
 }
 
@@ -174,6 +176,18 @@ CREATE TABLE IF NOT EXISTS health_alerts(
 );
 `,
   },
+  {
+    name: '006_resume_token',
+    sql: `
+ALTER TABLE pods ADD COLUMN resume_token TEXT;
+`,
+  },
+  {
+    name: '007_profile',
+    sql: `
+ALTER TABLE pods ADD COLUMN profile TEXT;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -219,23 +233,35 @@ function dbOf(store: Store): DatabaseSync {
 
 export function openPod(
   store: Store,
-  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null },
+  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null },
 ): void {
   dbOf(store)
     .prepare(
-      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent)
-       VALUES (?, ?, ?, ?, ?, 'live', ?, ?)
+      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile)
+       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?)
        ON CONFLICT(role) DO UPDATE SET
          dir = excluded.dir,
          terminal_target = excluded.terminal_target, model = excluded.model,
-         agent = excluded.agent, state = 'live'`,
+         agent = excluded.agent, profile = excluded.profile, state = 'live'`,
     )
-    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null);
+    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null);
 }
 
 export function getPodByRole(store: Store, role: string): Pod | null {
   const r = dbOf(store).prepare('SELECT * FROM pods WHERE role = ?').get(role) as Pod | undefined;
   return r ?? null;
+}
+
+export function setPodResumeToken(store: Store, role: string, token: string | null): void {
+  dbOf(store)
+    .prepare('UPDATE pods SET resume_token = ? WHERE role = ?')
+    .run(token, role);
+}
+
+export function setPodProfile(store: Store, role: string, profile: string | null): void {
+  dbOf(store)
+    .prepare('UPDATE pods SET profile = ? WHERE role = ?')
+    .run(profile, role);
 }
 
 export function listPods(store: Store): Pod[] {

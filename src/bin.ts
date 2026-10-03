@@ -29,7 +29,9 @@ const USAGE = `flock — core CLI
   flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--posture floor|full_bypass] [--cmd c]
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
       pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
-  flock pod relaunch <role> [--model M]   # новый агент на том же pod, сессия сохраняется
+  flock pod relaunch <role> [--model M] [--fork [role]] [--profile P]   # --fork (без аргумента) = форк своей сессии
+  flock pod spawn <role> [--agent X] [--profile P]   # профиль манифеста (override-set)
+  flock pod resume-token <role> <file|reset>   # зафиксировать сессию для resume (иначе — последняя)
   flock pod status [role]
   flock pod send <role> <text...>
   flock pod answer <role> <n|текст>   # ответ оператором на dialog (gate) в pi-поде
@@ -171,10 +173,13 @@ async function main(): Promise<void> {
           cmd: flag(flags, '--cmd'),
           fork: flag(flags, '--fork'),
           posture: flag(flags, '--posture'),
+          profile: flag(flags, '--profile'),
         }));
       } else if (action === 'relaunch') {
         const flags = rest.slice(1);
-        print(await api('POST', '/api/ops', { type: 'pod_relaunch', role, model: flag(flags, '--model') }));
+        print(await api('POST', '/api/ops', { type: 'pod_relaunch', role, model: flag(flags, '--model'), profile: flag(flags, '--profile'), fork: flag(flags, '--fork') ?? role }));
+      } else if (action === 'resume-token') {
+        print(await api('POST', '/api/ops', { type: 'pod_set_resume_token', role, token: rest[1] }));
       } else if (action === 'status') {
         const data = await api('GET', '/api/pods');
         const pods = rest[1] ? data.pods.filter((p: { role: string }) => p.role === rest[1]) : data.pods;

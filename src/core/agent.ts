@@ -42,6 +42,12 @@ export interface AgentManifest {
   guidance?: { id: string; content: string }[];
   // v3.1: sent to the agent once, after the ready gate, fresh starts only.
   firstPrompt?: string;
+  // v3.3: base manifests (builtin id or <FLOCK_HOME>/agents/<id>.json),
+  // merged in order — the importer wins on scalars, arrays concatenate,
+  // guidance merges by id.
+  imports?: string[];
+  // v3.3: named override sets; picked with --profile at spawn/relaunch.
+  profiles?: Record<string, Partial<AgentManifest>>;
 }
 
 import { PM_PROTOCOL } from './pm-protocol.js';
@@ -49,6 +55,21 @@ import { PM_PROTOCOL } from './pm-protocol.js';
 export const BUILTIN_AGENTS: Record<string, AgentManifest> = {
   pi: { id: 'pi', command: 'pi', modelFlag: '--model', runner: 'flock-rpc', trust: 'approve', trustLevel: 'dev' },
   bash: { id: 'bash', command: 'bash' },
+  // claude-code TUI: per-pod config home (<pod>/.claude, the adapter sets
+  // CLAUDE_CONFIG_DIR), auth via env (local Anthropic-compatible endpoint).
+  // Override with a custom manifest for other providers/models.
+  claude: {
+    id: 'claude',
+    command: 'claude',
+    runtime: 'claude',
+    modelFlag: '--model',
+    env: {
+      ANTHROPIC_BASE_URL: 'http://192.168.1.114:8000',
+      ANTHROPIC_API_KEY: 'flock-local',
+    },
+    // the local model accepts xhigh/medium/low effort; "high" -> 500
+    args: ['--effort', 'medium'],
+  },
   // goal-loop lead: wakes on triggers, issues typed intents (whitelist) via the CLI
   pm: {
     id: 'pm',
@@ -93,10 +114,51 @@ export interface ResolvedAgent {
   manifest: AgentManifest;
 }
 
-export function resolveAgent(id: string | undefined, model?: string | null): ResolvedAgent | null {
+// v3.3: one-sided merge — `ext` overrides `base`. Scalars: ext wins when set.
+// args concatenate (base first); env is key-merged; guidance merges by id
+// (ext entry with the same id replaces base's, others append). Imports and
+// profiles of `base` are NOT inherited — only the importer's own graph.
+export function mergeManifests(base: AgentManifest, ext: Partial<AgentManifest>): AgentManifest {
+  const g = new Map<string, { id: string; content: string }>();
+  for (const e of base.guidance ?? []) g.set(e.id, e);
+  for (const e of ext.guidance ?? []) g.set(e.id, e);
+  const defined = Object.fromEntries(Object.entries(ext).filter(([, v]) => v !== undefined));
+  return {
+    ...base,
+    ...defined,
+    args: [...(base.args ?? []), ...(ext.args ?? [])],
+    env: { ...(base.env ?? {}), ...(ext.env ?? {}) },
+    guidance: [...g.values()],
+    // never bake a profile's own imports into the result as active graph
+    imports: ext.imports ?? base.imports,
+    profiles: ext.profiles ?? base.profiles,
+  };
+}
+
+// Resolve the imports graph (in order, last wins) with cycle detection.
+export function resolveManifest(base: AgentManifest, agents: Record<string, AgentManifest>, seen: Set<string> = new Set()): AgentManifest {
+  const id = base.id;
+  if (seen.has(id)) throw new Error(`manifest import cycle: ${[...seen, id].join(' -> ')}`);
+  seen.add(id);
+  let m: AgentManifest = base;
+  for (const imp of base.imports ?? []) {
+    const dep = agents[imp];
+    if (!dep) throw new Error(`manifest ${id}: unknown import: ${imp}`);
+    m = mergeManifests(resolveManifest(dep, agents, new Set(seen)), m);
+  }
+  return m;
+}
+
+export function resolveAgent(id: string | undefined, model?: string | null, profile?: string | null): ResolvedAgent | null {
   const agents = loadAgents();
-  const m = agents[id ?? 'pi'];
-  if (!m) return null;
+  const raw = agents[id ?? 'pi'];
+  if (!raw) return null;
+  let m = resolveManifest(raw, agents);
+  if (profile) {
+    const p = m.profiles?.[profile];
+    if (!p) throw new Error(`manifest ${m.id}: unknown profile: ${profile} (has: ${Object.keys(m.profiles ?? {}).join(', ') || 'none'})`);
+    m = mergeManifests(m, p);
+  }
   const parts = [m.command, ...(m.args ?? [])];
   if (model && m.modelFlag) parts.push(m.modelFlag, model);
   return { id: m.id, cmd: parts.join(' '), env: { ...(m.env ?? {}) }, manifest: m };

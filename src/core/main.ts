@@ -108,6 +108,20 @@ function checkRunLiveness(): void {
       })();
       continue;
     }
+    // 2b) foreground guard (claude pods, persistent pane, no sidecar in this
+    // runtime): the TUI exited -> pane back at the shell = the agent is gone.
+    // The window being dead is step 3's job (pid ESRCH).
+    if (podRuntime(pod.agent) === 'claude') {
+      void (async () => {
+        const fg = await paneCommand(pod.terminal_target!).catch(() => '');
+        if (!fg || !SHELL_COMMANDS.has(fg)) return;
+        endRun(store, run.id, 'crashed(claude exited, pane at shell)');
+        console.log(`[core] runkeeper: run ${run.id} (pod ${pod.role}) claude exited (pane at shell) -> crashed`);
+        ctx.emit?.({ type: 'run_crashed', pod: pod.role, run: run.id });
+        void pmNotify(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: claude TUI завершился (pane на shell)` }).catch(() => {});
+      })();
+      continue;
+    }
     // 3) pid liveness (bash/cmd pods: the window's process; also catches a
     // killed window for any pod)
     if (!run.pid) continue;

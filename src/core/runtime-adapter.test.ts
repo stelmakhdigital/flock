@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveTrust, validateResumeToken, resolveLaunchMode } from './runner-protocol.js';
-import { mergeManagedBlock } from './runtime-adapter.js';
+import { mergeManagedBlock, pruneManagedBlocks } from './runtime-adapter.js';
 
 // ── resolveTrust: posture is authoritative ──
 assert.strictEqual(resolveTrust(undefined, undefined), 'approve'); // flock default
@@ -84,6 +84,27 @@ try {
   assert.ok(!text.includes('\nold\n'));
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ---- pruneManagedBlocks ----------------------------------------------------
+{
+  const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-prune-'));
+  const p2 = path.join(tmp2, 'AGENTS.md');
+  mergeManagedBlock(p2, 'flock-protocol', 'PROTOCOL');
+  mergeManagedBlock(p2, 'guid-a', 'A');
+  mergeManagedBlock(p2, 'guid-b', 'B');
+  fs.appendFileSync(p2, '\nUSER TEXT\n');
+  // keep protocol + a; b must go, user text must survive
+  pruneManagedBlocks(p2, new Set(['flock-protocol', 'guid-a']));
+  const t = fs.readFileSync(p2, 'utf8');
+  assert.ok(t.includes('BEGIN MANAGED BLOCK: guid-a'), 'kept block survives');
+  assert.ok(!t.includes('guid-b'), 'stale block removed');
+  assert.ok(t.includes('USER TEXT'), 'user text untouched');
+  // pruning again is a no-op
+  const before = fs.readFileSync(p2, 'utf8');
+  pruneManagedBlocks(p2, new Set(['flock-protocol', 'guid-a']));
+  assert.strictEqual(fs.readFileSync(p2, 'utf8'), before, 'idempotent');
+  fs.rmSync(tmp2, { recursive: true, force: true });
 }
 
 console.log('runtime-adapter: all checks passed');

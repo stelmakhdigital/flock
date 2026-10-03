@@ -303,3 +303,8 @@ export async function checkTransport(home: string): Promise<{ ok: boolean; detai
     await killWindow('_check');
   }
 }
+
+// Named keys for TUI dialogs (Up/Down/Enter/Esc) — send-keys territory.
+export async function sendKey(target: string, key: string): Promise<void> {
+  await tmux(['send-keys', '-t', target, key]);
+}

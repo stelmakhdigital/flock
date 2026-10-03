@@ -98,12 +98,17 @@ instance останавливается. DAG/зависимости/retry — п
 одного pid-проверки недостаточно).
 
 **Агент-адаптеры** — manifest-driven: один generic-реализатор + декларация
-`{id, command, modelFlag?, args?, env?}`. Встроенные: `pi`, `bash`;
-свой рантайм = `<FLOCK_HOME>/agents/<id>.json` (не код):
+`{id, command, runtime?, modelFlag?, args?, env?, guidance?, firstPrompt?,
+imports?, profiles?}`. Встроенные: `pi`, `bash`, `claude`, `pm`;
+свой рантайм = `<FLOCK_HOME>/agents/<id>.json` (не код). `imports` —
+наследование фрагментов манифестов (merge: скаляры — потомок, args —
+конкатенация, env/guidance — по ключу/id); `profiles` — per-spawn override
+(`--profile <name>`), при смене профиля stale managed-blocks чистятся:
 
 ```sh
 ./bin/flock pod spawn dev --agent pi --model <provider/id>
 ./bin/flock pod spawn stub --agent bash
+./bin/flock pod spawn mate --agent teammate --profile quiet
 ```
 
 **Multi-flock (profiles)** — несколько изолированных инстансов core:
@@ -128,9 +133,11 @@ instance останавливается. DAG/зависимости/retry — п
 - **доставка с подтверждением**: `pod send` идёт `flockmsg <base64>`
   (одна строка для любого текста), ack — из sidecar, не с экрана;
 - **relaunch с памятью (честный resume)**: `flock pod relaunch <role>`
-  перезапускает ТОЧНЫЙ persisted session-файл (`--session <file>`);
-  файла нет → retry_fresh с записью в meta, никогда silent fresh;
-  `--fork <role|file>` — форк в новую сессию (новая, не родительская);
+  перезапускает ТОЧНЫЙ persisted session-файл (pi: `--session <file>`,
+  claude: `--resume <uuid>`); файла нет → retry_fresh с записью в meta,
+  никогда silent fresh; `--fork [role]` — форк сессии (pi: `--fork <ref>`,
+  claude: `--resume <uuid> --fork-session`); `flock pod resume-token <role>
+  <file|uuid|reset>` — зафиксировать сессию для resume (иначе — последняя);
 - **постоянный pane**: окно пода — постоянный shell,
   relaunch = typed stop старого runner'а (C-c → sidecar `exited`) + новая
   команда в то же окно; скроллбек живёт через агентов, pane_pid неизменен;
@@ -167,18 +174,47 @@ trust/resume/fork-решения; hermetic-тест `npm test`) +
 
 Запуск рантайма — через 5-методный **RuntimeAdapter**:
 `listInstalled / project / deliverStartup / launchHarness / checkReady`.
-pi — RPC-мост с typed session identity; bash — plain window. Новый рантайм
+Адаптеры: **pi** (RPC-мост, typed session identity), **claude** (Claude Code
+TUI, transcript-сессии), **bash** (plain window). Новый рантайм
 = адаптер + manifest (`runtime` в JSON).
 
 - **launch posture**: `pod spawn --posture full_bypass` форсирует полный
-  resource trust; `floor` уважает `trust` из manifest.
-  `permissionMode` — слот; pi его отклоняет (trust — отдельный механизм);
+  bypass (pi: trust+approve; claude: `--permission-mode bypassPermissions`,
+  подтверждение диалога — автоматом); `floor` уважает конфиг.
+  `permissionMode` в manifest — нативная ось claude (`--permission-mode`);
+  pi отклоняет (у pi своя ось — trust-уровни);
 - **startup-контекст**: manifest `guidance[]` — managed blocks в
-  `<pod>/AGENTS.md` (идемпотентный merge, до запуска); `firstPrompt` —
-  первый промпт после ready (только fresh);
+  `<pod>/AGENTS.md` (идемпотентный merge, до запуска; claude — `CLAUDE.md`);
+  `firstPrompt` — первый промпт после ready (только fresh);
 - **checkReady**: live-готовность в `/api/pods` (`ready.reason`);
   sidecar «ready» при панели на shell = stale (`stale_ready`);
+  claude: prompt-курсор + нет открытого диалога (boot-диалоги — theme/API
+  key/уведомления/folder trust/MCP/bypass-приёмка — отвечаются автоматически);
 - **listInstalled**: нет бинарного рантайма — чистая ошибка на spawn.
+
+## Claude-под (этап 3.3)
+
+- **Изоляция**: `CLAUDE_CONFIG_DIR=<pod>/.claude` (конфиг+сессии+transcripts
+  в поде), onboarding-состояние pre-seed (fresh-конфиг иначе упирается в
+  connectivity-check на api.anthropic.com и умирает; partial-файл от
+  оброненного запуска — merge, не skip);
+- **Сессия = uuid transcript-файла** (`<pod>/.claude/projects/<slug>/<uuid>.jsonl`);
+  relaunch = честный `--resume <uuid>`; `--fork` = `--resume <uuid>
+  --fork-session` (fork-файл появляется после первого хода, parent не
+  трогается);
+- **Доставка**: raw paste + Enter, ack = рост transcript-файла (типизированный
+  сигнал, не скрапинг); relaunch — typed-stop (C-c) в тот же persistent pane;
+- **Runkeeper**: pane вернулась на shell = `crashed(claude exited, pane at shell)`;
+- **Built-in `claude`**: vLLM через Anthropic-совместимый эндпоинт
+  (`ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` в env manifest),
+  `--effort medium` (локальная модель не принимает high).
+
+```sh
+./bin/flock pod spawn ctest --agent claude          # TUI-под (ready-gate)
+./bin/flock pod spawn ctest --agent claude --posture full_bypass
+./bin/flock pod relaunch ctest --fork               # форк своей сессии
+```
+
 
 ## Этап 0 (готово)
 

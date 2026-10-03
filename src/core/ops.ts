@@ -4,8 +4,9 @@ import * as store from './store.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
-import { seatPaths, frameMessage } from './runner-protocol.js';
-import { getAdapter, mergeManagedBlock, type PodBinding, type StartupFile } from './runtime-adapter.js';
+import { seatPaths, frameMessage, validateResumeToken } from './runner-protocol.js';
+import { claudeConfigDir, claudeProjectsDir, claudeTranscriptFp, waitForTranscriptGrowth, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
+import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
 import { validateIntent, applyIntents, pmDigest, pmNotify } from './pm.js';
@@ -57,6 +58,8 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
       return podSpawn(o, ctx);
     case 'pod_relaunch':
       return podRelaunch(o, ctx);
+    case 'pod_set_resume_token':
+      return podSetResumeToken(o, ctx);
     case 'pod_send':
       return podSend(o, ctx);
     case 'pod_answer':
@@ -129,6 +132,7 @@ async function spawnAgent(ctx: CoreCtx, o: {
   resumeToken?: string;
   forkRef?: string;
   posture?: 'floor' | 'full_bypass';
+  profile?: string | null;
   freshStart?: boolean;
 }): Promise<{ pod: store.Pod; run: store.Run }> {
   fs.mkdirSync(o.dir, { recursive: true });
@@ -148,14 +152,19 @@ async function spawnAgent(ctx: CoreCtx, o: {
   } else {
     writePodAgentsMd(o.dir, o.role);
     const agentId = o.agentId ?? 'pi';
-    const r = resolveAgent(agentId, null);
+    const r = resolveAgent(agentId, null, o.profile ?? undefined);
     if (!r) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
     const manifest = r.manifest;
     agentStored = r.id;
-    const adapter = getAdapter(manifest, { home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js') });
+    const adapter = getAdapter(manifest, adapterEnv(ctx));
     if (!adapter) throw new OpError(400, `agent ${agentId}: no runtime adapter (manifest needs a supported "runtime")`);
 
     if (adapter.runtime === 'pi' && !model) model = firstUserModel();
+    if (adapter.runtime === 'claude' && !model) {
+      // pi config uses provider/model syntax; claude wants the bare model id
+      const fm = firstUserModel();
+      model = fm ? (fm.split('/').pop() ?? fm) : fm;
+    }
     const binding: PodBinding = {
       role: o.role,
       cwd: o.dir,
@@ -185,6 +194,9 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (pre.failed.length) {
       throw new OpError(500, `startup delivery failed: ${pre.failed.map((f) => `${f.path}: ${f.error}`).join('; ')}`);
     }
+    // guidance hygiene: drop managed blocks the current manifest no longer
+    // provides (e.g. left over from a previous profile)
+    pruneManagedBlocks(path.join(o.dir, 'AGENTS.md'), new Set(['flock-protocol', ...(manifest.guidance ?? []).map((g) => g.id)]));
 
     let launchId = store.newId('la');
     let launch = await adapter.launchHarness(binding, {
@@ -224,6 +236,7 @@ async function spawnAgent(ctx: CoreCtx, o: {
     terminalTarget: target,
     model,
     agent: agentStored,
+    profile: o.profile ?? null,
   });
   const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: o.role, pid, meta: runMeta });
   startPodSocket(ctx, o.dir); // pod-local API socket (sandbox-visible)
@@ -248,6 +261,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
     rawCmd: op.cmd ? String(op.cmd) : undefined,
     forkRef: op.fork ? resolveForkRef(ctx, String(op.fork)) : undefined,
     posture: op.posture === 'full_bypass' || op.posture === 'floor' ? op.posture : undefined,
+    profile: op.profile ? String(op.profile) : null,
   });
   return { pod, run };
 }
@@ -256,6 +270,8 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 // pod. pi (v3.1): HONEST resume — the exact persisted session file is
 // relaunched (--session <file>), never an interactive picker; a missing file
 // is retry_fresh (recorded in the run meta, never silent). bash: fresh window.
+const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js') });
+
 async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
@@ -265,16 +281,36 @@ async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   if (run && !run.ended_at) store.endRun(ctx.store, run.id, 'replaced');
   // PERSISTENT PANE: no killWindow — the adapter typed-stops the old runner
   // (C-c) and launches into the same window.
-  const resolved = resolveAgent(pod.agent ?? undefined, null);
-  const isPi = !!resolved && manifestRuntime(resolved.manifest) === 'pi';
-  const resumeToken = isPi ? (store.latestSessionFile(ctx.store, role) ?? undefined) : undefined;
+  const profile = op.profile !== undefined ? String(op.profile) : (pod.profile ?? undefined);
+  store.setPodProfile(ctx.store, role, profile || null);
+  const resolved = resolveAgent(pod.agent ?? undefined, null, profile);
+  const runtime = resolved ? manifestRuntime(resolved.manifest) : 'cmd';
+  const isPi = runtime === 'pi';
+  const isClaude = runtime === 'claude';
+  // pinned resume token wins; otherwise the latest session (honest resume).
+  // Token shape is per-runtime: pi = session file path, claude = transcript uuid.
+  const pinned = isPi || isClaude ? (pod.resume_token ?? undefined) : undefined;
+  const tokenValid = isPi ? validateResumeToken(pinned!) : validateClaudeSessionToken(pinned!);
+  if (pinned && !tokenValid) {
+    throw new OpError(400, `pinned resume token is invalid: ${pinned} (flock pod resume-token ${role} reset)`);
+  }
+  let resumeToken: string | undefined;
+  const forkRef = op.fork !== undefined ? resolveForkRef(ctx, String(op.fork)) : undefined;
+  if (isPi) {
+    resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
+  } else if (isClaude) {
+    const adapter = getAdapter(resolved!.manifest, adapterEnv(ctx));
+    resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: pod.dir })) ?? undefined;
+  }
   const res = await spawnAgent(ctx, {
     role,
     dir: pod.dir,
     model: op.model ? String(op.model) : (pod.model ?? undefined),
     agentId: pod.agent ?? undefined,
     resumeToken,
-    freshStart: !resumeToken,
+    forkRef,
+    profile: profile ?? null,
+    freshStart: !resumeToken && !forkRef,
   });
   ctx.emit?.({ type: 'pod_relaunched', role, run: res.run.id });
   let mode: string | null = null;
@@ -288,12 +324,30 @@ async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   return { pod: res.pod, run: res.run, resumed: mode === 'resume', resume: mode };
 }
 
+async function podSetResumeToken(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod) throw new OpError(404, `no pod: ${role}`);
+  const raw = op.token === undefined || op.token === '' || op.token === 'reset' ? null : String(op.token);
+  if (raw !== null && !validateResumeToken(raw)) {
+    throw new OpError(400, `invalid resume token: ${raw}`);
+  }
+  store.setPodResumeToken(ctx.store, role, raw);
+  ctx.emit?.({ type: 'pod_resume_token', role, token: raw });
+  return { role, resume_token: raw, source: raw ? 'pinned' : 'latest_session_file' };
+}
+
 // --fork <role|path>: role -> that pod's current session file (session-id is
 // in the filename); path is used as-is.
 function resolveForkRef(ctx: CoreCtx, ref: string): string {
   if (ref.includes('/') || ref.includes('\\')) return ref;
   const pod = store.getPodByRole(ctx.store, ref);
   if (!pod) throw new OpError(404, `no pod to fork from: ${ref}`);
+  if (podRuntime(pod.agent) === 'claude') {
+    const s = latestClaudeSession(claudeProjectsDir(claudeConfigDir(pod.dir), pod.dir));
+    if (!s) throw new OpError(404, `no session for pod ${ref} (no transcript yet)`);
+    return s.token;
+  }
   const dir = path.join(pod.dir, '.pi', 'sessions');
   let files: string[] = [];
   try {
@@ -310,6 +364,25 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const text = String(op.text ?? '');
   if (!text.trim()) throw new OpError(400, 'text required');
   const pod = requireLivePod(ctx, role);
+  if (podRuntime(pod.agent) === 'claude') {
+    // claude TUI: raw paste; the per-pod transcript is the typed ack (it grows
+    // when the prompt lands, independent of turn duration).
+    const projectsDir = claudeProjectsDir(claudeConfigDir(pod.dir), pod.dir);
+    const before = claudeTranscriptFp(projectsDir);
+    const res = await terminal.send(pod.terminal_target!, text, { raw: true });
+    const { grown } = await waitForTranscriptGrowth(projectsDir, before, 30000);
+    if (!grown) throw new OpError(504, 'claude transcript did not grow after send (check the pod pane)');
+    const run = store.currentRun(ctx.store, role);
+    if (run && !run.ended_at) {
+      store.appendRunMeta(ctx.store, run.id, {
+        kind: 'sent',
+        bytes: Buffer.byteLength(text),
+        attempts: res.attempts,
+        ack: 'transcript',
+      });
+    }
+    return { ok: true, attempts: res.attempts, ack: 'transcript' };
+  }
   if (podRuntime(pod.agent) === 'pi') {
     // runner bridge: framed message + raw paste, verified by the sidecar ack
     // (the visual probe breaks on long/wrapped lines in a TTY line editor).
