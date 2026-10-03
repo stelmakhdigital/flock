@@ -339,6 +339,28 @@ Workflow `build:dev → review:rev` — **merge откладывается до 
 ./bin/flock workflow start ship "фича X"
 ```
 
+## Merge queue S4 (этап 5.4b)
+
+Интегратор — **сам core** (он владеет base-репо; отдельный LLM-интегратор
+здесь не экономит — merge это детерминированные git-операции). С ≥2
+параллельными worktree-подами мутации на общем base-репо сериализуются:
+
+- **FIFO-queue** (merge-queue.ts): только мутирующая часть merge
+  (`ffMerge`/`squashMerge`) идёт под serial-лок; read-only часть (status,
+  merge-tree dry-run, прогон тестов quality-гейта) остаётся параллельной —
+  10-минутные тесты пода A не держат чистый ff-мердж пода B;
+- **re-verify at claim time** (аналог claim/verify арбитра): критическая
+  секция исполняет git против ТЕКУЩЕГО состояния base — если base сдвинулся,
+  пока merge ждал в очереди, ff падает чисто (skipped с причиной), а squash
+  переделывает 3-way против свежего base и чистится при конфликте;
+- observability: события `merge_queued`/`merge_done` (role, policy, queue)
+  и `mergeQueue` (глубина) в `GET /api/health`.
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.flock/token)" http://127.0.0.1:7460/api/health
+# -> {"alerts":[...],"opts":{...},"mergeQueue":0}
+```
+
 ## Workflow 5.4a: приоритет + timeout + retry (этап 5.4a)
 
 Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):

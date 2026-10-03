@@ -14,6 +14,7 @@ import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, typ
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
 import { validateIntent, applyIntents, pmDigest, pmNotify } from './pm.js';
+import { withMergeLock, mergeQueueSize } from './merge-queue.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -823,6 +824,10 @@ async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.T
     if (base && base !== 'HEAD') store.setPodRepo(ctx.store, role, pod.repo, base, pod.branch);
   }
   if (!base || base === 'HEAD') return { note: 'merge skipped (no base branch recorded)' };
+  // local consts: property narrowing does not survive into the merge-lock
+  // closures below
+  const repo = pod.repo;
+  const branch = pod.branch;
   const wt = pod.dir; // worktree pod: pod.dir IS the worktree checkout
   try {
     if (!gitops.isGitWorkdir(wt)) return { note: 'merge skipped (worktree missing)' };
@@ -850,7 +855,13 @@ async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.T
     if (noDiff) return { note: 'merge skipped (no diff vs base — already merged)' };
     if (policy === 'ff') {
       if (st.behind > 0) return { note: `merge skipped (base moved: ${st.behind} behind) — rebase/merge by hand` };
-      const r = await gitops.ffMerge(pod.repo, pod.branch, base);
+      // S4: the mutating git runs under the merge queue (FIFO) — with >=2
+      // worktree pods the base repo is re-verified at claim time, not at
+      // request time (a base moved while waiting fails cleanly as non-ff)
+      const waiters = mergeQueueSize();
+      ctx.emit?.({ type: 'merge_queued', role, policy, queue: waiters });
+      const r = await withMergeLock(() => gitops.ffMerge(repo, branch, base));
+      ctx.emit?.({ type: 'merge_done', role, policy, ok: r.ok });
       return { note: r.ok ? `auto-merged (ff, ${st.ahead} commit(s))` : `merge skipped (${r.error})` };
     }
     // policy === 'squash': S1 dry-run BEFORE anything (conflict is cheap to
@@ -879,9 +890,12 @@ async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.T
         }
       }
     }
-    // gate green (or not required) -> one squash commit on base
+    // gate green (or not required) -> one squash commit on base (S4: under
+    // the merge queue — the squash re-checks the base tree at claim time)
     const msg = `flock(${task.id}): ${task.title}`.slice(0, 200);
-    const r = await gitops.squashMerge(pod.repo, pod.branch, base, msg, wt);
+    ctx.emit?.({ type: 'merge_queued', role, policy: 'squash', queue: mergeQueueSize() });
+    const r = await withMergeLock(() => gitops.squashMerge(repo, branch, base, msg, wt));
+    ctx.emit?.({ type: 'merge_done', role, policy: 'squash', ok: r.ok });
     if (r.ok) {
       return { note: `squash-merged (1 commit on ${base}${inst?.require_test ? ', tests green' : ''}, ${st.ahead} commit(s) collapsed, branch advanced)` };
     }
