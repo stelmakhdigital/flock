@@ -227,6 +227,15 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'resolver': {
+      if (sub === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'resolver_ls' }));
+      } else {
+        console.log('usage: flock resolver ls');
+      }
+      return;
+    }
+
     case 'usage': {
       const q = rest[0] ? `?role=${encodeURIComponent(rest[0])}` : '';
       print(await api('GET', `/api/usage${q}`));

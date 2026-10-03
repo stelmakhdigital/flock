@@ -66,7 +66,7 @@ export function branchName(role: string): string {
 //   worktree exists         -> leave it (the worktree IS the pod's memory)
 //   branch exists, no wt    -> `worktree add` on the existing branch
 //   neither                 -> `worktree add -b <branch> <wt> <base|HEAD>`
-export async function worktreeAttach(repo: string, wtPath: string, branch: string, baseRef?: string): Promise<{ created: boolean; branch: string }> {
+export async function worktreeAttach(repo: string, wtPath: string, branch: string, baseRef?: string, startPoint?: string): Promise<{ created: boolean; branch: string }> {
   if (isGitWorkdir(wtPath)) return { created: false, branch };
   fs.mkdirSync(wtPath, { recursive: true });
   const branches = await git(repo, 'branch', '--list', branch);
@@ -74,7 +74,10 @@ export async function worktreeAttach(repo: string, wtPath: string, branch: strin
   if (hasBranch) {
     await git(repo, 'worktree', 'add', wtPath, branch);
   } else {
-    await git(repo, 'worktree', 'add', '-b', branch, wtPath, baseRef ?? 'HEAD');
+    // startPoint: the ref a NEW branch is created from (default: the base
+    // branch / HEAD). The S5 conflict resolver forks its resolution branch
+    // from the origin branch, not from the base.
+    await git(repo, 'worktree', 'add', '-b', branch, wtPath, startPoint ?? baseRef ?? 'HEAD');
   }
   // pod infrastructure files (context, cli shim, socket) live inside the
   // checkout — keep them out of the agent's git status (untracked is fine:

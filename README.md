@@ -361,7 +361,36 @@ curl -H "Authorization: Bearer $(cat ~/.flock/token)" http://127.0.0.1:7460/api/
 # -> {"alerts":[...],"opts":{...},"mergeQueue":0}
 ```
 
-## Workflow 5.4a: приоритет + timeout + retry (этап 5.4a)
+## Conflict-резолвер S5 (этап 5.4b, opt-in)
+
+**Включается болью, а не по умолчанию**: `FLOCK_RESOLVER_AGENT=pi` при
+запуске core (без env резолвер выключен). При `blocked (merge conflict)`
+(S1) core разворачивает цепочку:
+
+1. **resolver-под** `resolver-<role>`: LLM-агент (manifest из env) со своей
+   worktree на ветке `flock/<role>-resolve` (форк от конфликтующей ветки —
+   саму ветку занять нельзя: она checked out в worktree оригинала),
+   `merge: never` (резолвер никогда не мерджит сам);
+2. таск резолвера: **конфликт-информация из dry-run + инструкция** —
+   `git merge <base>`, разрешить конфликты **соблюдительно** (сохранить и
+   работу ветки, и изменения base), `flock task done/blocked`;
+3. по `done` резолвера core (tick 30s): ff-применяет fork на ветку
+   оригинала (worktree должна быть чистой, ff-only) → **перезапускает тот
+   же merge-гейт S1+S2** → успех: origin-таск `done` (reason: `S5 resolver:
+   conflict resolved in N attempt(s)`), цепочка `resolved`;
+4. **жесткий лимит попыток**: `FLOCK_RESOLVER_MAX_ATTEMPTS` (default 2) —
+   исчерпан → цепочка `exhausted`, таск остаётся `blocked` у оператора.
+   Нечего жечь деньги в бесконечном цикте.
+
+```sh
+FLOCK_RESOLVER_AGENT=pi FLOCK_RESOLVER_MAX_ATTEMPTS=2 ./bin/flock core up
+./bin/flock resolver ls        # цепочки: running | resolved | exhausted | failed
+```
+
+Семантика разрешения: если резолв полностью абсорбирован в base (например,
+резолвер честно взял версию base — работа ветки была дублем), merge-гейт
+видит `no diff vs base` → это **успешное** разрешение (origin-таск `done`),
+a не ошибка.
 
 Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):
 

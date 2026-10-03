@@ -250,6 +250,27 @@ ALTER TABLE pods ADD COLUMN merge_policy TEXT;
 ALTER TABLE workflow_instances ADD COLUMN require_test INTEGER NOT NULL DEFAULT 0;
 `,
   },
+  {
+    // 5.4b S5: conflict-resolution chain — one row per origin (conflicted)
+    // task; the resolver pod works on a <branch>-resolve fork, core applies
+    // the result back and re-runs the merge gate. Hard attempt limit: when
+    // exhausted, the task stays blocked for the operator.
+    name: '012_resolutions',
+    sql: `
+CREATE TABLE IF NOT EXISTS conflict_resolutions(
+  id TEXT PRIMARY KEY,
+  origin_task_id TEXT NOT NULL UNIQUE,
+  origin_role TEXT NOT NULL,
+  resolver_role TEXT NOT NULL,
+  resolver_task_id TEXT,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  apply_attempts INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'running',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -748,6 +769,57 @@ export function deleteUsageBefore(store: Store, ts: string): number {
 
 // retention: finished runs older than N days -> runs_archive (archive, not
 // delete: the meta carries launch/resume/usage history the operator audits)
+export interface ConflictResolution {
+  id: string;
+  origin_task_id: string;
+  origin_role: string;
+  resolver_role: string;
+  resolver_task_id: string | null;
+  attempts: number;
+  apply_attempts: number;
+  status: string; // running | resolved | failed | exhausted
+  created_at: string;
+  updated_at: string;
+}
+
+export function insertConflictResolution(
+  store: Store,
+  r: { id: string; originTaskId: string; originRole: string; resolverRole: string; resolverTaskId: string | null; attempts?: number },
+): void {
+  dbOf(store)
+    .prepare(
+      `INSERT INTO conflict_resolutions(id, origin_task_id, origin_role, resolver_role, resolver_task_id, attempts, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
+    )
+    .run(r.id, r.originTaskId, r.originRole, r.resolverRole, r.resolverTaskId ?? null, r.attempts ?? 1, nowIso(), nowIso());
+}
+
+export function getConflictResolutionByTask(store: Store, originTaskId: string): ConflictResolution | null {
+  const r = dbOf(store).prepare('SELECT * FROM conflict_resolutions WHERE origin_task_id = ?').get(originTaskId) as ConflictResolution | undefined;
+  return r ?? null;
+}
+
+export function listConflictResolutions(store: Store, status?: string): ConflictResolution[] {
+  return status
+    ? (dbOf(store).prepare('SELECT * FROM conflict_resolutions WHERE status = ? ORDER BY created_at').all(status) as unknown as ConflictResolution[])
+    : (dbOf(store).prepare('SELECT * FROM conflict_resolutions ORDER BY created_at').all() as unknown as ConflictResolution[]);
+}
+
+export function setConflictResolution(
+  store: Store,
+  id: string,
+  patch: { status?: string; resolverTaskId?: string | null; attempts?: number; applyAttempts?: number },
+): void {
+  const sets: string[] = ['updated_at = ?'];
+  const vals: (string | number | null)[] = [nowIso()];
+  if (patch.status !== undefined) { sets.push('status = ?'); vals.push(patch.status); }
+  if (patch.resolverTaskId !== undefined) { sets.push('resolver_task_id = ?'); vals.push(patch.resolverTaskId); }
+  if (patch.attempts !== undefined) { sets.push('attempts = ?'); vals.push(patch.attempts); }
+  if (patch.applyAttempts !== undefined) { sets.push('apply_attempts = ?'); vals.push(patch.applyAttempts); }
+  vals.push(id);
+  dbOf(store).prepare(`UPDATE conflict_resolutions SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+}
+
 export function archiveOldRuns(store: Store, olderThanIso: string): number {
   const db = dbOf(store);
   const rows = db

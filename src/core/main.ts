@@ -13,7 +13,7 @@ import { pmTick, pmNotify } from './pm.js';
 import { ingestUsage } from './usage.js';
 import { runRetentionSweep } from './retention.js';
 import { podRuntime } from './agent.js';
-import { writePodAgentsMd } from './ops.js';
+import { writePodAgentsMd, tickConflictResolvers } from './ops.js';
 import type { CoreCtx } from './ops.js';
 
 export const FLOCK_HOME = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
@@ -164,6 +164,15 @@ ticks.register('retention', 24 * 3600_000, () => {
     console.warn('[core] retention tick failed:', e instanceof Error ? e.message : e);
   }
 });
+// S5 conflict resolver (30s): advance running resolution chains — apply the
+// resolved fork to the origin branch, re-run the merge gate, retry/exhaust
+if (process.env.FLOCK_RESOLVER_AGENT) {
+  ticks.register('resolver', 30_000, () => {
+    tickConflictResolvers(ctx).catch((e) => {
+      console.warn('[core] resolver tick failed:', e instanceof Error ? e.message : e);
+    });
+  });
+}
 // watchdog: declarative checks registered by agents/CLI (1s tick)
 ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 

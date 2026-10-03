@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import * as store from './store.js';
 import * as gitops from './gitops.js';
 import { parseTeamYaml, TeamParseError } from './team.js';
+import { listConflictResolutions } from './store.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
@@ -93,6 +94,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_relaunch: { group: 'pod', scopes: ['operator'], summary: 'new run on the same pod (honest resume, --fork)', run: (o, c) => podRelaunch(o, c) },
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
   team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
+  resolver_ls: { group: 'team', scopes: ['operator'], summary: 'S5 conflict-resolution chains (opt-in FLOCK_RESOLVER_AGENT)', run: (o, c) => listConflictResolutions(c.store) },
   pod_merge_status: { group: 'pod', scopes: ['operator', 'pod'], summary: 'worktree pod: ahead/behind/dirty vs base', run: (o, c) => podMergeStatus(o, c) },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
   pod_answer: { group: 'pod', scopes: ['operator'], summary: 'answer a pending dialog (gate) in a pod', run: (o, c) => podAnswer(o, c) },
@@ -301,12 +303,21 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   let repo: string | null = null;
   let repoBase: string | null = null;
   let branch: string | null = null;
+  let branchStart: string | null = null;
   if (op.repo !== undefined) {
     const repoPath = path.resolve(String(op.repo));
     if (!gitops.isGitRepo(repoPath)) throw new OpError(400, `--repo: not a git repo: ${repoPath}`);
     repo = repoPath;
     repoBase = op.base ? String(op.base) : (await gitops.currentBranch(repoPath)) ?? 'HEAD';
     branch = gitops.branchName(role);
+    if (op.branch) {
+      // S5: explicit branch override (the conflict resolver works on the
+      // origin pod's branch, not flock/<resolver-role>)
+      const b = String(op.branch);
+      if (!/^[A-Za-z0-9._/-]{1,60}$/.test(b)) throw new OpError(400, `bad branch: ${b}`);
+      branch = b;
+      if (op.branchStart) branchStart = String(op.branchStart);
+    }
     dir = path.join(ctx.store.home, 'pods', role, 'work');
   } else if (existing?.repo && existing.repo_base && existing.branch) {
     // re-spawn of a previously closed worktree pod: same layout
@@ -317,7 +328,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   }
   if (repo) {
     try {
-      await gitops.worktreeAttach(repo, dir, branch!, repoBase!);
+      await gitops.worktreeAttach(repo, dir, branch!, repoBase!, branchStart ?? undefined);
     } catch (e) {
       throw new OpError(500, `worktree attach failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -770,6 +781,13 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
   ctx.emit?.({ type: `task_${finalTo}`, taskId: id, pod: task.pod_role, reason: finalReason, gate: gateBlock ? true : undefined });
+  // S5: a merge conflict starts the resolver chain (opt-in via
+  // FLOCK_RESOLVER_AGENT) — the task stays blocked in the meantime
+  if (finalTo === 'blocked' && gateBlock?.reason.startsWith('merge conflict')) {
+    void maybeStartResolver(ctx, task, gateBlock.result).catch((e) =>
+      ctx.emit?.({ type: 'resolver_error', originTaskId: id, message: String(e instanceof Error ? e.message : e) }),
+    );
+  }
   advanceWorkflow(ctx, id);
   return store.getTask(ctx.store, id);
 }
@@ -971,6 +989,170 @@ async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknow
   }
   ctx.emit?.({ type: 'team_up', file, pods: Object.keys(spec.pods) });
   return { file, results };
+}
+
+// ---------- S5: conflict resolver ----------
+// Opt-in by actual pain: FLOCK_RESOLVER_AGENT (e.g. 'pi') enables it, the
+// hard attempt limit is FLOCK_RESOLVER_MAX_ATTEMPTS (default 2). When a merge
+// conflict blocks a task, a dedicated LLM pod works on a <branch>-resolve
+// fork (the origin branch is checked out in the origin worktree, so the
+// resolver cannot share it), merges base into the fork and resolves. Core
+// then ff-applies the fork onto the origin branch and re-runs the merge gate.
+// Exhausted attempts -> the task stays blocked for the operator (no
+// unbounded money-burning loop).
+
+function resolverOpts(): { agent: string; maxAttempts: number } {
+  return {
+    agent: process.env.FLOCK_RESOLVER_AGENT ?? '',
+    maxAttempts: Math.max(1, Math.min(5, Math.trunc(Number(process.env.FLOCK_RESOLVER_MAX_ATTEMPTS ?? 2)))),
+  };
+}
+
+function resolverTaskBody(pod: store.Pod, conflictInfo: string): string {
+  const base = pod.repo_base ?? 'base';
+  const resolveBranch = `${pod.branch}-resolve`;
+  return [
+    `Конфликт-резолв: ветка ${pod.branch} не смержилась с ${base} (S1 dry-run):`,
+    conflictInfo,
+    '',
+    `Твоя ветка: ${resolveBranch} (форк ${pod.branch}). Инструкции:`,
+    `1. git merge ${base}   (конфликт проявится в этой worktree)`,
+    '2. Разрешай конфликты СОБЛИТЕЛЬНО: сохрани И работу ветки, И новые изменения base (не выбрасывай стороны!).',
+    '   Если сторона ветки — дубль/отладка и не несёт нового смысла, допустимо взять версию base (обоснуй в комментарии к решению).',
+    '   add/add конфликты: сравни содержимое обеих версий, объедини осмысленно.',
+    '3. git add . && git commit -m "resolve: merge base into branch"',
+    '4. Когда готово: flock task done <id>. Если не можешь разрешить честно — flock task blocked <id> \'<почему>\'.',
+    'Не трогай ветку base, не делай force-push, не удаляй файлы без причины.',
+  ].join('\n');
+}
+
+// Spawn (if needed) the resolver pod + first resolver task for a conflicted
+// origin task. Called from the merge-conflict block path of taskReport.
+export async function maybeStartResolver(ctx: CoreCtx, task: store.Task, conflictInfo: string): Promise<void> {
+  const opts = resolverOpts();
+  if (!opts.agent) return; // disabled
+  const pod = store.getPodByRole(ctx.store, task.pod_role);
+  if (!pod?.repo || !pod.branch) return;
+  if (store.getConflictResolutionByTask(ctx.store, task.id)) return; // one chain per task
+  const resolverRole = `resolver-${task.pod_role}`.slice(0, 20);
+  const resolveBranch = `${pod.branch}-resolve`;
+  const r = store.getPodByRole(ctx.store, resolverRole);
+  if (!r || r.state === 'closed') {
+    try {
+      await apply(
+        {
+          type: 'pod_spawn',
+          role: resolverRole,
+          agent: opts.agent,
+          repo: pod.repo,
+          base: pod.repo_base ?? undefined,
+          branch: resolveBranch,
+          branchStart: pod.branch, // fork from the origin branch, not the base
+          merge: 'never', // the resolver never auto-merges; core applies the result
+        },
+        ctx,
+      );
+    } catch (e) {
+      ctx.emit?.({ type: 'resolver_error', originTaskId: task.id, message: `resolver spawn failed: ${e instanceof Error ? e.message : String(e)}` });
+      return;
+    }
+  }
+  const resolverTaskId = store.newId('t');
+  store.insertTask(ctx.store, {
+    id: resolverTaskId,
+    title: `[S5] resolve conflict ${pod.branch} vs ${pod.repo_base ?? 'base'}`,
+    body: resolverTaskBody(pod, conflictInfo),
+    podRole: resolverRole,
+  });
+  const cr = store.newId('cr');
+  store.insertConflictResolution(ctx.store, { id: cr, originTaskId: task.id, originRole: task.pod_role, resolverRole, resolverTaskId });
+  ctx.emit?.({ type: 'resolver_started', originTaskId: task.id, resolverRole, resolverTaskId });
+}
+
+// Apply the resolver's fork onto the origin branch (inside the origin
+// worktree — it owns the branch): clean tree required, ff-only.
+async function applyResolutionToOrigin(pod: store.Pod): Promise<boolean> {
+  const resolveBranch = `${pod.branch}-resolve`;
+  try {
+    const dirty = await gitops.git(pod.dir, 'status', '--porcelain', '--untracked-files=no');
+    if (dirty) return false; // the origin pod is still working — retry next tick
+    const r = await gitops.gitRaw(pod.dir, 'merge', '--ff-only', resolveBranch);
+    return r.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+// 30s tick: advance running resolution chains (resolver task finished ->
+// apply + re-run the merge gate; failed resolver -> next attempt or exhaust).
+export async function tickConflictResolvers(ctx: CoreCtx): Promise<void> {
+  const opts = resolverOpts();
+  for (const res of store.listConflictResolutions(ctx.store, 'running')) {
+    const resolverTask = res.resolver_task_id ? store.getTask(ctx.store, res.resolver_task_id) : null;
+    if (!resolverTask) {
+      store.setConflictResolution(ctx.store, res.id, { status: 'failed' });
+      continue;
+    }
+    if (resolverTask.status !== 'done' && resolverTask.status !== 'blocked' && resolverTask.status !== 'cancelled') continue;
+    if (resolverTask.status === 'done') {
+      const pod = store.getPodByRole(ctx.store, res.origin_role);
+      if (!pod?.repo || !pod.branch) {
+        store.setConflictResolution(ctx.store, res.id, { status: 'failed' });
+        continue;
+      }
+      if (!(await applyResolutionToOrigin(pod))) {
+        // origin worktree busy/dirty/diverged — retry, but not forever
+        if (res.apply_attempts + 1 >= 20) {
+          store.setConflictResolution(ctx.store, res.id, { status: 'failed' });
+          ctx.emit?.({ type: 'resolver_failed', originTaskId: res.origin_task_id, reason: 'cannot apply resolution to origin worktree (busy?) after 20 tries' });
+        } else {
+          store.setConflictResolution(ctx.store, res.id, { applyAttempts: res.apply_attempts + 1 });
+        }
+        continue;
+      }
+      const originTask = store.getTask(ctx.store, res.origin_task_id);
+      if (!originTask || originTask.status !== 'blocked') {
+        store.setConflictResolution(ctx.store, res.id, { status: originTask?.status === 'done' ? 'resolved' : 'failed' });
+        continue;
+      }
+      const outcome = await mergeWorktreeIfEligible(ctx, res.origin_role, originTask, true);
+      // 'no diff vs base' after applying the resolution = the resolution was
+      // fully absorbed (e.g. the resolver adopted the base version of the
+      // only conflicted file) — a successful resolution, not a failure
+      const noDiffLeft = /no diff vs base/.test(outcome.note ?? '');
+      const merged = (outcome.note && !/skipped|error/i.test(outcome.note)) || noDiffLeft;
+      if (merged) {
+        store.setTaskStatus(ctx.store, originTask.id, 'done', { reason: `S5 resolver: conflict resolved in ${res.attempts} attempt(s)${noDiffLeft ? ' (resolution absorbed into base, no remaining diff)' : ` · ${outcome.note}`}`, result: null });
+        store.setConflictResolution(ctx.store, res.id, { status: 'resolved' });
+        ctx.emit?.({ type: 'conflict_resolved', originTaskId: originTask.id, note: outcome.note, attempts: res.attempts });
+        advanceWorkflow(ctx, originTask.id);
+        continue;
+      }
+      if (outcome.conflict && res.attempts < opts.maxAttempts) {
+        // the resolution did not fix it — another attempt (fresh task, same pod)
+        const podNow = store.getPodByRole(ctx.store, res.origin_role)!;
+        const t = store.newId('t');
+        store.insertTask(ctx.store, { id: t, title: `[S5] resolve conflict (attempt ${res.attempts + 1}) ${podNow.branch}`, body: resolverTaskBody(podNow, outcome.conflict), podRole: res.resolver_role });
+        store.setConflictResolution(ctx.store, res.id, { attempts: res.attempts + 1, resolverTaskId: t });
+        ctx.emit?.({ type: 'resolver_retry', originTaskId: res.origin_task_id, attempt: res.attempts + 1 });
+        continue;
+      }
+      store.setConflictResolution(ctx.store, res.id, { status: outcome.conflict ? 'exhausted' : 'failed' });
+      ctx.emit?.({ type: 'resolver_exhausted', originTaskId: res.origin_task_id, attempts: res.attempts, detail: outcome.conflict ?? outcome.note ?? 'merge still failing' });
+      continue;
+    }
+    // resolver task failed (blocked/cancelled): next attempt or exhaust
+    if (res.attempts < opts.maxAttempts) {
+      const pod = store.getPodByRole(ctx.store, res.origin_role);
+      const t = store.newId('t');
+      store.insertTask(ctx.store, { id: t, title: `[S5] resolve conflict (attempt ${res.attempts + 1}) ${pod?.branch ?? res.origin_role}`, body: pod ? resolverTaskBody(pod, `previous attempt: ${resolverTask.result ?? resolverTask.status}`) : 'resolver pod unavailable', podRole: res.resolver_role });
+      store.setConflictResolution(ctx.store, res.id, { attempts: res.attempts + 1, resolverTaskId: t });
+      ctx.emit?.({ type: 'resolver_retry', originTaskId: res.origin_task_id, attempt: res.attempts + 1, reason: resolverTask.result ?? resolverTask.status });
+    } else {
+      store.setConflictResolution(ctx.store, res.id, { status: 'exhausted' });
+      ctx.emit?.({ type: 'resolver_exhausted', originTaskId: res.origin_task_id, attempts: res.attempts, detail: `resolver task ${resolverTask.status}: ${resolverTask.result ?? ''}` });
+    }
+  }
 }
 
 // ---------- workflows ----------
