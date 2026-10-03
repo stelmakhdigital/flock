@@ -49,7 +49,7 @@ fs.writeFileSync(path.join(devSeat, '.pi', 'activity.jsonl'), Array.from({ lengt
 // core.log over the 10MB cap
 fs.writeFileSync(path.join(home, 'core.log'), 'x'.repeat(11 * 1024 * 1024));
 
-const report = runRetentionSweep({ store: db, home });
+const report = await runRetentionSweep({ store: db, home });
 assert.strictEqual(report.archivedRuns, 2, 'only the two FINISHED old runs are archived');
 assert.ok(report.coreLogRotated, 'core.log rotated');
 assert.ok(report.trimmedActivity.includes('dev'), 'dev activity trimmed');
@@ -69,7 +69,7 @@ assert.strictEqual(kept.length, 10, 'tail window kept');
 assert.strictEqual(JSON.parse(kept[0]).n, 140, 'head (oldest) dropped');
 
 // idempotent second sweep: nothing to do
-const again = runRetentionSweep({ store: db, home });
+const again = await runRetentionSweep({ store: db, home });
 assert.strictEqual(again.archivedRuns, 0);
 assert.deepStrictEqual(again.trimmedActivity, []);
 assert.strictEqual(again.coreLogRotated, false);

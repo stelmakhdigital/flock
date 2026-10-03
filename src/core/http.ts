@@ -112,7 +112,8 @@ export function createHttp(ctx: CoreCtx) {
 
   app.get('/api/health', (c) => {
     const alerts = listAlerts(ctx);
-    return c.json({ alerts, opts: healthOptsFromEnv(), mergeQueue: mergeQueueSize() });
+    const escs = store.listEscalations(ctx.store, true);
+    return c.json({ alerts, opts: healthOptsFromEnv(), mergeQueue: mergeQueueSize(), activeEscalations: escs.map((e) => ({ id: e.id, key: e.key, state: e.state, kind: e.kind, subject: e.subject, created_at: e.created_at })) });
   });
 
   app.get('/api/ops', (c) => {

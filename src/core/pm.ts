@@ -140,8 +140,24 @@ export interface PmTrigger {
 
 let lastDigest: string | null = null;
 
-/** Wake the pm pod on a trigger (no-op when the pm is not live). */
+/**
+ * Durable pm trigger (5.4c): the trigger is persisted as an escalation
+ * FIRST, then delivered. pm dead -> nothing is lost: the ladder walks
+ * pm -> operator (runEscalationTick) and the audit row survives restarts.
+ */
 export async function pmNotify(ctx: CoreCtx, t: PmTrigger): Promise<boolean> {
+  const key = t.type === 'pod_crashed' ? `pod:${pmRoleFrom(t.detail)}:crashed`
+    : t.type.startsWith('task_') ? `task:${taskIdFrom(t.detail) ?? t.detail.slice(0, 40)}`
+    : t.type === 'pm_tick' ? null
+    : t.type; // pod_woken etc.: the event itself is the key
+  if (key) {
+    const { openEscalation } = await import('./escalation.js');
+    // only the hang-worthy kinds start a ladder: a crash, a blocked/needs
+    // task. task_added/done/pod_woken are informational (no audit value).
+    if (t.type === 'pod_crashed' || t.type === 'task_blocked' || t.type === 'task_needs') {
+      openEscalation(ctx, { key, kind: t.type, detail: t.detail, severity: t.type === 'pod_crashed' ? 'critical' : 'warn' });
+    }
+  }
   const pod = store.getPodByRole(ctx.store, 'pm');
   if (!pod || pod.state !== 'live') return false;
   await apply(
@@ -149,6 +165,15 @@ export async function pmNotify(ctx: CoreCtx, t: PmTrigger): Promise<boolean> {
     ctx,
   );
   return true;
+}
+
+function pmRoleFrom(detail: string): string {
+  const m = detail.match(/^под (\S+):/);
+  return m?.[1] ?? 'unknown';
+}
+function taskIdFrom(detail: string): string | null {
+  const m = detail.match(/^таск (t_\w+)/);
+  return m?.[1] ?? null;
 }
 
 const PM_TICK_INTERVAL_MS = 5 * 60_000;

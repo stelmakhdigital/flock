@@ -271,6 +271,35 @@ CREATE TABLE IF NOT EXISTS conflict_resolutions(
 );
 `,
   },
+  {
+    // 5.4c: durable escalation ladder — pm triggers are persisted, not
+    // fire-and-forget: pm dead -> the trigger survives the restart and the
+    // ladder walks pm -> operator with timestamps (audit: why it hung)
+    name: '013_escalations',
+    sql: `
+CREATE TABLE IF NOT EXISTS escalations(
+  id TEXT PRIMARY KEY,
+  key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'warn',
+  state TEXT NOT NULL DEFAULT 'open',
+  pm_notified_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  resolved_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_esc_key_state ON escalations(key, state);
+`,
+  },
+  {
+    // 5.4d: DAG workflows — per-step state for the dependency engine
+    // (pending | running | done | blocked); wf_step_state now carries both
+    // the retry counter and the step's place in the DAG
+    name: '014_wf_step_state',
+    sql: `ALTER TABLE wf_step_state ADD COLUMN state TEXT NOT NULL DEFAULT 'pending';`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -687,6 +716,21 @@ export function listTasksForInstance(store: Store, instanceId: string): Task[] {
 // per-step retry accounting: how many times a step of an instance has been
 // attempted (the first enqueue counts as attempt 0; each re-queue after a
 // failure increments it)
+export function setWfStepState(store: Store, instanceId: string, step: string, state: string): void {
+  dbOf(store)
+    .prepare('INSERT INTO wf_step_state(instance_id, step, state) VALUES (?, ?, ?) ON CONFLICT(instance_id, step) DO UPDATE SET state = excluded.state')
+    .run(instanceId, step, state);
+}
+
+export function wfStepStateMap(store: Store, instanceId: string): Record<string, string> {
+  const rows = dbOf(store)
+    .prepare('SELECT step, state FROM wf_step_state WHERE instance_id = ?')
+    .all(instanceId) as { step: string; state: string }[];
+  const m: Record<string, string> = {};
+  for (const r of rows) m[r.step] = r.state;
+  return m;
+}
+
 export function wfStepAttempts(store: Store, instanceId: string, step: string): number {
   const r = dbOf(store)
     .prepare('SELECT attempts FROM wf_step_state WHERE instance_id = ? AND step = ?')
@@ -702,10 +746,10 @@ export function bumpWfStepAttempts(store: Store, instanceId: string, step: strin
   return next;
 }
 
-export function listWfStepStates(store: Store, instanceId: string): { step: string; attempts: number }[] {
+export function listWfStepStates(store: Store, instanceId: string): { step: string; attempts: number; state: string }[] {
   return dbOf(store)
-    .prepare('SELECT step, attempts FROM wf_step_state WHERE instance_id = ? ORDER BY step')
-    .all(instanceId) as { step: string; attempts: number }[];
+    .prepare('SELECT step, attempts, state FROM wf_step_state WHERE instance_id = ? ORDER BY step')
+    .all(instanceId) as { step: string; attempts: number; state: string }[];
 }
 
 // ---------- usage (economy) ----------
@@ -818,6 +862,67 @@ export function setConflictResolution(
   if (patch.applyAttempts !== undefined) { sets.push('apply_attempts = ?'); vals.push(patch.applyAttempts); }
   vals.push(id);
   dbOf(store).prepare(`UPDATE conflict_resolutions SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+}
+
+export interface Escalation {
+  id: string;
+  key: string;
+  kind: string; // pod_crashed | task_blocked | task_needs | workflow_blocked | gate_red | ...
+  subject: string;
+  severity: string; // warn | critical
+  state: string; // open | pm_notified | escalated | acknowledged | resolved
+  pm_notified_at: string | null;
+  attempts: number;
+  resolved_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// 5.4c: durable escalation ladder (the pm trigger that is never lost). One
+// ACTIVE row per key; a duplicate event while active is absorbed (audit
+// note refreshed). Active = open | pm_notified | escalated.
+export const ESC_ACTIVE_STATES = ['open', 'pm_notified', 'escalated'] as const;
+
+export function upsertEscalation(
+  store: Store,
+  e: { key: string; kind: string; subject: string; severity?: string },
+): { id: string; active: boolean } {
+  const db = dbOf(store);
+  const prev = db
+    .prepare("SELECT * FROM escalations WHERE key = ? AND state IN ('open', 'pm_notified', 'escalated')")
+    .get(e.key) as Escalation | undefined;
+  if (prev) {
+    db.prepare('UPDATE escalations SET subject = ?, updated_at = ? WHERE id = ?').run(e.subject, nowIso(), prev.id);
+    return { id: prev.id, active: true };
+  }
+  const id = newId('esc');
+  db.prepare(
+    `INSERT INTO escalations(id, key, kind, subject, severity, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`,
+  ).run(id, e.key, e.kind, e.subject, e.severity ?? 'warn', nowIso(), nowIso());
+  return { id, active: true };
+}
+
+export function getEscalation(store: Store, id: string): Escalation | null {
+  const r = dbOf(store).prepare('SELECT * FROM escalations WHERE id = ?').get(id) as Escalation | undefined;
+  return r ?? null;
+}
+
+export function listEscalations(store: Store, activeOnly = false): Escalation[] {
+  return activeOnly
+    ? (dbOf(store).prepare("SELECT * FROM escalations WHERE state IN ('open', 'pm_notified', 'escalated') ORDER BY created_at DESC").all() as unknown as Escalation[])
+    : (dbOf(store).prepare('SELECT * FROM escalations ORDER BY created_at DESC LIMIT 200').all() as unknown as Escalation[]);
+}
+
+export function setEscalationState(store: Store, id: string, state: string, extra?: { pmNotifiedAt?: string | null; attempts?: number; resolvedReason?: string | null; subject?: string }): void {
+  const db = dbOf(store);
+  const sets = ['state = ?', 'updated_at = ?'];
+  const vals: (string | number | null)[] = [state, nowIso()];
+  if (extra?.pmNotifiedAt !== undefined) { sets.push('pm_notified_at = ?'); vals.push(extra.pmNotifiedAt); }
+  if (extra?.attempts !== undefined) { sets.push('attempts = ?'); vals.push(extra.attempts); }
+  if (extra?.resolvedReason !== undefined) { sets.push('resolved_reason = ?'); vals.push(extra.resolvedReason); }
+  if (extra?.subject !== undefined) { sets.push('subject = ?'); vals.push(extra.subject); }
+  vals.push(id);
+  db.prepare(`UPDATE escalations SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
 }
 
 export function archiveOldRuns(store: Store, olderThanIso: string): number {

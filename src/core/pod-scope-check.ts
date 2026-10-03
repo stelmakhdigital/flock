@@ -1,13 +1,23 @@
 // pod-scoped socket — live check: the operator token arriving on a pod's
-// unix socket is scoped to that pod (5.3). Requires a running core + live
-// dev pod. Run: node dist/core/pod-scope-check.js
+// unix socket is scoped to that pod (5.3). Requires a running core + a live
+// pod with a socket. Run: node dist/core/pod-scope-check.js [role]
+// (role defaults to 'dev'; FLOCK_HOME / FLOCK_PORT respected)
 import { readFileSync, existsSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import net from 'node:net';
 
-const token = readFileSync('/home/arkalaust/.flock/token', 'utf8').trim();
-const sock = '/home/arkalaust/.flock/pods/dev/core.sock';
+const FLOCK_HOME = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+const role = process.argv[2] ?? 'dev';
+const tokenFile = path.join(FLOCK_HOME, 'token');
+const sock = path.join(FLOCK_HOME, 'pods', role, 'core.sock');
+if (!existsSync(tokenFile)) {
+  console.log(`SKIP: no token at ${tokenFile} (core not started?)`);
+  process.exit(0);
+}
+const token = readFileSync(tokenFile, 'utf8').trim();
 if (!existsSync(sock)) {
-  console.log('SKIP: no live dev pod socket (flock pod relaunch dev first)');
+  console.log(`SKIP: no live ${role} pod socket at ${sock} (flock pod relaunch ${role} first)`);
   process.exit(0);
 }
 
@@ -85,7 +95,7 @@ const check = (name: string, cond: boolean, detail = '') => {
   if (!cond) failed++;
 };
 
-const d1 = await call({ type: 'pod_relaunch', role: 'dev' });
+const d1 = await call({ type: 'pod_relaunch', role });
 check('operator-only op blocked (pod_relaunch)', !d1.ok, d1.error);
 
 const d2 = await call({ type: 'task_add', role: 'pm', title: 'scope hack' });
@@ -94,7 +104,7 @@ check('foreign-pod task blocked', !d2.ok, d2.error);
 const d3 = await call({ type: 'watchdog_register', name: 'scope-x', policy: 'timer', intervalMs: 999_999 });
 check('operator-only op blocked (watchdog_register)', !d3.ok, d3.error);
 
-const d4 = await call({ type: 'task_add', role: 'dev', title: 'scope self-check' });
+const d4 = await call({ type: 'task_add', role, title: 'scope self-check' });
 check('own-pod task add allowed', d4.ok);
 const tid = (d4.result as { id?: string } | undefined)?.id;
 

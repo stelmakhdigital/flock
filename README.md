@@ -304,8 +304,12 @@ Worktree-под при `task done` проходит **merge-гейт** — merge
   `--steps-json`-спеке/flag при start) — перед merge core запускает `testCmd`
   из agent-манифеста **в worktree**: green → merge, red/timeout → таск
   `blocked (quality gate: tests failed)` + лог (tail 4KB) в `run.meta`
-  (`kind: quality_gate`). Требует гейт, но `testCmd` не задан → merge со
-  заметкой о дыре в конфиге (не молча).
+  (`kind: quality_gate`). **Fail-closed (5.4c)**: требуется гейт, но `testCmd`
+  не задан в манифесте → merge НЕ идёт: таск
+  `blocked (quality gate unconfigured)` + громкий health-алерт + durable
+  эскалация (не только transition-note). Оператор чинит манифест и
+  `flock task unblock`. (pre-check чистоты base-репо перед `reset --hard`
+  при squash-конфликте покрыт отдельным тестом — gitops.test.ts)  заметкой о дыре в конфиге (не молча).
 
 ```sh
 # squash-под + workflow с тестовым гейтом
@@ -392,14 +396,72 @@ FLOCK_RESOLVER_AGENT=pi FLOCK_RESOLVER_MAX_ATTEMPTS=2 ./bin/flock core up
 видит `no diff vs base` → это **успешное** разрешение (origin-таск `done`),
 a не ошибка.
 
+## Durable-лестница эскалации (этап 5.4c)
+
+pm-триггеры были fire-and-forget: pm умер → триггер потерян до 5-мин
+sweep, аудита «почему провисло» нет. Теперь каждый hang-worthy триггер
+(pod_crashed / task_blocked / task_needs / quality-gate) первым делом
+пишется в `escalations` (миграция 013) — BDD-строка, переживающая
+рестарт, а потом доставляется. Tick 30s (всегда включён) водит лестницу:
+
+```
+open → pm_notified   (pm жив: триггер доставлен + pm-silence-таймер запущен)
+open → escalated     (pm не жив: сразу к оператору — ничто не теряется)
+pm_notified → escalated (pm молчит > FLOCK_ESC_PM_TIMEOUT_S, default 300s)
+escalated → health-алерт (kind=ladder) + core.log, re-reminder каждые
+             FLOCK_ESC_REMINDER_S (default 3600s) до ack/resolve
+```
+
+**Автоматическое закрытие**: tick перечитывает исходное условие (таск
+ушёл из blocked/needs, run пода снова жив, инстанс ушёл из blocked) →
+`resolved` с причиной. Дедуп: один активный ряд на key (повторный
+краш того же пода обновляет audit-note, а не множит ряды).
+
+```sh
+./bin/flock esc ls [--all]     # активные (или все) эскалации — аудит «почему провисло»
+./bin/flock esc ack <id>       # оператор: принял, напоминания прекращаются
+```
+
+`/api/health` теперь включает `activeEscalations` (id/key/state/kind/subject).
+
+## Worktree GC в retention-свип (этап 5.4c)
+
+Закрытые worktree-поды не копят checkout'ы и ветки: 24h sweep удаляет
+worktree закрытого пода (ветка сохраняет коммиты, re-spawn idempotently
+переподключается) и ветку с `ahead=0` (полностью смержена). **Ветка с
+ahead>0 (UNMERGED) сохраняется** — это merge-кандидат (arbiter re-queue
+полагается на него). Плюс `git worktree prune` по всем известным репо.
+Отчёт: `gcWorktrees`/`gcBranches`/`gcKept` в core.log.
+
+## Замечание по claude-адаптеру
+
+claude — единственный «не-typed» адаптер: boot-диалоги по клавишам и
+TUI-маркерам, ack по транскрипту. Маркеры — хрупкая поверхность: при
+бампе версии claude сверяйте маркеры (claude-protocol.ts) с новым TUI —
+hermetic-тест claude-protocol фиксирует текущие ожидания.
+
 Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):
 
 ```json
 [
   {"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2},
-  {"id":"rev","role":"rev"}
+  {"id":"rev","role":"rev","deps":["dev"]}
 ]
 ```
+
+- **deps** (5.4d, DAG): ids шагов, которые должны быть done, прежде чем шаг
+  стартует. Без deps — шаг на стартовом фронте. Последовательный пайплайн —
+  вырожденный случай (шаг N зависит от N-1). Валидация на define: unknown
+  dep, self-dep и **циклы** отклоняются (400). Движок: при done шага ready
+  set = pending-шаги со всеми done-зависимостями → закидываются **параллельно**
+  (арбитер сам распределяет по подам); тело таска получает результаты
+  зависимых шагов. Состояние шага — `wf_step_state.state`
+  (pending/running/done/blocked), видно в `flock workflow status`.
+  Merge-отложенность S3 в DAG: merge откладывается, пока в инстансе есть
+  другие незавершённые шаги. Задержка: если ready пуст, но есть running —
+  ждём (не deadlock); deadlock (валидацией невозможен) блокирует инстанс.
+  Live: ромб a(pi)→b,c(параллельно)→d закрылся, b и c созданы в одну секунду,
+  d — только после обоих.
 
 - **priority** (0..10): шаг-таск получает `priority = instance + step`; арбитер
   берёт из очереди **сначала приоритет, потом FIFO**. У `flock task add`

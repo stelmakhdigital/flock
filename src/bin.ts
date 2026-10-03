@@ -236,6 +236,24 @@ async function main(): Promise<void> {
       return;
     }
 
+    case 'esc': {
+      // 5.4c durable escalation ladder: audit of "why did it hang"
+      if (sub === 'ls') {
+        const activeOnly = rest.includes('--all') ? false : true;
+        print(await api('POST', '/api/ops', { type: 'esc_ls', active: activeOnly }));
+      } else if (sub === 'ack') {
+        const id = rest.find((r) => !r.startsWith('-'));
+        if (!id) {
+          console.log('usage: flock esc ack <id>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'esc_ack', id }));
+      } else {
+        console.log('usage: flock esc ls [--all] | flock esc ack <id>');
+      }
+      return;
+    }
+
     case 'usage': {
       const q = rest[0] ? `?role=${encodeURIComponent(rest[0])}` : '';
       print(await api('GET', `/api/usage${q}`));

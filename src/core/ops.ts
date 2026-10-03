@@ -95,6 +95,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
   team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
   resolver_ls: { group: 'team', scopes: ['operator'], summary: 'S5 conflict-resolution chains (opt-in FLOCK_RESOLVER_AGENT)', run: (o, c) => listConflictResolutions(c.store) },
+  esc_ls: { group: 'team', scopes: ['operator', 'pod'], summary: '5.4c durable escalations (ladder audit)', run: (o, c) => { const activeOnly = o.active === true || o.active === 'true'; return store.listEscalations(c.store, activeOnly); } },
+  esc_ack: { group: 'team', scopes: ['operator'], summary: '5.4c acknowledge an escalation (stops operator reminders)', run: (o, c) => { const id = o.id as string | undefined; if (!id) throw new Error('id required'); const row = store.getEscalation(c.store, id); if (!row) throw new Error('escalation not found'); if (!store.ESC_ACTIVE_STATES.includes(row.state as (typeof store.ESC_ACTIVE_STATES)[number]) && row.state !== 'pm_notified') throw new Error(`escalation is ${row.state}`); store.setEscalationState(c.store, id, 'acknowledged', { resolvedReason: 'operator ack' }); c.emit?.({ type: 'escalation_resolved', id, key: row.key, reason: 'operator ack' }); return { ok: true, id, state: 'acknowledged' }; } },
   pod_merge_status: { group: 'pod', scopes: ['operator', 'pod'], summary: 'worktree pod: ahead/behind/dirty vs base', run: (o, c) => podMergeStatus(o, c) },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
   pod_answer: { group: 'pod', scopes: ['operator'], summary: 'answer a pending dialog (gate) in a pod', run: (o, c) => podAnswer(o, c) },
@@ -781,6 +783,17 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
   ctx.emit?.({ type: `task_${finalTo}`, taskId: id, pod: task.pod_role, reason: finalReason, gate: gateBlock ? true : undefined });
+  if (task.status === 'done' && gateBlock) {
+    // S2 fail-closed: the gate was required but failed to run (no testCmd)
+    // or failed — open a durable escalation so it cannot be scrolled past
+    const { openEscalation } = await import('./escalation.js');
+    openEscalation(ctx, {
+      key: `gate:${task.id}`,
+      kind: gateBlock.reason.includes('unconfigured') ? 'gate_unconfigured' : 'gate_red',
+      detail: `task ${task.id} "${task.title}" (pod ${task.pod_role}): ${gateBlock.reason} — ${gateBlock.result ?? ''}`,
+      severity: 'critical',
+    });
+  }
   // S5: a merge conflict starts the resolver chain (opt-in via
   // FLOCK_RESOLVER_AGENT) — the task stays blocked in the meantime
   if (finalTo === 'blocked' && gateBlock?.reason.startsWith('merge conflict')) {
@@ -849,17 +862,19 @@ async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.T
   const wt = pod.dir; // worktree pod: pod.dir IS the worktree checkout
   try {
     if (!gitops.isGitWorkdir(wt)) return { note: 'merge skipped (worktree missing)' };
-    // S3 (review gate): if this step is followed by more steps (e.g. review),
-    // the merge is DEFERRED — it runs when the instance finishes (after the
-    // review verdict). The branch stays a merge candidate in the meantime.
+    // S3 (review gate) + 5.4d: if OTHER steps of this instance are not done
+    // yet (e.g. review, or a DAG sibling that hasn't finished), the merge is
+    // DEFERRED — it runs when the instance finishes. The branch stays a
+    // merge candidate in the meantime.
     if (task.workflow_instance_id && task.workflow_step && !skipDefer) {
       const inst = store.getWorkflowInstance(ctx.store, task.workflow_instance_id);
       const wf = inst ? store.getWorkflow(ctx.store, inst.workflow_id) : null;
       if (inst && wf) {
         const steps = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
-        const idx = steps.findIndex((s) => s.id === task.workflow_step);
-        if (idx >= 0 && idx < steps.length - 1) {
-          return { note: `merge deferred (step ${steps[idx + 1].id} follows — S3 review gate)` };
+        const states = store.wfStepStateMap(ctx.store, inst.id);
+        const othersIncomplete = steps.some((s) => s.id !== task.workflow_step && (states[s.id] ?? 'pending') !== 'done');
+        if (othersIncomplete) {
+          return { note: `merge deferred (other steps not done yet — S3 review gate)` };
         }
       }
     }
@@ -893,10 +908,11 @@ async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.T
     if (inst?.require_test) {
       const manifest = pod.agent ? resolveAgent(pod.agent, null, pod.profile ?? undefined)?.manifest : undefined;
       if (!manifest?.testCmd) {
-        // config gap: the gate is required but no command is defined — do
-        // NOT merge silently; flag it in the audit note, merge proceeds
-        // (the operator sees it in the transition reason)
-        ctx.emit?.({ type: 'quality_gate', role, ok: null, note: 'no testCmd in manifest (gate skipped)' });
+        // S2 fail-closed: the gate is REQUIRED but unconfigured (no testCmd
+        // in the manifest) — do NOT merge silently. Block the task; the
+        // operator fixes the manifest and unblocks. A loud escalation is
+        // opened in taskReport so it cannot be scrolled past.
+        return { note: null, gateFail: 'quality gate unconfigured (no testCmd in manifest) — set testCmd and unblock' };
       } else {
         const timeoutMs = Number(process.env.FLOCK_TEST_TIMEOUT_S ?? 600) * 1000;
         const g = await runQualityGate(wt, manifest.testCmd, timeoutMs);
@@ -1169,6 +1185,10 @@ interface WfStep {
   // step reviews (fresh-context pod gets the git diff + checklist in the
   // task body; reports done = approve / blocked = reject)
   review?: string;
+  // 5.4d: DAG — ids of steps that must be done before this step starts.
+  // Absent/empty = start with the instance (the sequential pipeline is the
+  // special case: step N deps on step N-1).
+  deps?: string[];
 }
 
 function parseSteps(raw: unknown): WfStep[] {
@@ -1193,7 +1213,31 @@ function parseSteps(raw: unknown): WfStep[] {
     if (s.review != null && typeof s.review !== 'string') {
       throw new OpError(400, `step ${s.id}: review must be a pod role (string)`);
     }
+    if (s.deps != null && (!Array.isArray(s.deps) || s.deps.some((d) => typeof d !== 'string' || !d))) {
+      throw new OpError(400, `step ${s.id}: deps must be an array of step ids`);
+    }
   }
+  // 5.4d: deps reference existing steps, no self-deps, no cycles
+  for (const s of steps) {
+    for (const d of s.deps ?? []) {
+      if (d === s.id) throw new OpError(400, `step ${s.id}: cannot depend on itself`);
+      if (!ids.has(d)) throw new OpError(400, `step ${s.id}: unknown dep: ${d}`);
+    }
+  }
+  const indeg = new Map(steps.map((s) => [s.id, (s.deps ?? []).length]));
+  const dependents = new Map<string, string[]>(steps.map((s) => [s.id, []]));
+  for (const s of steps) for (const d of s.deps ?? []) dependents.get(d)!.push(s.id);
+  const q = steps.filter((s) => (s.deps ?? []).length === 0).map((s) => s.id);
+  let seen = 0;
+  while (q.length) {
+    const cur = q.shift()!;
+    seen++;
+    for (const nxt of dependents.get(cur) ?? []) {
+      indeg.set(nxt, (indeg.get(nxt) ?? 1) - 1);
+      if ((indeg.get(nxt) ?? 0) === 0) q.push(nxt);
+    }
+  }
+  if (seen !== steps.length) throw new OpError(400, 'steps contain a dependency cycle');
   return steps;
 }
 
@@ -1234,11 +1278,12 @@ function reviewDiffBody(ctx: CoreCtx, role: string): string | null {
   }
 }
 
-function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.Workflow, step: WfStep, prevResult?: string): void {
+function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.Workflow, step: WfStep, depsResult?: string | null): void {
   const bodyLines = [
     `Workflow ${wf.name}: шаг ${step.id}`,
     inst.payload ? `Payload: ${inst.payload}` : '',
-    prevResult ? `Результат предыдущего шага: ${prevResult}` : '',
+    step.deps?.length ? `Зависимости: ${step.deps.join(', ')} (уже done)` : '',
+    depsResult ?? '',
   ].filter(Boolean);
   if (step.review) {
     const r = reviewDiffBody(ctx, step.review);
@@ -1256,9 +1301,30 @@ function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.W
   });
 }
 
+// 5.4d: results of a step's deps (their done-task results) for the task body
+function depsResultLine(ctx: CoreCtx, inst: store.WorkflowInstance, step: WfStep): string | null {
+  if (!step.deps?.length) return null;
+  const instTasks = store.listTasksForInstance(ctx.store, inst.id);
+  const parts: string[] = [];
+  for (const d of step.deps) {
+    const done = instTasks.filter((t) => t.workflow_step === d && t.status === 'done').pop();
+    if (done?.result) parts.push(`[${d}] ${String(done.result).slice(0, 400)}`);
+  }
+  return parts.length ? `Результаты зависимых шагов:\n${parts.join('\n')}` : null;
+}
+
+// 5.4d: the DAG frontier — steps that are pending and whose deps are all done
+function readySteps(steps: WfStep[], states: Record<string, string>): WfStep[] {
+  return steps.filter((s) => {
+    if ((states[s.id] ?? 'pending') !== 'pending') return false;
+    return (s.deps ?? []).every((d) => (states[d] ?? 'pending') === 'done');
+  });
+}
+
 // A workflow step task finished (done/blocked/cancelled) → move the instance:
-// done + next step exists → enqueue next step (frontier advance);
-// done + last step → instance done; blocked/cancelled → instance stops.
+// done → mark the step done, enqueue the newly-ready steps (DAG frontier;
+// the sequential pipeline is the degenerate case), done + nothing left →
+// instance done; blocked/cancelled → retry budget per step, then stop.
 export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
   const task = store.getTask(ctx.store, taskId);
   if (!task || !task.workflow_instance_id) return;
@@ -1268,9 +1334,10 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
   if (!wf) return;
   const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
   if (task.status === 'done') {
-    const idx = steps.findIndex((s) => s.id === task.workflow_step);
-    const next = idx >= 0 ? steps[idx + 1] : undefined;
-    if (!next) {
+    store.setWfStepState(ctx.store, inst.id, task.workflow_step!, 'done');
+    const states = store.wfStepStateMap(ctx.store, inst.id);
+    const incomplete = steps.filter((s) => (states[s.id] ?? 'pending') !== 'done');
+    if (incomplete.length === 0) {
       store.setWorkflowInstanceState(ctx.store, inst.id, 'done');
       ctx.emit?.({ type: 'workflow_done', instanceId: inst.id, workflow: wf.name });
       // S3: the instance finished (review approved / last step done) — the
@@ -1283,19 +1350,34 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
       );
       return;
     }
-    enqueueStepTask(ctx, inst, wf, next, task.result ?? undefined);
-    store.setWorkflowInstanceState(ctx.store, inst.id, 'running', next.id);
-    ctx.emit?.({ type: 'workflow_step', instanceId: inst.id, step: next.id, role: next.role });
+    const ready = readySteps(steps, states);
+    if (ready.length === 0) {
+      const anyRunning = steps.some((s) => (states[s.id] ?? 'pending') === 'running');
+      if (anyRunning) return; // waiting for in-flight steps — not a deadlock
+      // defensive: validation forbids cycles/unknown deps, so this is
+      // unreachable in a normal spec — but never leave a stuck instance
+      store.setWorkflowInstanceState(ctx.store, inst.id, 'blocked');
+      ctx.emit?.({ type: 'workflow_blocked', instanceId: inst.id, reason: 'dag deadlock: no ready step while the instance is incomplete' });
+      return;
+    }
+    for (const s of ready) {
+      store.setWfStepState(ctx.store, inst.id, s.id, 'running');
+      enqueueStepTask(ctx, inst, wf, s, depsResultLine(ctx, inst, s));
+    }
+    store.setWorkflowInstanceState(ctx.store, inst.id, 'running', ready.map((s) => s.id).join(','));
+    ctx.emit?.({ type: 'workflow_step', instanceId: inst.id, step: ready.map((s) => s.id).join(','), role: ready.map((s) => s.role).join(',') });
   } else {
     // failure (blocked/cancelled): retry budget per step, then stop the instance
     const attempts = store.wfStepAttempts(ctx.store, inst.id, task.workflow_step!);
     const retryBudget = steps.find((s) => s.id === task.workflow_step)?.retry ?? 0;
     if (task.status !== 'cancelled' && attempts < retryBudget) {
       store.bumpWfStepAttempts(ctx.store, inst.id, task.workflow_step!);
+      store.setWfStepState(ctx.store, inst.id, task.workflow_step!, 'running');
       enqueueStepTask(ctx, inst, wf, steps.find((s) => s.id === task.workflow_step)!);
       ctx.emit?.({ type: 'workflow_retry', instanceId: inst.id, step: task.workflow_step, attempt: store.wfStepAttempts(ctx.store, inst.id, task.workflow_step!), reason: task.result ?? task.status });
       return;
     }
+    store.setWfStepState(ctx.store, inst.id, task.workflow_step!, 'blocked');
     const state = task.status === 'cancelled' ? 'cancelled' : 'blocked';
     store.setWorkflowInstanceState(ctx.store, inst.id, state);
     ctx.emit?.({ type: `workflow_${state}`, instanceId: inst.id, reason: task.result ?? task.status });
@@ -1393,9 +1475,16 @@ async function workflowStart(op: Record<string, unknown>, ctx: CoreCtx): Promise
     : specReqs;
   const instId = store.newId('wfi');
   store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null, priority, requireTest });
-  store.setWorkflowInstanceState(ctx.store, instId, 'running', steps[0].id);
-  enqueueStepTask(ctx, { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null, priority, require_test: requireTest ? 1 : 0 }, wf, steps[0]);
-  ctx.emit?.({ type: 'workflow_started', instanceId: instId, workflow: wf.name, requireTest });
+  // 5.4d: start the DAG frontier — every step without deps (a sequential
+  // pipeline: only steps[0] is ready at start, as before)
+  const instObj = { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null, priority, require_test: requireTest ? 1 : 0 } as store.WorkflowInstance;
+  const frontier = readySteps(steps, {});
+  for (const s of frontier) {
+    store.setWfStepState(ctx.store, instId, s.id, 'running');
+    enqueueStepTask(ctx, instObj, wf, s);
+  }
+  store.setWorkflowInstanceState(ctx.store, instId, 'running', frontier.map((s) => s.id).join(','));
+  ctx.emit?.({ type: 'workflow_started', instanceId: instId, workflow: wf.name, requireTest, frontier: frontier.map((s) => s.id) });
   return { instance: store.getWorkflowInstance(ctx.store, instId), workflow: wf };
 }
 
