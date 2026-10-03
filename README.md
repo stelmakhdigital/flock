@@ -317,6 +317,28 @@ Worktree-под при `task done` проходит **merge-гейт** — merge
 Agent-манифесты: `merge` и `testCmd` поля (например `~/.flock/agents/pi.json`:
 `"testCmd": "npm test"`). Таймаут гейта: `FLOCK_TEST_TIMEOUT_S` (default 600).
 
+## Review-гейт S3 (этап 5.4b)
+
+Workflow `build:dev → review:rev` — **merge откладывается до verdict'а**:
+
+- `review: <role>` у шага = «ревьюет worktree-под `role`». При enqueue core
+  кладёт в body таска **`git diff base...branch` (≤4KB) + чек-лист** (свежий
+  контекст ревьюера видит изменения, а не самоописание автора);
+- build-шаг при `done` не мерджит: `merge deferred (step review follows)`;
+- вердикт ревью через тот же протокол: `task done` (approve) / `task blocked
+  '<почему>'` (reject) — reject блокирует инстанс, merge не происходит;
+- approve (последний шаг) → **deferred merge** того же merge-гейта S1+S2
+  (squash/ff + quality gate); конфликт или red-гейт на этом этапе блокирует
+  **инстанс** (`workflow_blocked`), а не ре-квезит агента — работа сделана,
+  упала интеграция;
+- frozen step task: остановленный инстанс (blocked/cancelled/done) не
+  принимает поздние смены статуса шага (задача и инстанс не разъезжаются).
+
+```sh
+./bin/flock workflow define ship --steps-json '[{"id":"build","role":"dev"},{"id":"review","role":"rev","review":"dev"}]'
+./bin/flock workflow start ship "фича X"
+```
+
 ## Workflow 5.4a: приоритет + timeout + retry (этап 5.4a)
 
 Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):

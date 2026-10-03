@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as store from './store.js';
 import * as gitops from './gitops.js';
@@ -720,6 +720,16 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
   // terminal tasks never re-open and never re-merge (a second `task done`
   // after the pod self-reported would double-squash the branch)
   if (task.status === 'done' || task.status === 'cancelled') return task;
+  // frozen step task: a stopped workflow instance (blocked/cancelled/done)
+  // does not accept late state changes — the instance state and the task
+  // state must not drift apart (a bash pod can self-report the protocol
+  // line after the operator already rejected the step)
+  if (task.workflow_instance_id) {
+    const inst = store.getWorkflowInstance(ctx.store, task.workflow_instance_id);
+    if (inst && inst.state !== 'running') {
+      throw new OpError(409, `workflow instance ${inst.id} is ${inst.state} — the step task is frozen`);
+    }
+  }
   // pod token: own pod's tasks only (an agent cannot report on another
   // pod's work or cancel operator tasks)
   if (ctx.caller?.kind === 'pod' && ctx.caller.role !== task.pod_role) {
@@ -800,7 +810,7 @@ export async function runQualityGate(
   return { ok: r.code === 0, code: r.code, ms, tail: r.out.slice(-4000), timedOut: r.timedOut };
 }
 
-async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.Task): Promise<MergeOutcome> {
+async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.Task, skipDefer = false): Promise<MergeOutcome> {
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod?.repo || !pod.branch) return { note: null };
   const policy = pod.merge_policy ?? 'ff';
@@ -816,6 +826,20 @@ async function mergeWorktreeIfEligible(ctx: CoreCtx, role: string, task: store.T
   const wt = pod.dir; // worktree pod: pod.dir IS the worktree checkout
   try {
     if (!gitops.isGitWorkdir(wt)) return { note: 'merge skipped (worktree missing)' };
+    // S3 (review gate): if this step is followed by more steps (e.g. review),
+    // the merge is DEFERRED — it runs when the instance finishes (after the
+    // review verdict). The branch stays a merge candidate in the meantime.
+    if (task.workflow_instance_id && task.workflow_step && !skipDefer) {
+      const inst = store.getWorkflowInstance(ctx.store, task.workflow_instance_id);
+      const wf = inst ? store.getWorkflow(ctx.store, inst.workflow_id) : null;
+      if (inst && wf) {
+        const steps = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
+        const idx = steps.findIndex((s) => s.id === task.workflow_step);
+        if (idx >= 0 && idx < steps.length - 1) {
+          return { note: `merge deferred (step ${steps[idx + 1].id} follows — S3 review gate)` };
+        }
+      }
+    }
     const st = await gitops.worktreeStatus(pod.repo, wt, pod.branch, base);
     if (st.ahead === 0) return { note: 'merge skipped (no commits ahead of base)' };
     if (st.dirty) return { note: `merge skipped (worktree dirty: commit first) — ${st.ahead} commit(s) unmerged` };
@@ -945,6 +969,10 @@ interface WfStep {
   priority?: number; // 0..10, added to the instance priority for the step task
   timeoutMin?: number; // 1..10080, active-task TTL -> blocked (step timeout)
   retry?: number; // 0..5, auto re-queue on blocked/cancelled
+  // 5.4b S3: review gate — the role of the worktree pod whose branch this
+  // step reviews (fresh-context pod gets the git diff + checklist in the
+  // task body; reports done = approve / blocked = reject)
+  review?: string;
 }
 
 function parseSteps(raw: unknown): WfStep[] {
@@ -966,8 +994,48 @@ function parseSteps(raw: unknown): WfStep[] {
     if (s.retry != null && (!Number.isInteger(s.retry) || s.retry < 0 || s.retry > 5)) {
       throw new OpError(400, `step ${s.id}: retry must be an integer 0..5`);
     }
+    if (s.review != null && typeof s.review !== 'string') {
+      throw new OpError(400, `step ${s.id}: review must be a pod role (string)`);
+    }
   }
   return steps;
+}
+
+// S3: build the review step task body — the fresh-context reviewer gets the
+// diff of the worktree pod's branch vs its base (the actual changes, not the
+// agent's self-description) + a short checklist. Truncated: a review task
+// must stay small (pod-socket transport). Synchronous: body construction
+// happens once per step enqueue (git diff of a worktree is fast).
+function reviewDiffBody(ctx: CoreCtx, role: string): string | null {
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod?.repo || !pod.branch || !pod.repo_base) return null;
+  try {
+    const st = ((): { ahead: number; dirty: boolean } => {
+      const ahead = Number(
+        execFileSync('git', ['-C', pod.repo!, 'rev-list', '--count', `${pod.repo_base}..${pod.branch}`], { timeout: 15_000, encoding: 'utf8' }).trim(),
+      );
+      const dirty = execFileSync('git', ['-C', pod.dir, 'status', '--porcelain', '--untracked-files=no'], { timeout: 15_000, encoding: 'utf8' }).trim() !== '';
+      return { ahead, dirty };
+    })();
+    if (st.ahead === 0) return `Под ${role}: нет новых коммитов против base (${pod.repo_base}) — ревьювать нечего.`;
+    let d: string;
+    try {
+      d = execFileSync('git', ['-C', pod.repo!, 'diff', `${pod.repo_base}...${pod.branch}`], { timeout: 15_000, encoding: 'utf8', maxBuffer: 8_000_000 });
+    } catch {
+      d = '(diff недоступен)';
+    }
+    const body = d.slice(0, 4000) + (d.length > 4000 ? '\n… (diff обрезан)' : '');
+    return [
+      `Ревью ветки ${pod.branch} (base: ${pod.repo_base}, ${st.ahead} commit(s) ahead, dirty: ${st.dirty}):`,
+      '--- git diff base...branch ---',
+      body,
+      '---',
+      'Чек-лист: 1) код делает то, что обещает заголовок таска; 2) нет side-effects вне задачи; 3) нет отладочного мусора/секретов.',
+      'Вердикт: `flock task done <id>` (approve) или `flock task blocked <id> \'<что не так>\'` (reject).',
+    ].join('\n');
+  } catch {
+    return null;
+  }
 }
 
 function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.Workflow, step: WfStep, prevResult?: string): void {
@@ -976,6 +1044,11 @@ function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.W
     inst.payload ? `Payload: ${inst.payload}` : '',
     prevResult ? `Результат предыдущего шага: ${prevResult}` : '',
   ].filter(Boolean);
+  if (step.review) {
+    const r = reviewDiffBody(ctx, step.review);
+    if (r) bodyLines.push(r);
+    else bodyLines.push(`Ревью под ${step.review}: worktree-привязка не найдена (под закрыт или без --repo) — запроси diff у оператора.`);
+  }
   store.insertTask(ctx.store, {
     id: store.newId('t'),
     title: `[wf ${wf.name}] ${step.title ?? step.id}`,
@@ -1004,6 +1077,14 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
     if (!next) {
       store.setWorkflowInstanceState(ctx.store, inst.id, 'done');
       ctx.emit?.({ type: 'workflow_done', instanceId: inst.id, workflow: wf.name });
+      // S3: the instance finished (review approved / last step done) — the
+      // deferred merge runs NOW, on the worktree pod of the first step.
+      // Merge conflict / gate-red: the instance becomes blocked (not done).
+      // Fire-and-forget: the merge (git + optional test run) outlives the
+      // report call; the instance state settles on its own.
+      void deferredMerge(ctx, inst, wf, steps).catch((e) =>
+        ctx.emit?.({ type: 'workflow_merge_error', instanceId: inst.id, message: e instanceof Error ? e.message : String(e) }),
+      );
       return;
     }
     enqueueStepTask(ctx, inst, wf, next, task.result ?? undefined);
@@ -1022,6 +1103,38 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
     const state = task.status === 'cancelled' ? 'cancelled' : 'blocked';
     store.setWorkflowInstanceState(ctx.store, inst.id, state);
     ctx.emit?.({ type: `workflow_${state}`, instanceId: inst.id, reason: task.result ?? task.status });
+  }
+}
+
+// S3: deferred merge for a finished workflow instance — the worktree pod of
+// the first step carries the branch; the instance's done build-task supplies
+// the squash message + the require_test gate. A failed merge (conflict / red
+// gate) blocks the INSTANCE (the operator sees it in workflow status), not a
+// re-queued agent task — the work is done, integration failed.
+async function deferredMerge(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.Workflow, steps: WfStep[]): Promise<void> {
+  const firstRole = steps[0]?.role;
+  if (!firstRole) return;
+  const pod = store.getPodByRole(ctx.store, firstRole);
+  if (!pod?.repo || !pod.branch) return;
+  // the build step's done task (its id/title feed the squash commit message)
+  const buildTask = store
+    .listTasks(ctx.store)
+    .filter((t) => t.workflow_instance_id === inst.id && t.workflow_step === steps[0].id && t.status === 'done')
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+  if (!buildTask) return; // nothing merged yet (e.g. ff skip) — nothing to defer
+  const outcome = await mergeWorktreeIfEligible(ctx, firstRole, buildTask, true);
+  if (outcome.conflict) {
+    store.setWorkflowInstanceState(ctx.store, inst.id, 'blocked');
+    ctx.emit?.({ type: 'workflow_blocked', instanceId: inst.id, reason: `merge conflict: ${outcome.conflict}` });
+    return;
+  }
+  if (outcome.gateFail) {
+    store.setWorkflowInstanceState(ctx.store, inst.id, 'blocked');
+    ctx.emit?.({ type: 'workflow_blocked', instanceId: inst.id, reason: `quality gate: ${outcome.gateFail}` });
+    return;
+  }
+  if (outcome.note && !/skipped/.test(outcome.note)) {
+    ctx.emit?.({ type: 'workflow_merged', instanceId: inst.id, role: firstRole, note: outcome.note });
   }
 }
 

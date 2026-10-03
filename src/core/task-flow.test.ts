@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { openStore, setTaskStatus } from './store.js';
+import { openStore, setTaskStatus, setWorkflowInstanceState } from './store.js';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-tf-'));
 const db = openStore(home);
@@ -31,4 +31,30 @@ setTaskStatus(db, 't_a', 'cancelled');
 assert.throws(() => setTaskStatus(db, 't_a', 'done'), /bad task transition/, 'terminal state is terminal');
 
 fs.rmSync(home, { recursive: true, force: true });
-console.log('task-flow: all checks passed');
+
+// 5.4b S3: frozen step task — a stopped workflow instance rejects late state
+// changes (no task/instance state drift)
+{
+  const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-frozen-'));
+  const db2 = openStore(home2);
+  const raw2 = new DatabaseSync(path.join(home2, 'flock.db'));
+  raw2.prepare("INSERT INTO pods(id, role, dir, state, created_at) VALUES (?, ?, ?, 'live', ?)").run('pod_p', 'p', path.join(home2, 'pods', 'p'), new Date().toISOString());
+  raw2.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at, workflow_instance_id, workflow_step) VALUES ('t_f1', 'x', 'p', 'active', ?, 'wfi1', 's')").run(new Date().toISOString());
+  raw2.prepare("INSERT INTO workflows(id, name, spec, created_at) VALUES ('wf1', 'froz', ?, ?)").run(JSON.stringify({ steps: [{ id: 's', role: 'p' }] }), new Date().toISOString());
+  raw2.prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at) VALUES ('wfi1', 'wf1', NULL, 'running', ?)").run(new Date().toISOString());
+  raw2.close();
+  const { apply } = await import('./ops.js');
+  const ctx = { store: db2, ticks: {} } as never;
+  const r1 = (await apply({ type: 'task_blocked', id: 't_f1', reason: 'reject' }, ctx)) as { status: string };
+  assert.strictEqual(r1.status, 'blocked', 'running instance: reject lands');
+  setWorkflowInstanceState(db2, 'wfi1', 'blocked');
+  let threw = false;
+  try {
+    await apply({ type: 'task_done', id: 't_f1' }, ctx);
+  } catch (e) {
+    threw = /frozen/.test(String((e as Error).message));
+  }
+  assert.ok(threw, 'frozen instance rejects the late state change');
+  fs.rmSync(home2, { recursive: true, force: true });
+  console.log('task-flow: frozen step task checks passed');
+}
