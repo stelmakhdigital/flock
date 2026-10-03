@@ -12,6 +12,7 @@ import {
   claudePaneReady,
   claudePaneBusy,
   claudeTranscriptFp,
+  detectClaudeGate,
   waitForTranscriptGrowth,
 } from './claude-protocol.js';
 
@@ -122,6 +123,43 @@ assert.ok(!claudePaneReady(shell), 'shell prompt (zsh ❰) is not the claude ❯
   const r3 = await waitForTranscriptGrowth(dir, null, 1000);
   assert.ok(r3.grown, 'first appearance counts as growth');
   fs.rmSync(tmp, { recursive: true, force: true });
+}
+
+// ── detectClaudeGate (runtime-agnostic healthProbe gate) ───────────────────
+{
+  // idle prompt (ready footer, ❯ cursor) is NOT a gate
+  const idle = ' auto mode on · ← for agents\n❯ '
+  assert.strictEqual(detectClaudeGate(idle), undefined, 'idle footer is not a gate');
+  const plain = '❯ '; // bare cursor, no hints
+  assert.strictEqual(detectClaudeGate(plain), undefined, 'bare cursor is not a gate');
+
+  // permission prompt: footer hint 'Enter to confirm' + visible question line
+  const perm = [
+    '✻ Thinking…',
+    'Do you want to make this edit?',
+    '  ❯ 1. Yes',
+    '    2. Yes, and don’t ask again',
+    '    3. No',
+    '',
+    ' Enter to confirm · Esc to reject',
+  ].join('\n');
+  const g = detectClaudeGate(perm);
+  assert.ok(g, 'permission prompt is a gate');
+  assert.strictEqual(g!.channel, 'attach', 'TUI gate is answered by attaching, not /answer');
+  assert.ok(g!.id.startsWith('claude:'), 'stable id per hint: ' + g!.id);
+  assert.ok(g!.title.startsWith('Do you want to make this edit?'), 'title = the visible question, got: ' + g!.title);
+
+  // stability: the same hint on two ticks yields the same id (alert state ref)
+  assert.strictEqual(detectClaudeGate(perm)!.id, detectClaudeGate(perm + '\nmore')!.id, 'id stable across ticks');
+
+  // MCP dialog (Space to select) is a gate too; API-key confirm as well
+  assert.ok(detectClaudeGate('Space to select · Enter to continue'), 'MCP checkbox dialog is a gate');
+  assert.ok(detectClaudeGate('Do you want to use this API key?\n Enter to confirm'), 'API key confirm is a gate');
+
+  // ready() and gate() agree on the idle prompt: ready true, no gate
+  assert.ok(claudePaneReady(idle), 'idle prompt is ready');
+  assert.strictEqual(detectClaudeGate(idle), undefined, '…and still not a gate');
+  assert.ok(!claudePaneReady(perm), 'a gated pane is not ready');
 }
 
 console.log('claude-protocol: all checks passed');

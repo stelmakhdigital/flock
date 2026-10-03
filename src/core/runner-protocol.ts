@@ -10,6 +10,7 @@
 // Core reads ONLY runner-authored surfaces (sidecar, markers) — never
 // screen-scrapes the TUI.
 
+import fs from 'node:fs';
 import path from 'node:path';
 
 export const RUNNER_READY_MARKER = '[flock-runner] READY';
@@ -432,4 +433,78 @@ export function dialogResponse(dialog: PendingDialog, arg: AnswerArg): { value?:
   }
   // input / editor: free text (index form = the value of /n/ is the text itself)
   return { value: arg.kind === 'value' ? arg.v : '' };
+}
+
+// ── Typed activity log (pure) ───────────────────────────────────────────────
+// The pod's durable activity log (seat activityPath): one JSON event per line
+// (ext_dialog_unanswered/answered, prompts, …). Parsed here — pure, so the
+// adapters (healthProbe) and the core (health) share ONE reader. (Moved out
+// of health.ts for the runtime-agnostic refactor: health is a CORE consumer
+// of the probes, not the place where the protocol lives.)
+
+export interface ActivityLine {
+  at?: string;
+  event?: string;
+  id?: string;
+  via?: string;
+  method?: string;
+  title?: string;
+  [k: string]: unknown;
+}
+
+// Parse (tail of) the activity log: newest last, non-JSON lines skipped.
+export function parseActivity(raw: string, maxLines = 400): ActivityLine[] {
+  const lines = raw.split('\n').filter(Boolean).slice(-maxLines);
+  const out: ActivityLine[] = [];
+  for (const l of lines) {
+    try {
+      out.push(JSON.parse(l) as ActivityLine);
+    } catch {
+      /* not json — skip */
+    }
+  }
+  return out;
+}
+
+// Read + parse the pod's activity log. Missing file = [].
+export function readActivity(stateRoot: string, role: string, maxLines = 2000): ActivityLine[] {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(seatPaths(stateRoot, role).activityPath, 'utf8');
+  } catch {
+    return [];
+  }
+  return parseActivity(raw, maxLines);
+}
+
+// The currently-open dialog gate: any ext_dialog_unanswered without an
+// ext_dialog_answered for the same id after it; the most recent one wins.
+export function detectGate(activity: ActivityLine[]): ActivityLine | null {
+  const openIdx = new Map<string, number>(); // dialog id -> index of its unanswered event
+  activity.forEach((a, i) => {
+    if (a.event === 'ext_dialog_unanswered' && typeof a.id === 'string') openIdx.set(a.id, i);
+    else if (a.event === 'ext_dialog_answered' && typeof a.id === 'string') openIdx.delete(a.id);
+  });
+  let best: ActivityLine | null = null;
+  let bestIdx = -1;
+  for (const [id, idx] of openIdx) {
+    if (idx > bestIdx) {
+      bestIdx = idx;
+      best = activity[idx];
+    }
+  }
+  return best;
+}
+
+// The launchId of the run a sidecar state belongs to (from the 'created'
+// run-meta entry). Pure: runkeeper + the pi adapter's liveness both need it.
+export function runLaunchId(run: { meta?: string | null }): string | null {
+  try {
+    const arr = JSON.parse(run.meta || '[]');
+    if (!Array.isArray(arr)) return null;
+    const created = arr.find((e: unknown) => (e as { kind?: string })?.kind === 'created');
+    return created && typeof (created as { launchId?: string }).launchId === 'string' ? (created as { launchId: string }).launchId : null;
+  } catch {
+    return null;
+  }
 }

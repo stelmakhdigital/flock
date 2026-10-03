@@ -25,12 +25,17 @@ import {
   buildPendingState,
   buildRunnerCommand,
   frameMessage,
+  newNonce,
+  runLaunchId,
   LaunchPosture,
   resolveLaunchMode,
   resolveTrust,
   ForkSource,
   seatPaths,
+  readActivity,
+  detectGate,
   type RunnerState,
+  type ActivityLine,
 } from './runner-protocol.js';
 import {
   CLAUDE_BOOT_DIALOGS,
@@ -40,9 +45,12 @@ import {
   claudePaneBusy,
   claudePaneReady,
   claudeProjectsDir,
+  claudeTranscriptFp,
+  detectClaudeGate,
   latestClaudeSession,
   seedClaudeConfig,
   validateClaudeSessionToken,
+  waitForTranscriptGrowth,
 } from './claude-protocol.js';
 import {
   AgentManifest,
@@ -125,6 +133,63 @@ export interface ReadyResult {
   code?: string;
 }
 
+// ── Runtime-agnostic signal contract ────────────────────────────────────────
+// The CORE asks every runtime the same three questions and does not know
+// HOW the answer was produced (typed sidecar? transcript? pane scrape?).
+// A runtime that cannot answer a question simply does not implement the
+// method, and the core DEGRADES instead of erroring:
+//
+//   liveness()     absent -> generic pid check (bash/cmd: window process)
+//   sendVerified() absent -> legacy visual probe (capture-based verify)
+//   healthProbe()  absent -> core skips health for the pod (bash/cmd)
+//
+// The questions:
+//
+//   liveness(binding, run) — "is the agent of THIS run still alive?"
+//     { alive: false, reason } — core writes `reason` into runs.exit_state
+//     (keep the reason in the existing shape: 'clean' or 'crashed(...)';
+//     the core treats a 'crashed…' state as a crash event + pm notification,
+//     'clean' as a quiet end).
+//
+//   sendVerified(binding, text) — "deliver this text and PROVE it landed."
+//     { ok: false, detail } — the send failed (op 504/503).
+//     attempts — terminal attempts used (run.meta audit, unchanged).
+//     The ack mechanism is the adapter's business (sidecar nonce, transcript
+//     growth, …) — the core only needs ok/attempts + the ack name for the
+//     run.meta audit line.
+//
+//   healthProbe(binding) — "what is the agent doing right now?"
+//     ready:            is the agent at a usable state (sidecar ready /
+//                       prompt)?
+//     busy:             is it working a turn (streaming / in-turn marker)?
+//     lastActivityAt:   ISO timestamp of the last observed activity (prompt
+//                       landed / transcript written) — the idle ladder's clock.
+//     gate:             a dialog that needs a HUMAN (permission prompt).
+//                       channel 'answer' — answerable via `flock pod answer`
+//                       (a typed channel exists); 'attach' — the operator
+//                       must watch the pane (tmux attach).
+//                       at — when the gate was observed (the core keeps the
+//                       policy "a gate is live only for the current run").
+//     null — no probe available (sidecar missing) — the core clears/skips.
+
+export interface RunLike {
+  id: string;
+  pid?: number | null;
+  meta?: string | null; // run-meta JSON (launchId lives in the 'created' entry)
+  started_at: string;
+}
+
+export interface LivenessResult { alive: boolean; reason?: string }
+
+export interface SendVerifiedResult { ok: boolean; attempts?: number; detail?: string; ack?: string }
+
+export interface HealthProbe {
+  ready: boolean;
+  busy: boolean;
+  lastActivityAt?: string;
+  gate?: { id: string; title: string; channel: 'answer' | 'attach'; at?: string };
+}
+
 export interface RuntimeAdapter {
   readonly runtime: string;
   listInstalled(binding: PodBinding): Promise<{ installed: boolean; version?: string; detail?: string }>;
@@ -143,6 +208,10 @@ export interface RuntimeAdapter {
   // run-meta (store.latestSessionFile) and does not implement this; claude
   // scans its per-pod transcripts.
   latestSessionToken?(binding: PodBinding): Promise<string | null>;
+  // ── the three questions (see the contract above) ──
+  liveness?(binding: PodBinding, run: RunLike): Promise<LivenessResult>;
+  sendVerified?(binding: PodBinding, text: string): Promise<SendVerifiedResult>;
+  healthProbe?(binding: PodBinding): Promise<HealthProbe | null>;
 }
 
 // ── Managed blocks (guidance_merge) ─────────────────────────────────────────
@@ -377,6 +446,66 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
+  // ── the three questions (pi answers with typed signals) ─────────────────
+  // (1) liveness — moved byte-for-byte from the core runkeeper (checkRunLiveness):
+  //     step 1 typed sidecar exit (launchId-scoped), step 2 foreground guard
+  //     (sidecar alive but the pane fell back to the shell = untyped death).
+  async liveness(binding: PodBinding, run: RunLike): Promise<LivenessResult> {
+    const launchId = runLaunchId(run);
+    const st = terminal.readRunnerState(this.env.home, binding.role);
+    if (launchId && st?.exited && st.launchId === launchId) {
+      const ex = st.exited;
+      return { alive: false, reason: ex.code === 0 && !ex.signal ? 'clean' : `crashed(${ex.signal ? `signal ${ex.signal}` : `code ${ex.code}`})` };
+    }
+    if (launchId && st && st.launchId === launchId && !st.exited) {
+      const fg = await terminal.paneCommand(terminal.winTarget(binding.role)).catch(() => '');
+      if (terminal.SHELL_COMMANDS.has(fg)) {
+        return { alive: false, reason: 'crashed(runner gone, pane at shell)' };
+      }
+    }
+    return { alive: true };
+  }
+
+  // (2) sendVerified — flockmsg v2: framed message (nonce), raw paste, ack =
+  //     the sidecar's lastPrompt carrying our nonce (5s deadline, 300ms poll).
+  async sendVerified(binding: PodBinding, text: string): Promise<SendVerifiedResult> {
+    const nonce = newNonce();
+    const wire = frameMessage(text, nonce);
+    const res = await terminal.send(terminal.winTarget(binding.role), wire, { raw: true });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const st = terminal.readRunnerState(this.env.home, binding.role);
+      if (st?.lastPrompt?.nonce === nonce) {
+        return { ok: true, attempts: res.attempts, ack: 'sidecar' };
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return { ok: false, attempts: res.attempts, detail: 'runner did not ack the message (check the pod pane)' };
+  }
+
+  // (3) healthProbe — sidecar (ready/streaming/lastPrompt.at) + the typed
+  //     activity log's open dialog (gate, channel 'answer').
+  async healthProbe(binding: PodBinding): Promise<HealthProbe | null> {
+    const state = terminal.readRunnerState(this.env.home, binding.role);
+    const activity = readActivity(this.env.home, binding.role);
+    const gateRaw = detectGate(activity);
+    const gateAt = gateRaw && typeof gateRaw.at === 'string' ? Date.parse(gateRaw.at) : 0;
+    const gate = gateRaw && typeof gateRaw.id === 'string' && Number.isFinite(gateAt)
+      ? { id: gateRaw.id, title: typeof gateRaw.title === 'string' ? gateRaw.title : '(без заголовка)', channel: 'answer' as const, at: new Date(gateAt).toISOString() }
+      : undefined;
+    if (!state) {
+      // sidecar missing: nothing typed to report (a dead runner has no
+      // response path for its stale dialogs either)
+      return { ready: false, busy: false, gate };
+    }
+    return {
+      ready: !!state.ready,
+      busy: !!state.streaming,
+      lastActivityAt: state.lastPrompt?.at,
+      gate,
+    };
+  }
+
   async checkReady(binding: PodBinding): Promise<ReadyResult> {
     const target = terminal.winTarget(binding.role);
     const state = terminal.readRunnerState(this.env.home, binding.role);
@@ -590,6 +719,57 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
         /* the launch paste will surface the failure */
       }
     }
+  }
+
+  // ── the three questions (claude answers with pane + transcript signals) ──
+  // (1) liveness — foreground guard: the TUI exited -> the pane is back at the
+  //     shell. (A missing/unknown foreground is NOT a crash here — the generic
+  //     pid check catches a dead window.)
+  async liveness(binding: PodBinding, _run: RunLike): Promise<LivenessResult> {
+    const fg = await terminal.paneCommand(terminal.winTarget(binding.role)).catch(() => '');
+    if (fg && terminal.SHELL_COMMANDS.has(fg)) {
+      return { alive: false, reason: 'crashed(claude exited, pane at shell)' };
+    }
+    return { alive: true };
+  }
+
+  // (2) sendVerified — raw paste + Enter; ack = the per-pod transcript GROWS
+  //     (a user entry lands within seconds, independent of turn duration).
+  async sendVerified(binding: PodBinding, text: string): Promise<SendVerifiedResult> {
+    const projectsDir = claudeProjectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd);
+    const before = claudeTranscriptFp(projectsDir);
+    const res = await terminal.send(terminal.winTarget(binding.role), text, { raw: true });
+    const { grown } = await waitForTranscriptGrowth(projectsDir, before, 30000);
+    if (!grown) return { ok: false, attempts: res.attempts, detail: 'claude transcript did not grow after send (check the pod pane)' };
+    return { ok: true, attempts: res.attempts, ack: 'transcript' };
+  }
+
+  // (3) healthProbe — pane scrape: ready = idle prompt, busy = in-turn marker,
+  //     lastActivityAt = newest transcript mtime, gate = an open permission
+  //     prompt (detectClaudeGate: the idle footer is NOT a gate; channel
+  //     'attach' — there is no /answer channel for the TUI). at = now: the
+  //     pane is a LIVE scrape, so the core's "gate is live only for the
+  //     current run" rule sees a fresh timestamp, not a stale one.
+  async healthProbe(binding: PodBinding): Promise<HealthProbe | null> {
+    const target = terminal.winTarget(binding.role);
+    const out = await terminal.capture(target, 60).catch(() => '');
+    const gate = detectClaudeGate(out);
+    const gated = gate ? { ...gate, at: new Date().toISOString() } : undefined;
+    const last = latestClaudeSession(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd));
+    let lastActivityAt: string | undefined;
+    if (last) {
+      try {
+        lastActivityAt = new Date(fs.statSync(last.file).mtimeMs).toISOString();
+      } catch {
+        lastActivityAt = undefined;
+      }
+    }
+    return {
+      ready: claudePaneReady(out),
+      busy: claudePaneBusy(out),
+      lastActivityAt,
+      gate: gated,
+    };
   }
 
   async checkReady(binding: PodBinding): Promise<ReadyResult> {

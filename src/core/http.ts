@@ -120,8 +120,8 @@ export function createHttp(ctx: CoreCtx) {
     return c.json({ ops: listOps() });
   });
 
-  app.get('/api/pm', (c) => {
-    return c.json({ pm: pmDigest(ctx), alerts: listAlerts(ctx), usage: store.usageSummary(ctx.store) });
+  app.get('/api/pm', async (c) => {
+    return c.json({ pm: await pmDigest(ctx), alerts: listAlerts(ctx), usage: store.usageSummary(ctx.store) });
   });
 
   app.get('/api/usage', (c) => {

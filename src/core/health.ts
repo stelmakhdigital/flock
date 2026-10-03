@@ -18,12 +18,12 @@
 
 import * as path from 'node:path';
 import fs from 'node:fs';
-import { seatPaths } from './runner-protocol.js';
 import type { CoreCtx } from './ops.js';
-import { apply } from './ops.js';
+import { apply, adapterForPod } from './ops.js';
 import * as store from './store.js';
-import { readRunnerState, capture, sendKey, winTarget } from './terminal.js';
+import { capture, sendKey, winTarget } from './terminal.js';
 import { podRuntime } from './agent.js';
+import type { RuntimeAdapter } from './runtime-adapter.js';
 
 export interface HealthOpts {
   gateDetectMin: number; // dialog pending longer than this -> alert
@@ -59,61 +59,11 @@ export function healthOptsFromEnv(env: NodeJS.ProcessEnv = process.env): HealthO
 }
 
 // ---- pure detection (testable) ----------------------------------------------
-
-export interface ActivityLine {
-  at?: string;
-  event?: string;
-  id?: string;
-  via?: string;
-  method?: string;
-  title?: string;
-  [k: string]: unknown;
-}
-
-/** Parse (tail of) the pod activity log: newest last, non-JSON lines skipped. */
-export function parseActivity(raw: string, maxLines = 400): ActivityLine[] {
-  const lines = raw.split('\n').filter(Boolean).slice(-maxLines);
-  const out: ActivityLine[] = [];
-  for (const l of lines) {
-    try {
-      out.push(JSON.parse(l) as ActivityLine);
-    } catch {
-      /* not json — skip */
-    }
-  }
-  return out;
-}
-
-export function readActivity(stateRoot: string, role: string, maxLines = 2000): ActivityLine[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(path.join(seatPaths(stateRoot, role).activityPath), 'utf8');
-  } catch {
-    return [];
-  }
-  return parseActivity(raw, maxLines);
-}
-
-/**
- * The currently-open dialog gate: any ext_dialog_unanswered without an
- * ext_dialog_answered for the same id after it; the most recent one wins.
- */
-export function detectGate(activity: ActivityLine[]): ActivityLine | null {
-  const openIdx = new Map<string, number>(); // dialog id -> index of its unanswered event
-  activity.forEach((a, i) => {
-    if (a.event === 'ext_dialog_unanswered' && typeof a.id === 'string') openIdx.set(a.id, i);
-    else if (a.event === 'ext_dialog_answered' && typeof a.id === 'string') openIdx.delete(a.id);
-  });
-  let best: ActivityLine | null = null;
-  let bestIdx = -1;
-  for (const [id, idx] of openIdx) {
-    if (idx > bestIdx) {
-      bestIdx = idx;
-      best = activity[idx];
-    }
-  }
-  return best;
-}
+// The activity-log protocol (ActivityLine/parseActivity/readActivity/
+// detectGate) lives in runner-protocol.js — the pi healthProbe and the
+// tests share it. Re-exported from here so existing imports keep working.
+export type { ActivityLine } from './runner-protocol.js';
+export { parseActivity, readActivity, detectGate } from './runner-protocol.js';
 
 export interface IdleProbe {
   ready: boolean;
@@ -182,10 +132,15 @@ export function listAlerts(ctx: CoreCtx): AlertRow[] {
 export async function runHealthTick(ctx: CoreCtx): Promise<void> {
   const opts = healthOptsFromEnv();
   const nowMs = Date.now();
+  // Runtime-agnostic: ANY pod whose adapter can probe is checked (pi and
+  // claude answer the same questions with their own signals; bash/cmd have
+  // no probe -> skipped, as before).
   for (const pod of store.listPods(ctx.store)) {
-    if (pod.state !== 'live' || podRuntime(pod.agent) !== 'pi') continue; // only runner pods
+    if (pod.state !== 'live') continue;
+    const resolved = adapterForPod(pod, ctx);
+    if (!resolved?.adapter.healthProbe) continue;
     try {
-      await checkPod(ctx, pod.role, opts, nowMs);
+      await checkPod(ctx, pod, resolved.adapter, opts, nowMs);
     } catch (e) {
       console.error(`[core] health: ${pod.role}: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -217,18 +172,23 @@ function sweepClaudeDialog(ctx: CoreCtx, role: string): void {
     .catch(() => {});
 }
 
-async function checkPod(ctx: CoreCtx, role: string, opts: HealthOpts, nowMs: number): Promise<void> {
-  const state = readRunnerState(ctx.store.home, role);
-  const activity = readActivity(ctx.store.home, role);
+async function checkPod(ctx: CoreCtx, pod: store.Pod, adapter: RuntimeAdapter, opts: HealthOpts, nowMs: number): Promise<void> {
+  const role = pod.role;
+  const probe = await adapter.healthProbe!({
+    role,
+    cwd: pod.dir,
+    seatRoot: path.join(ctx.store.home, 'pods', role),
+  });
 
   // --- gate: a dialog is waiting for a human ---------------------------------
   // A dialog is live only for the CURRENT run: activity is durable, and an
   // unanswered dialog from a dead runner (relaunch/kill) has no response
-  // path and must not alert forever.
+  // path and must not alert forever. (The core policy over the probe: the
+  // adapter reports what it sees; the run boundary is the core's call.)
   const run = store.currentRun(ctx.store, role);
   const runStartMs = run ? Date.parse(run.started_at) : 0;
-  const gateRaw = detectGate(activity);
-  const gateAt = gateRaw && typeof gateRaw.at === 'string' ? Date.parse(gateRaw.at) : 0;
+  const gateRaw = probe?.gate ?? null;
+  const gateAt = gateRaw && gateRaw.at ? Date.parse(gateRaw.at) : 0;
   const gate = gateRaw && Number.isFinite(gateAt) && gateAt >= runStartMs ? gateRaw : null;
   for (const a of listAlerts(ctx).filter((a) => a.pod_role === role && a.kind === 'gate')) {
     if (!gate || a.ref !== gate.id) alertClear(ctx, role, 'gate', a.ref);
@@ -248,7 +208,7 @@ async function checkPod(ctx: CoreCtx, role: string, opts: HealthOpts, nowMs: num
           kind: 'gate',
           ref: gate.id,
           state: 'open',
-          note: `dialog waiting: ${title} — ответ: flock pod answer ${role} <n|текст>`,
+          note: `dialog waiting: ${title} — ${gate.channel === 'answer' ? `ответ: flock pod answer ${role} <n|текст>` : `смотреть: tmux attach -t ${winTarget(role)}`}`,
         });
       }
       // escalation: park an active task in needs so it is not lost in the queue
@@ -270,15 +230,18 @@ async function checkPod(ctx: CoreCtx, role: string, opts: HealthOpts, nowMs: num
   }
 
   // --- idle: at rest while a claimed task is still active ----------------------
+  // Runtime-agnostic over the probe: ready + !busy + lastActivity older than
+  // idleMin (pi: sidecar ready/streaming/lastPrompt.at; claude: pane scrape +
+  // transcript mtime). The ladder (watching -> nudging -> needs) is unchanged.
   const activeTasks = store.listTasks(ctx.store, 'active').filter((t) => t.pod_role === role);
-  if (!state || activeTasks.length === 0) {
+  if (!probe || !probe.ready || activeTasks.length === 0) {
     for (const a of listAlerts(ctx).filter((a) => a.pod_role === role && a.kind === 'idle')) {
       alertClear(ctx, role, 'idle', a.ref);
     }
     return;
   }
   for (const task of activeTasks) {
-    const idle = detectIdle({ ready: !!state.ready, streaming: state.streaming, lastPromptAt: state.lastPrompt?.at }, nowMs, opts);
+    const idle = detectIdle({ ready: probe.ready, streaming: probe.busy, lastPromptAt: probe.lastActivityAt }, nowMs, opts);
     if (!idle) {
       alertClear(ctx, role, 'idle', task.id);
       continue;

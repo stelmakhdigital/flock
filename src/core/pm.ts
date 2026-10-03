@@ -11,9 +11,7 @@
 // a quiet pipeline).
 
 import * as store from './store.js';
-import { apply, OpError, type CoreCtx } from './ops.js';
-import { readRunnerState } from './terminal.js';
-import { podRuntime } from './agent.js';
+import { apply, OpError, adapterForPod, type CoreCtx } from './ops.js';
 import { PM_PROTOCOL } from './pm-protocol.js';
 export { PM_PROTOCOL };
 
@@ -93,7 +91,7 @@ export async function applyIntents(ctx: CoreCtx, intents: Record<string, unknown
 
 // ---- pm state (what the pm sees) ----------------------------------------------
 
-export function pmDigest(ctx: CoreCtx): Record<string, unknown> {
+export async function pmDigest(ctx: CoreCtx): Promise<Record<string, unknown>> {
   const s = ctx.store;
   const tasks = store.listTasks(s);
   const byStatus: Record<string, number> = {};
@@ -105,12 +103,24 @@ export function pmDigest(ctx: CoreCtx): Record<string, unknown> {
   const waitingOnClosed = tasks
     .filter((t) => t.status === 'queued' && !liveRoles.has(t.pod_role))
     .map((t) => ({ id: t.id, title: t.title.slice(0, 80), pod: t.pod_role }));
-  const pods = store.listPods(s).map((p) => ({
-    role: p.role,
-    state: p.state,
-    agent: p.agent,
-    ready: podRuntime(p.agent) === 'pi' ? (readPodReady(ctx, p.role) ?? null) : null,
-  }));
+  // Runtime-agnostic pod activity: the adapter's healthProbe answers for any
+  // runtime (pi: sidecar ready/streaming; claude: pane scrape + transcript
+  // mtime). No probe (bash/cmd) or no run boundary -> null.
+  const pods = await Promise.all(
+    store.listPods(s).map(async (p) => {
+      const resolved = p.state === 'live' ? adapterForPod(p, ctx) : null;
+      let activity: 'busy' | 'idle' | 'not-ready' | null = null;
+      if (resolved?.adapter.healthProbe) {
+        try {
+          const probe = await resolved.adapter.healthProbe(resolved.binding);
+          if (probe) activity = probe.busy ? 'busy' : probe.ready ? 'idle' : 'not-ready';
+        } catch {
+          activity = null; // transient probe failure: unknown, not an error
+        }
+      }
+      return { role: p.role, state: p.state, agent: p.agent, activity };
+    }),
+  );
   const runs = store.listRuns(s).filter((r) => !r.ended_at).map((r) => ({ pod: r.pod_role, run: r.id, started_at: r.started_at }));
   return {
     at: store.nowIso(),
@@ -120,15 +130,6 @@ export function pmDigest(ctx: CoreCtx): Record<string, unknown> {
     pods,
     liveRuns: runs,
   };
-}
-
-function readPodReady(ctx: CoreCtx, role: string): boolean | null {
-  try {
-    const st = readRunnerState(ctx.store.home, role);
-    return st ? st.ready : null;
-  } catch {
-    return null;
-  }
 }
 
 // ---- triggers ------------------------------------------------------------------
@@ -184,7 +185,7 @@ export async function pmTick(ctx: CoreCtx): Promise<void> {
   const now = Date.now();
   if (now - lastTickAt < PM_TICK_INTERVAL_MS) return;
   lastTickAt = now;
-  const digest = pmDigest(ctx);
+  const digest = await pmDigest(ctx);
   const sig = JSON.stringify({ tasks: digest.tasks, open: (digest.openTasks as unknown[]).map((t) => JSON.stringify(t)), pods: (digest.pods as unknown[]).map((p) => JSON.stringify(p)) });
   const firstSweep = lastDigest === null;
   if (!firstSweep && sig === lastDigest) return; // nothing changed — no LLM cost

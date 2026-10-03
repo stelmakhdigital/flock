@@ -215,6 +215,38 @@ TUI, transcript-сессии), **bash** (plain window). Новый рантай�
 ./bin/flock pod relaunch ctest --fork               # форк своей сессии
 ```
 
+## Runtime-agnostic signal contract
+
+Core больше не знает, какой рантайм под окном. Три утечки (runkeeper-ветка
+`podRuntime==='claude'`, podSend-ветки pi/claude, health «только pi») закрыты
+единым контрактом: core задаёт любому рантайму три вопроса, адаптер отвечает
+своими сигналами:
+
+- **`liveness(binding, run) → {alive, reason?}`** — «жив ли агент этого
+  run?». reason попадает в `runs.exit_state` (форма прежняя: `clean` /
+  `crashed(...)`; core считает `crashed…` крахом + pm-уведомление). pi:
+  typed sidecar exit (launchId-scoped) + foreground-guard; claude:
+  foreground-guard (pane на shell = TUI умер). Метода нет → общий pid-check
+  (bash/cmd).
+- **`sendVerified(binding, text) → {ok, attempts, ack, detail?}`** —
+  «доставь и докажи». pi: flockmsg v2 + ack по sidecar nonce; claude: raw
+  paste + рост transcript. Метода нет → legacy visual probe.
+- **`healthProbe(binding) → {ready, busy, lastActivityAt?, gate?}`** —
+  «что агент делает?». pi: sidecar ready/streaming/lastPrompt.at + gate из
+  activity log (`channel: 'answer'`); claude: склейн панели + mtime
+  transcript + `detectClaudeGate` (permission-промпт; idle-footer — НЕ
+  gate; `channel: 'attach'` — отвечать tmux attach, а не `flock pod answer`).
+  Метода нет → health для пода пропускается.
+
+Правило «gate жив только для текущего run» (`gate.at >= run.started_at`)
+осталось политикой CORE поверх пробы; лестницы gate/idle (alert →
+nudge/realert → task needs) не менялись. `pmDigest.pods[].ready` заменён на
+`activity: 'busy'|'idle'|'not-ready'|null` (null = нет пробы — bash/cmd).
+
+Новый рантайм = один адаптер, отвечающий на эти же вопросы (+ launch/
+ready-часть контракта), без правок core. claude-гейт детерминирован по
+подсказке футера: `id = claude:<hint>` (стабилен для health_alerts.ref).
+
 ## Агенты и профили (T2)
 
 `~/.flock/agents/<id>.json` — декларативный манифест: `imports` (цепочка

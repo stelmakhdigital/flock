@@ -159,6 +159,23 @@ export function claudePaneReady(paneText: string): boolean {
   return /(^|\n)\s*❯/.test(paneText);
 }
 
+// The gate a human must resolve: an OPEN permission/confirmation prompt on
+// screen. PURE (the runtime-agnostic healthProbe answers with it). Rules:
+// - a dialog footer hint (DIALOG_HINTS) marks an open prompt;
+// - the IDLE footer ("auto mode on · ← for agents") has no key hint — it is
+//   NOT a gate (a ready agent at the prompt); the ❯ cursor alone never is;
+// - id is deterministic per hint ('claude:<hint>') so the health alert state
+//   (health_alerts.ref) is stable across ticks; title = the visible prompt
+//   line ("Do you want to…") when recognizable, else the hint.
+export function detectClaudeGate(paneText: string): { id: string; title: string; channel: 'attach' } | undefined {
+  const hit = DIALOG_HINTS.find((h) => paneText.includes(h));
+  if (!hit) return undefined;
+  let title = hit;
+  const m = /Do you want to[^(\n]{0,120}/.exec(paneText);
+  if (m) title = m[0].trim();
+  return { id: `claude:${hit}`, title, channel: 'attach' };
+}
+
 // The transcript grows when the agent is working; "esc to interrupt" is the
 // in-turn status line.
 export function claudePaneBusy(paneText: string): boolean {

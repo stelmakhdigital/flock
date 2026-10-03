@@ -9,9 +9,9 @@ import { listConflictResolutions } from './store.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
-import { seatPaths, frameMessage, newNonce, validateResumeToken } from './runner-protocol.js';
-import { claudeConfigDir, claudeProjectsDir, claudeTranscriptFp, waitForTranscriptGrowth, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
-import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type StartupFile } from './runtime-adapter.js';
+import { seatPaths, validateResumeToken } from './runner-protocol.js';
+import { claudeConfigDir, claudeProjectsDir, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
+import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type RuntimeAdapter, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
 import { validateIntent, applyIntents, pmDigest, pmNotify } from './pm.js';
@@ -123,7 +123,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   task_needs: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task needs help (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_needs', o, 'needs'); return taskReport(o, c, 'needs'); } },
   // -- pm / goal loop ---------------------------------------------------------
   pm_up: { group: 'pm', scopes: ['operator'], summary: 'start the pm pod (goal loop)', run: (_o, c) => pmUp(c) },
-  pm_state: { group: 'pm', scopes: ['operator'], summary: 'pm digest snapshot + alerts', run: (_o, c) => ({ pm: pmDigest(c), alerts: listAlerts(c) }) },
+  pm_state: { group: 'pm', scopes: ['operator'], summary: 'pm digest snapshot + alerts', run: async (_o, c) => ({ pm: await pmDigest(c), alerts: listAlerts(c) }) },
   pm_intents: { group: 'pm', scopes: ['operator'], summary: 'typed intents from pm (whitelist, applied via apply)', run: (o, c) => pmIntents(o, c) },
   // -- health / system ---------------------------------------------------------
   health_list: { group: 'health', scopes: ['operator', 'pod'], summary: 'built-in health alerts (gate/idle)', run: (_o, c) => ({ alerts: listAlerts(c) }) },
@@ -396,6 +396,31 @@ function podMergePolicyFrom(op: Record<string, unknown>, agentId: string | undef
 // is retry_fresh (recorded in the run meta, never silent). bash: fresh window.
 const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js') });
 
+// Resolve the adapter for a stored pod (manifest -> runtime -> adapter) and
+// the minimal binding the signal-contract methods need (role/cwd/seatRoot).
+// null = no adapter (cmd windows, unknown/broken manifests) — the caller
+// degrades (generic pid check / visual probe / skip health).
+// ponytail: the signal methods (liveness/sendVerified/healthProbe) only read
+// the pod's cwd + seatRoot — model/posture/trust are launch-time axes and
+// don't affect the answers.
+export function adapterForPod(pod: { role: string; dir: string; agent: string | null }, ctx: CoreCtx): { adapter: RuntimeAdapter; binding: PodBinding } | null {
+  if (!pod.agent || pod.agent === 'cmd') return null;
+  try {
+    const resolved = resolveAgent(pod.agent, null);
+    if (!resolved || manifestRuntime(resolved.manifest) === 'cmd') return null;
+    const adapter = getAdapter(resolved.manifest, adapterEnv(ctx));
+    if (!adapter) return null;
+    const binding: PodBinding = {
+      role: pod.role,
+      cwd: pod.dir,
+      seatRoot: path.join(ctx.store.home, 'pods', pod.role),
+    };
+    return { adapter, binding };
+  } catch {
+    return null; // broken manifest: degrade, the error surfaces at spawn
+  }
+}
+
 export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
@@ -509,53 +534,27 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const text = String(op.text ?? '');
   if (!text.trim()) throw new OpError(400, 'text required');
   const pod = requireLivePod(ctx, role);
-  if (podRuntime(pod.agent) === 'claude') {
-    // claude TUI: raw paste; the per-pod transcript is the typed ack (it grows
-    // when the prompt lands, independent of turn duration).
-    const projectsDir = claudeProjectsDir(claudeConfigDir(path.join(ctx.store.home, 'pods', pod.role)), pod.dir);
-    const before = claudeTranscriptFp(projectsDir);
-    const res = await terminal.send(pod.terminal_target!, text, { raw: true });
-    const { grown } = await waitForTranscriptGrowth(projectsDir, before, 30000);
-    if (!grown) throw new OpError(504, 'claude transcript did not grow after send (check the pod pane)');
+  const resolved = adapterForPod(pod, ctx);
+  // Verified delivery through the runtime's own typed signal (pi: sidecar
+  // nonce-ack; claude: transcript growth). The core does not know which one
+  // it is — the adapter answers.
+  if (resolved?.adapter.sendVerified) {
+    const r = await resolved.adapter.sendVerified(resolved.binding, text);
+    if (!r.ok) throw new OpError(504, r.detail ?? 'delivery not verified (check the pod pane)');
     const run = store.currentRun(ctx.store, role);
     if (run && !run.ended_at) {
       store.appendRunMeta(ctx.store, run.id, {
         kind: 'sent',
         bytes: Buffer.byteLength(text),
-        attempts: res.attempts,
-        ack: 'transcript',
+        attempts: r.attempts ?? 0,
+        ack: r.ack,
       });
     }
-    return { ok: true, attempts: res.attempts, ack: 'transcript' };
+    ctx.emit?.({ type: 'pod_sent', role, bytes: Buffer.byteLength(text), attempts: r.attempts ?? 0 });
+    return { ok: true, attempts: r.attempts ?? 0, ack: r.ack };
   }
-  if (podRuntime(pod.agent) === 'pi') {
-    // runner bridge: framed message + raw paste, verified by the sidecar ack
-    // (the visual probe breaks on long/wrapped lines in a TTY line editor).
-    const nonce = newNonce();
-    const wire = frameMessage(text, nonce);
-    const res = await terminal.send(pod.terminal_target!, wire, { raw: true });
-    const deadline = Date.now() + 5000;
-    let acked = false;
-    while (Date.now() < deadline) {
-      const st = terminal.readRunnerState(ctx.store.home, pod.role);
-      if (st?.lastPrompt?.nonce === nonce) {
-        acked = true;
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 300));
-    }
-    if (!acked) throw new OpError(504, 'runner did not ack the message (check the pod pane)');
-    const run = store.currentRun(ctx.store, role);
-    if (run && !run.ended_at) {
-      store.appendRunMeta(ctx.store, run.id, {
-        kind: 'sent',
-        bytes: Buffer.byteLength(text),
-        attempts: res.attempts,
-        ack: 'sidecar',
-      });
-    }
-    return { ok: true, attempts: res.attempts, ack: 'sidecar' };
-  }
+  // Fallback (bash/cmd, adapter without sendVerified): legacy visual probe —
+  // the capture-verified send. Deliberate degradation, not an error.
   const res = await terminal.send(pod.terminal_target!, text);
   if (!res.delivered) {
     throw new OpError(503, `delivery not verified after ${res.attempts} attempts (pod busy or pane gone)`);
