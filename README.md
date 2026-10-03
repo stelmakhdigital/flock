@@ -215,6 +215,86 @@ TUI, transcript-сессии), **bash** (plain window). Новый рантай�
 ./bin/flock pod relaunch ctest --fork               # форк своей сессии
 ```
 
+## Worktree + S0 merge (этап 5.1)
+
+Под с `--repo` живёт в git-worktree `flock/<role>` — изолированная ветка,
+собственные коммиты, без загрязнения основного checkout:
+
+- **spawn**: `flock pod spawn dev --repo /path/to/repo [--base main]` —
+  worktree прицепляется к `~/.flock/pods/<role>/work`; база по умолчанию =
+  текущая ветка репо (не detached);
+- **S0 auto-merge**: при `task done` ядро делает **fast-forward merge**,
+  если ветка чистая (только tracked-изменения — инфраструктура пода
+  untracked по дизайну), `ahead > 0`, `behind = 0` и база проверена в
+  HEAD репо. Всё остальное — `merge skipped (reason)` в transition
+  (ветка остаётся кандидатом на ручной merge);
+- **арбитр**: закрытый worktree-под с unmerged-коммитами → таск re-queue
+  (не blocked) — коммиты не теряются;
+- **relaunch** сохраняет worktree-биндинг (восстанавливается из `.git`
+  файла, если поля стерты); `pod close --purge` — удалить checkout
+  (ветка остаётся);
+- worktree-поды: sandbox off (git и есть trust boundary), bash-guard
+  autonomous (рутинный git — работа; жёсткий floor на `rm -rf` и т.п.
+  остаётся).
+
+```sh
+./bin/flock pod spawn dev --repo /path/to/repo --base main
+./bin/flock pod merge-status dev                  # ahead/behind/dirty/head
+./bin/flock pod close dev --purge                 # worktree удалить, ветку оставить
+```
+
+## Team up (этап 5.1)
+
+`flock team up [pods.yaml]` — декларативный состав команды, reconcile:
+недостающих spawn, живым пере-merge guidance (managed block `team:<role>`
+в AGENTS.md), никого не убивает. Идемпотентен — можно запускать на каждом
+запуске как "раскладка":
+
+```yaml
+pods:
+  dev:
+    agent: pi
+    model: cat-vllm/qwen3.8-27b-fp8
+    repo: /path/to/repo
+    base: main
+    guidance: |
+      Пиши на русском. Коммить с prefix dev:
+  rev:
+    agent: pi
+    repo: /path/to/repo
+    guidance: |
+      Ревью: только замечания, без правок.
+```
+
+## Экономика + retention (этап 5.2)
+
+- **Usage**: pi-runner пишет `usage`-события (input/output/cache токены,
+  модель) на каждый assistant-сообщение в `activity.jsonl`; ядро (тик 60с)
+  агрегирует в `usage_events` (per-seat byte-cursor переживает рестарты
+  core, dedupe key, self-heal после head-trim). `flock usage [role]`,
+  `/api/usage[?role=&since=]` (токены по подам — экономия pipeline);
+- **Retention** (тик 24ч, env-настраивается): runs старше 14 дней →
+  `runs_archive` (архив, не delete — audit trail сохраняется),
+  `activity.jsonl` head-trim 20k→5k строк, `core.log` rotate >10MB.
+
+```sh
+./bin/flock usage            # токены по всем подам
+./bin/flock usage dev        # один под
+```
+
+## Pod-scoped авторизация (этап 5.3)
+
+Однако-токен core, но **scope зависит от сокета**: запросы, пришедшие на
+unix-сокет пода (`<pod>/core.sock`), видят только ops со scope `pod`
+(чтение + свои задачи: add/report/unblock/merge-status/capture/close
+своего пода). Operator-only ops (spawn/relaunch/watchdog/…) через сокет
+пода → 403. Операторский CLI (main-порт) не ограничен. Узкое место
+(own-pod/own-task) проверяется в самом op, не в middleware.
+
+```sh
+# live-проверка (нужен live dev-под):
+node dist/core/pod-scope-check.js
+```
 
 ## Этап 0 (готово)
 

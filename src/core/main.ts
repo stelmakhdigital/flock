@@ -171,9 +171,11 @@ const pidFile = path.join(FLOCK_HOME, 'core.pid');
 
 const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: FLOCK_PORT }, () => {
   injectWebSocket(server);
-  // pod-local unix sockets (visible to the pi sandbox, no network needed)
+  // pod-local unix sockets (visible to the pi sandbox, no network needed);
+  // role tags the socket so the operator token arriving on it is scoped to
+  // that pod's 'pod'-scope ops (5.3)
   for (const pod of listPods(store)) {
-    if (pod.state === 'live') startPodSocket(ctx, pod.dir);
+    if (pod.state === 'live') startPodSocket(ctx, pod.dir, pod.role);
   }
   fs.writeFileSync(pidFile, String(process.pid));
   console.log(`[core] listening http://127.0.0.1:${FLOCK_PORT} pid=${process.pid} home=${FLOCK_HOME}`);

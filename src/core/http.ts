@@ -20,6 +20,14 @@ const safeJson = (s: string): unknown => {
   }
 };
 
+declare module 'hono' {
+  // pod-socket caller identity (set by the auth middleware when the
+  // request arrived tagged with flockRole)
+  interface ContextVariableMap {
+    flockCaller: { kind: 'pod'; role: string } | undefined;
+  }
+}
+
 export function createHttp(ctx: CoreCtx) {
   const app = new Hono();
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -27,6 +35,11 @@ export function createHttp(ctx: CoreCtx) {
   app.use('*', async (c, next) => {
     const got = c.req.header('authorization')?.replace(/^Bearer\s+/i, '');
     if (got !== ctx.store.token) return c.json({ error: 'unauthorized' }, 401);
+    // pod socket: mark the caller so op auth can narrow scope (the token is
+    // the same core token; the SCOPE comes from which socket the request
+    // arrived on — the operator CLI and the in-pod CLI share it)
+    const env = c.env as { flockRole?: string };
+    if (env?.flockRole) c.set('flockCaller', { kind: 'pod', role: env.flockRole });
     await next();
   });
 
@@ -127,7 +140,8 @@ export function createHttp(ctx: CoreCtx) {
 
   app.get('/api/tasks', (c) => {
     const status = c.req.query('status');
-    return c.json({ tasks: store.listTasks(ctx.store, status) });
+    const limit = Math.max(1, Math.min(500, Number(c.req.query('limit') ?? 50)));
+    return c.json({ tasks: store.listTasks(ctx.store, status, limit) });
   });
 
   app.post('/api/ops', async (c) => {
@@ -136,7 +150,8 @@ export function createHttp(ctx: CoreCtx) {
       return c.json({ ok: false, error: 'invalid op json' }, 400);
     }
     try {
-      const result = await apply(op, ctx);
+      const caller = c.get('flockCaller') as { kind: 'pod'; role: string } | undefined;
+      const result = await apply(op, { ...ctx, caller });
       return c.json({ ok: true, result });
     } catch (e) {
       if (e instanceof OpError) return c.json({ ok: false, error: e.message }, e.status as 400);
@@ -185,7 +200,7 @@ export function podSocketPath(podDir: string): string {
   return path.join(podDir, 'core.sock');
 }
 
-export function startPodSocket(ctx: CoreCtx, podDir: string): void {
+export function startPodSocket(ctx: CoreCtx, podDir: string, role?: string): void {
   if (podSockets.has(podDir)) return;
   const sockPath = podSocketPath(podDir);
   try {
@@ -193,8 +208,24 @@ export function startPodSocket(ctx: CoreCtx, podDir: string): void {
   } catch {
     /* stale file is fine, listen() replaces it */
   }
+  // pod-scoped authorization: the pod token may only reach ops with the
+  // 'pod' scope (own-pod narrowing in the op handlers); the operator token
+  // keeps full access to the socket. The wrapper clones the shared app and
+  // injects the caller for op auth.
   const { app } = createHttp(ctx);
-  const server = createAdaptorServer({ fetch: app.fetch }) as Server;
+  // pod socket: the node-server adaptor calls fetch(req, { incoming,
+  // outgoing }) — position 2 is the Hono env slot. Wrapping fetch tags
+  // every request with the pod role so the auth middleware marks the
+  // caller for op scope narrowing. The operator token stays valid on the
+  // socket (its CLI uses the same core token) and stays unrestricted.
+  const bound = app.fetch.bind(app);
+  const fetchFn = role
+    ? (async (req: Request, env?: unknown) => {
+        const e = (env ?? {}) as Record<string, unknown>;
+        return bound(req, { ...e, flockRole: role });
+      })
+    : bound;
+  const server = createAdaptorServer({ fetch: fetchFn }) as Server;
   server.on('error', (e: NodeJS.ErrnoException) => {
     if (e.code !== 'EADDRINUSE') console.error(`pod socket ${sockPath}: ${e.message}`);
   });

@@ -25,6 +25,9 @@ export interface CoreCtx {
   ticks: Ticks;
   startedAt: string;
   emit?: (e: Record<string, unknown>) => void;
+  // who is calling through /api/ops: undefined = operator/core internal,
+  // { kind: 'pod', role } = request arrived on a pod's scoped socket
+  caller?: { kind: 'pod'; role: string };
 }
 
 export class OpError extends Error {
@@ -57,6 +60,12 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
   const t = String(o.type ?? '');
   const d = OP_REGISTRY[t];
   if (!d) throw new OpError(400, `unknown op: ${t || '(empty)'}`);
+  // pod-scoped token: only 'pod'-scoped ops are reachable; the operator
+  // token (and core internals, which carry no caller) are unrestricted.
+  // Per-resource narrowing (own pod / own tasks) happens in the handlers.
+  if (ctx.caller?.kind === 'pod' && !d.scopes.includes('pod')) {
+    throw new OpError(403, `op ${t} is not available to pod tokens`);
+  }
   d.validate?.(o, ctx);
   return d.run(o, ctx);
 }
@@ -85,7 +94,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
   pod_answer: { group: 'pod', scopes: ['operator'], summary: 'answer a pending dialog (gate) in a pod', run: (o, c) => podAnswer(o, c) },
   pod_capture: { group: 'pod', scopes: ['operator'], summary: 'capture pod pane text', run: (o, c) => podCapture(o, c) },
-  pod_close: { group: 'pod', scopes: ['operator'], summary: 'close a pod (kill window, state=closed)', run: (o, c) => podClose(o, c) },
+  pod_close: { group: 'pod', scopes: ['operator', 'pod'], summary: 'close a pod (kill window, state=closed; --purge drops a worktree)', run: (o, c) => podClose(o, c) },
   // -- watchdog --------------------------------------------------------------
   watchdog_register: { group: 'watchdog', scopes: ['operator'], summary: 'register a watchdog check (agent-registered)', run: (o, c) => watchdogRegister(o, c) },
   watchdog_cancel: { group: 'watchdog', scopes: ['operator'], summary: 'cancel a watchdog job', run: (o, c) => watchdogCancel(o, c) },
@@ -96,11 +105,11 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   workflow_ls: { group: 'workflow', scopes: ['operator'], summary: 'list workflows and instances', run: (_o, c) => ({ workflows: store.listWorkflows(c.store), instances: store.listWorkflowInstances(c.store) }) },
   workflow_status: { group: 'workflow', scopes: ['operator'], summary: 'instance status (steps, states)', run: (o, c) => workflowStatus(o, c) },
   // -- tasks -----------------------------------------------------------------
-  task_add: { group: 'task', scopes: ['operator'], summary: 'add a task to the queue (pod must exist)', run: (o, c) => taskAdd(o, c) },
-  task_list: { group: 'task', scopes: ['operator', 'pod'], summary: 'list tasks (filter by status)', run: (o, c) => ({ tasks: store.listTasks(c.store, o.status ? String(o.status) : undefined) }) },
+  task_add: { group: 'task', scopes: ['operator', 'pod'], summary: 'add a task to the queue (pod must exist; pod token: own pod only)', run: (o, c) => taskAdd(o, c) },
+  task_list: { group: 'task', scopes: ['operator', 'pod'], summary: 'list tasks (filter by status, limit default 50)', run: (o, c) => ({ tasks: store.listTasks(c.store, o.status ? String(o.status) : undefined, Math.max(1, Math.min(500, Number(o.limit ?? 50)))) }) },
   task_history: { group: 'task', scopes: ['operator', 'pod'], summary: 'task transitions (audit)', run: (o, c) => taskHistory(o, c) },
   task_cancel: { group: 'task', scopes: ['operator'], summary: 'cancel a task', run: async (o, c) => { await pmNotifyMaybe(c, 'task_cancelled', o, 'cancelled'); return taskReport(o, c, 'cancelled'); } },
-  task_unblock: { group: 'task', scopes: ['operator'], summary: 'unblock a task (-> queued)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
+  task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
   task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task done (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
   task_blocked: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task blocked (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_blocked', o, 'blocked'); return taskReport(o, c, 'blocked'); } },
   task_needs: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task needs help (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_needs', o, 'needs'); return taskReport(o, c, 'needs'); } },
@@ -267,7 +276,7 @@ async function spawnAgent(ctx: CoreCtx, o: {
     branch: o.branch ?? null,
   });
   const run = store.insertRun(ctx.store, { id: store.newId('run'), podRole: o.role, pid, meta: runMeta });
-  startPodSocket(ctx, o.dir); // pod-local API socket (sandbox-visible)
+  startPodSocket(ctx, o.dir, o.role); // pod-local API socket (sandbox-visible)
   ctx.emit?.({ type: 'pod_spawned', role: o.role, target, run: run.id });
   return { pod: store.getPodByRole(ctx.store, o.role)!, run };
 }
@@ -529,6 +538,9 @@ async function podCapture(op: Record<string, unknown>, ctx: CoreCtx): Promise<un
   const role = requireRole(op);
   const lines = Math.max(10, Math.min(2000, Number(op.lines ?? 200)));
   const pod = requireLivePod(ctx, role);
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: cannot capture pod ${role}`);
+  }
   const text = await terminal.capture(pod.terminal_target!, lines);
   return { role, text };
 }
@@ -537,6 +549,9 @@ async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod) throw new OpError(404, `no pod: ${role}`);
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: cannot close pod ${role}`);
+  }
   try {
     await terminal.killWindow(role);
   } catch {
@@ -611,6 +626,10 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   if (!title) throw new OpError(400, 'title required');
   // only enqueue for pods that exist (spawned or closed-then-reopenable)
   if (!store.getPodByRole(ctx.store, role)) throw new OpError(404, `no pod: ${role}`);
+  // pod token: own pod only (a pod cannot queue work for another pod)
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: cannot add a task for pod ${role}`);
+  }
   const id = store.newId('t');
   store.insertTask(ctx.store, { id, title, body: op.body ? String(op.body) : null, podRole: role });
   ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
@@ -666,6 +685,11 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
   const id = String(op.id ?? '');
   const task = store.getTask(ctx.store, id);
   if (!task) throw new OpError(404, `no task: ${id}`);
+  // pod token: own pod's tasks only (an agent cannot report on another
+  // pod's work or cancel operator tasks)
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== task.pod_role) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: task ${id} belongs to pod ${task.pod_role}`);
+  }
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
   // S0 merge: a worktree pod's done task is a merge candidate. Auto fast-
   // forward ONLY (branch == base + commits, base not moved, clean tree);

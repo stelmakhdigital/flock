@@ -518,13 +518,13 @@ export function getTask(store: Store, id: string): Task | null {
   return r ?? null;
 }
 
-export function listTasks(store: Store, status?: string): Task[] {
+export function listTasks(store: Store, status?: string, limit = 100): Task[] {
   if (status) {
     return dbOf(store)
-      .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC, rowid ASC')
-      .all(status) as unknown as Task[];
+      .prepare('SELECT * FROM tasks WHERE status = ? ORDER BY created_at ASC, rowid ASC LIMIT ?')
+      .all(status, limit) as unknown as Task[];
   }
-  return dbOf(store).prepare('SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT 100').all() as unknown as Task[];
+  return dbOf(store).prepare('SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit) as unknown as Task[];
 }
 
 export function oldestQueuedTask(store: Store, podRole: string): Task | null {
@@ -545,6 +545,7 @@ export function setTaskStatus(store: Store, id: string, to: string, opts?: { rea
   const now = nowIso();
   const cur = dbOf(store).prepare('SELECT status FROM tasks WHERE id = ?').get(id) as { status: string } | undefined;
   if (!cur) throw new Error(`no task: ${id}`);
+  if (to === cur.status) return; // idempotent no-op (same-state report)
   if (!TASK_FLOW[cur.status]?.includes(to)) {
     throw new Error(`bad task transition: ${cur.status} -> ${to}`);
   }

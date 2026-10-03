@@ -5,3 +5,4 @@ AGENTS.md
 .pi/
 .flock/
 *.log
+.wt-demo/
