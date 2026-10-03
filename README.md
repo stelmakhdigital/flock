@@ -215,6 +215,63 @@ TUI, transcript-сессии), **bash** (plain window). Новый рантай�
 ./bin/flock pod relaunch ctest --fork               # форк своей сессии
 ```
 
+## Агенты и профили (T2)
+
+`~/.flock/agents/<id>.json` — декларативный манифест: `imports` (цепочка
+базовых манифестов), `guidance` (блок, который агент видит в AGENTS.md),
+`profiles` (именованные override-наборы) и pi-оси первой руки:
+
+- **thinking**: `off|minimal|low|medium|high|xhigh|max` (закрытый набор,
+  `resolveAgent` проверяет — ошибка перечисляет допустимые);
+- **tools / excludeTools**: allow/deny-списки (pi: `--tools`, `--exclude-tools`);
+- **skills / noSkills**: пути/имена скиллов (`--skill`, `--no-skills`);
+- **extensions / noExtensions**: builtin-имена или пути (`--extension`);
+- **mcp**: мапа pod-серверов `{имя: {command, args, env} | {url, headers}}` —
+  пишется в `<PI_CODING_AGENT_DIR>/mcp.json` при каждом запуске (и удаляется,
+  если манифест без mcp — переключение профиля не оставляет чужие серверы);
+- **systemPrompt / appendSystemPrompt / noContextFiles**.
+
+Мерж как у всего остального: скаляры ext-wins (profile > imports > base),
+массивы concat (как args), `mcp` — по имени сервера (запись ext с тем же
+именем заменяет сервер целиком). Пустые массивы после мержа выкидываются
+(`tools: []` не может стать флагом «разрешено ничего»).
+
+**CLI**:
+
+```sh
+flock agents ls                        # id, runtime, source, profiles, thinking
+flock agents show <id> [--profile P]   # resolved manifest (как при spawn)
+flock agents new <id> [--from pi]      # каркас {id, imports:[pi], profiles:{}} (не перезаписывает)
+```
+
+Каркасный манифест может НЕ иметь `command` — он наследуется по цепочке
+imports (`pi` даёт `command: pi` + `runner: flock-rpc` + runner-окружение).
+
+**Подключение**: `flock pod spawn <role> --agent <id> [--profile P]` —
+ось thinking/tools/skills/mcp попадает в pi-флаги через runner
+(один JSON-флаг `--pi-config` в runner-команде, парсер выбрасывает
+неизвестные ключи). Мерж-политика (squash/never) и `testCmd` — тоже
+манифестные оси (S1/S2).
+
+```sh
+# пример: под на базе pi, но с дешёвым thinking и без edit
+cat > ~/.flock/agents/cheap-dev.json <<'EOF'
+{
+  "id": "cheap-dev",
+  "imports": ["pi"],
+  "thinking": "low",
+  "excludeTools": ["edit"],
+  "mcp": { "time": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-time"] } },
+  "profiles": { "careful": { "thinking": "xhigh", "tools": ["bash"] } }
+}
+EOF
+flock pod spawn dev2 --agent cheap-dev --profile careful
+flock agents show cheap-dev --profile careful    # проверка того, что resolved
+```
+
+Регрессия (тест): манифест без новых осей собирает байт-идентичную
+runner-команду и pi-argv, что до T1 (флага `--pi-config` просто нет).
+
 ## Worktree + S0 merge (этап 5.1)
 
 Под с `--repo` живёт в git-worktree `flock/<role>` — изолированная ветка,

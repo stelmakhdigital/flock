@@ -136,7 +136,10 @@ export function loadAgents(): Record<string, AgentManifest> {
     if (!f.endsWith('.json')) continue;
     try {
       const m = JSON.parse(fs.readFileSync(path.join(agentsDir(), f), 'utf8')) as AgentManifest;
-      if (m && typeof m.id === 'string' && typeof m.command === 'string') all[m.id] = m;
+      // T2: a user manifest may omit `command` — it is inherited from the
+      // imports graph (flock agents new skeleton: {id, imports, profiles}).
+      // command is validated at resolve time.
+      if (m && typeof m.id === 'string') all[m.id] = m;
     } catch {
       // bad manifest file: skip (logged at spawn if requested by id)
     }
@@ -220,6 +223,11 @@ export function resolveAgent(id: string | undefined, model?: string | null, prof
   if (m.thinking != null && !THINKING_LEVELS.includes(m.thinking)) {
     throw new Error(`manifest ${m.id}: unknown thinking level: ${m.thinking} (valid: ${THINKING_LEVELS.join(', ')})`);
   }
+  // T2: a skeleton manifest may omit command, but the RESOLVED manifest
+  // must have one (inherited from imports, or its own).
+  if (typeof m.command !== 'string' || !m.command) {
+    throw new Error(`manifest ${m.id}: no command (set "command" or import a manifest that has one, e.g. "pi")`);
+  }
   const parts = [m.command, ...(m.args ?? [])];
   if (model && m.modelFlag) parts.push(m.modelFlag, model);
   return { id: m.id, cmd: parts.join(' '), env: { ...(m.env ?? {}) }, manifest: m };
@@ -240,8 +248,15 @@ export function manifestRuntime(m: AgentManifest): string {
 // manifest, not from the id).
 export function podRuntime(agentId: string | null): string {
   if (!agentId || agentId === 'cmd') return 'cmd';
-  const r = resolveAgent(agentId, null);
-  return r ? manifestRuntime(r.manifest) : 'cmd';
+  try {
+    const r = resolveAgent(agentId, null);
+    return r ? manifestRuntime(r.manifest) : 'cmd';
+  } catch {
+    // T2: an invalid manifest (no command, bad thinking) is not a known
+    // runtime — the pod keeps its legacy 'cmd' behavior, the error surfaces
+    // at spawn/relaunch where resolveAgent is called for real.
+    return 'cmd';
+  }
 }
 
 // ── Config projection (per-pod PI_CODING_AGENT_DIR, symlinked) ──────────

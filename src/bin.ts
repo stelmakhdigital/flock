@@ -48,6 +48,9 @@ const USAGE = `flock — core CLI
   flock pm intent '<json>'             # typed intent: {"op":"task_done","id":"t_x"} или {"intents":[...]}
   flock health ls                      # built-in health-алерты (gate/idle)
   flock ops ls                         # реестр ops (introspection: group, scopes)
+  flock agents ls                      # манифесты: id, runtime, source, profiles, thinking
+  flock agents show <id> [--profile P] # resolved manifest (imports+profile, как при spawn)
+  flock agents new <id> [--from <base>]  # каркас ~/.flock/agents/<id>.json (не перезаписывает)
   flock watchdog add --policy <marker|timer|stall|file> --target <role> [opts]
       marker: --text T [--lines N] [--repeat]
       timer:  --after N
@@ -114,6 +117,8 @@ function unixRequest(socketPath: string, method: string, path: string, token: st
     req.end();
   });
 }
+
+const agentsDirOf = () => path.join(process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock'), 'agents');
 
 async function api(method: 'GET' | 'POST', path: string, body?: unknown): Promise<any> {
   const token = process.env.FLOCK_TOKEN ?? readToken();
@@ -299,6 +304,78 @@ async function main(): Promise<void> {
       } else {
         console.log('usage: flock ops ls');
       }
+      return;
+    }
+
+    case 'agents': {
+      // T2: manifests are local config — no core round-trip needed
+      // (loadAgents/resolveAgent run in-process; core may be down)
+      const { loadAgents, manifestRuntime, resolveAgent, THINKING_LEVELS } = await import('./core/agent.js');
+      const { writeFileSync, existsSync, mkdirSync } = await import('node:fs');
+      const agents = loadAgents();
+      if (!sub || sub === 'ls') {
+        const builtin = new Set(['pi', 'bash', 'claude', 'pm']);
+        const rows = Object.values(agents).map((m) => ({
+          id: m.id,
+          runtime: manifestRuntime(m),
+          source: builtin.has(m.id) && !existsSync(path.join(agentsDirOf(), `${m.id}.json`)) ? 'builtin' : 'user',
+          profiles: Object.keys(m.profiles ?? {}).join(',') || '-',
+          thinking: m.thinking ?? '-',
+        }));
+        const w = (k: keyof (typeof rows)[0]) => Math.max(...rows.map((r) => String(r[k]).length), k.length);
+        console.log(`${'id'.padEnd(w('id'))}  ${'runtime'.padEnd(w('runtime'))}  ${'source'.padEnd(w('source'))}  ${'profiles'.padEnd(w('profiles'))}  ${'thinking'.padEnd(w('thinking'))}`);
+        for (const r of rows) {
+          console.log(`${String(r.id).padEnd(w('id'))}  ${String(r.runtime).padEnd(w('runtime'))}  ${String(r.source).padEnd(w('source'))}  ${String(r.profiles).padEnd(w('profiles'))}  ${String(r.thinking)}`);
+        }
+        return;
+      }
+      if (sub === 'show') {
+        const id = rest.find((r) => !r.startsWith('-'));
+        if (!id) {
+          console.log('usage: flock agents show <id> [--profile P]');
+          return;
+        }
+        const profileIdx = rest.indexOf('--profile');
+        const profile = profileIdx >= 0 ? rest[profileIdx + 1] : undefined;
+        try {
+          const r = resolveAgent(id, null, profile);
+          if (!r) throw new Error(`unknown agent: ${id} (have: ${Object.keys(agents).join(', ')})`);
+          console.log(JSON.stringify(r.manifest, null, 2));
+        } catch (e) {
+          // resolve errors are the config check: print them as-is
+          console.error(e instanceof Error ? e.message : String(e));
+          process.exitCode = 1;
+        }
+        return;
+      }
+      if (sub === 'new') {
+        const id = rest.find((r) => !r.startsWith('-'));
+        if (!id || !/^[a-z0-9][a-z0-9-]{0,30}$/.test(id)) {
+          console.log('usage: flock agents new <id> [--from <base>]');
+          return;
+        }
+        const fromIdx = rest.indexOf('--from');
+        const from = fromIdx >= 0 ? rest[fromIdx + 1] : 'pi';
+        if (from && !agents[from]) {
+          console.error(`unknown base manifest: ${from} (have: ${Object.keys(agents).join(', ')})`);
+          process.exitCode = 1;
+          return;
+        }
+        const dir = agentsDirOf();
+        const file = path.join(dir, `${id}.json`);
+        if (existsSync(file)) {
+          console.error(`already exists: ${file} (not overwriting)`);
+          process.exitCode = 1;
+          return;
+        }
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(file, JSON.stringify({ id, imports: [from], profiles: {} }, null, 2) + '\n');
+        console.log(`created ${file}`);
+        console.log(`override axes: thinking (${THINKING_LEVELS.join('/')}), tools, excludeTools, skills, noSkills, extensions, noExtensions, mcp, systemPrompt, appendSystemPrompt, noContextFiles; plus model (spawn --model), guidance, merge, testCmd`);
+        console.log('named override sets live under "profiles": {}; pick one with `flock pod spawn <role> --agent ' + id + ' --profile P`');
+        return;
+      }
+      console.log('usage: flock agents ls | show <id> [--profile P] | new <id> [--from <base>]');
       return;
     }
 
