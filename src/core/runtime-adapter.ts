@@ -73,6 +73,23 @@ export interface PodBinding {
   extraEnv?: Record<string, string>; // flock-managed env for the harness child
   seatRoot?: string; // canonical pod state dir (home/pods/<role>); != cwd for worktree pods
   trustLevel?: string; // sandbox trust level (overrides manifest; e.g. off for worktree pods)
+  // pi first-class config axes (T1): mapped to pi CLI flags by the runner.
+  // Ignored by non-pi runtimes.
+  pi?: {
+    thinking?: string;
+    tools?: string[];
+    excludeTools?: string[];
+    skills?: string[];
+    noSkills?: boolean;
+    extensions?: string[];
+    noExtensions?: boolean;
+    systemPrompt?: string;
+    appendSystemPrompt?: string[];
+    noContextFiles?: boolean;
+    // MCP servers -> written to the pod's <PI_CODING_AGENT_DIR>/mcp.json by
+    // launchHarness (pod-level, replaces any previous mcp.json).
+    mcp?: Record<string, { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }>;
+  };
 }
 
 export interface StartupFile {
@@ -281,6 +298,13 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     // distinguishable from a missing one.
     fs.mkdirSync(path.dirname(paths.runnerStatePath), { recursive: true });
     fs.writeFileSync(paths.runnerStatePath, JSON.stringify(buildPendingState(opts.launchId, new Date().toISOString()), null, 2));
+    // T1: pod-level MCP config — the pod's <PI_CODING_AGENT_DIR>/mcp.json is
+    // replaced on every launch (a profile/manifest switch must not leave
+    // another agent's servers behind).
+    // ponytail: the pod sees ONLY this pod-level mcp.json; the user's
+    // ~/.pi/agent/mcp.json is invisible to the pod (PI_CODING_AGENT_DIR is
+    // redirected). That is the isolation we want, not a bug to fix.
+    writePodMcpConfig(paths.agentDir, binding.pi?.mcp);
 
     const cmd = buildRunnerCommand({
       runnerPath: this.env.runnerPath,
@@ -295,6 +319,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       sessionFile: mode.mode === 'resume' ? mode.sessionFile : undefined,
       forkRef: mode.mode === 'fork' ? mode.forkRef : undefined,
       extraEnv: binding.extraEnv ? Object.entries(binding.extraEnv).map(([k, v]) => `${k}=${v}`) : undefined,
+      pi: binding.pi,
     });
     // PERSISTENT PANE: the window outlives the runner.
     // Alive -> typed-stop the old foreground (C-c -> runner writes the
@@ -577,6 +602,27 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
     if (claudePaneBusy(out)) return { ready: true, reason: 'working (in turn)' };
     if (claudePaneReady(out)) return { ready: true, reason: 'at prompt' };
     return { ready: false, reason: 'no prompt marker (boot dialog?)', code: 'awaiting_runtime' };
+  }
+}
+
+// T1: pod-level MCP config. Writes <agentDir>/mcp.json when servers are
+// given, REMOVES it otherwise — a relaunch with a manifest that has no mcp
+// must not keep the previous agent's servers.
+export function writePodMcpConfig(
+  agentDir: string,
+  mcp: Record<string, { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }> | undefined,
+): void {
+  const p = path.join(agentDir, 'mcp.json');
+  try {
+    if (mcp && Object.keys(mcp).length > 0) {
+      fs.writeFileSync(p, JSON.stringify({ mcpServers: mcp }, null, 2));
+    } else if (fs.existsSync(p)) {
+      fs.rmSync(p);
+    }
+  } catch (e) {
+    // MCP is best-effort: a broken mcp.json should degrade the pod (no
+    // servers), not kill the launch.
+    console.warn(`[flock] mcp.json write failed: ${e instanceof Error ? e.message : e}`);
   }
 }
 

@@ -88,6 +88,66 @@ try {
   assert.throws(() => resolveAgent('multi', null, 'nope'), /unknown profile/);
 
   const r3 = resolveAgent('multi', null);
+
+  // ---- T1: pi first-class axes -----------------------------------------
+  // merge semantics: scalars ext-wins, arrays concat, mcp per server name
+  const ax1 = mergeManifests(
+    { id: 'x', command: 'pi', thinking: 'low', tools: ['read'], skills: ['/s/a'], extensions: ['builtin:e'], mcp: { a: { command: 'aa' }, b: { command: 'bb' } } },
+    { thinking: 'high', tools: ['bash'], skills: ['/s/b'], extensions: ['/ext/f.ts'], mcp: { a: { command: 'aa2' }, c: { url: 'http://c' } } },
+  );
+  assert.strictEqual(ax1.thinking, 'high', 'thinking: scalar ext-wins');
+  assert.deepStrictEqual(ax1.tools, ['read', 'bash'], 'tools: concat (like args)');
+  assert.deepStrictEqual(ax1.skills, ['/s/a', '/s/b'], 'skills: concat');
+  assert.deepStrictEqual(ax1.extensions, ['builtin:e', '/ext/f.ts'], 'extensions: concat');
+  assert.deepStrictEqual(ax1.mcp, { a: { command: 'aa2' }, b: { command: 'bb' }, c: { url: 'http://c' } }, 'mcp: per-server merge, same name replaces wholesale');
+
+  // boolean axes ext-wins; empty arrays drop out (no "allow nothing" flag)
+  const ax2 = mergeManifests({ id: 'y', command: 'pi', noSkills: true }, { noSkills: false });
+  assert.strictEqual(ax2.noSkills, false, 'noSkills: scalar ext-wins');
+  const ax3 = mergeManifests({ id: 'z', command: 'pi' }, {});
+  assert.strictEqual(ax3.tools, undefined, 'unset array axes stay unset');
+  const ax4 = mergeManifests({ id: 'z2', command: 'pi', tools: [] }, {});
+  assert.strictEqual(ax4.tools, undefined, 'empty tools drops out of the merge');
+
+  // full chain: imports + profile through resolveAgent
+  fs.writeFileSync(path.join(tmp, 'agents', 'axes.json'), JSON.stringify({
+    id: 'axes-base',
+    command: 'pi',
+    modelFlag: '--model',
+    thinking: 'low',
+    tools: ['read'],
+    mcp: { stub: { command: 'echo', args: ['stub'] } },
+    profiles: { careful: { thinking: 'xhigh', tools: ['bash'], excludeTools: ['edit'], appendSystemPrompt: ['be careful'] } },
+  }));
+  fs.writeFileSync(path.join(tmp, 'agents', 'axes-kid.json'), JSON.stringify({
+    id: 'axes-kid',
+    command: 'pi',
+    imports: ['axes-base'],
+    skills: ['/base/skill'],
+    profiles: { cheap: { thinking: 'minimal', noSkills: true } },
+  }));
+  // careful profile on the base: profile axes override/append the base axes
+  const axc = resolveAgent('axes-base', null, 'careful')!;
+  assert.strictEqual(axc.manifest.thinking, 'xhigh', 'profile thinking overrides base scalar');
+  assert.deepStrictEqual(axc.manifest.tools, ['read', 'bash'], 'base + profile tools concat');
+  assert.deepStrictEqual(axc.manifest.excludeTools, ['edit'], 'profile-only axis appears');
+  assert.deepStrictEqual(axc.manifest.appendSystemPrompt, ['be careful'], 'profile appendSystemPrompt');
+  assert.deepStrictEqual(axc.manifest.mcp, { stub: { command: 'echo', args: ['stub'] } }, 'mcp intact, profile did not touch it');
+  // no profile: the import chain resolves (kid inherits base axes + its own skills)
+  const axplain = resolveAgent('axes-kid')!;
+  assert.strictEqual(axplain.manifest.thinking, 'low', 'imported thinking without profile');
+  assert.deepStrictEqual(axplain.manifest.tools, ['read'], 'imported tools without profile');
+  assert.deepStrictEqual(axplain.manifest.skills, ['/base/skill'], 'importer skills kept');
+  // own profile of the kid: profile wins over imported scalar, imported axes survive
+  const axcheap = resolveAgent('axes-kid', null, 'cheap')!;
+  assert.strictEqual(axcheap.manifest.thinking, 'minimal', 'own profile wins over imported scalar');
+  assert.strictEqual(axcheap.manifest.noSkills, true, 'own profile boolean axis');
+  assert.deepStrictEqual(axcheap.manifest.mcp, { stub: { command: 'echo', args: ['stub'] } }, 'mcp imported through the profile merge');
+
+  // thinking validation: closed set, error lists the valid values
+  fs.writeFileSync(path.join(tmp, 'agents', 'badthinking.json'), JSON.stringify({ id: 'badthinking', command: 'pi', thinking: 'ultra' }));
+  assert.throws(() => resolveAgent('badthinking'), /unknown thinking level: ultra \(valid: off, minimal, low, medium, high, xhigh, max\)/);
+
   assert.strictEqual(r3!.manifest.env?.MODE, 'base', 'no profile = base manifest');
 
   // imports through the on-disk loader

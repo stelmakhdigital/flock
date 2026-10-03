@@ -135,6 +135,20 @@ export function buildPiChildEnv(
 
 // ── Command builders ─────────────────────────────────────────────────────────
 
+export interface PiChildConfig {
+  // pi first-class config axes (T1) — carried to the runner in one JSON flag
+  thinking?: string;
+  tools?: string[];
+  excludeTools?: string[];
+  skills?: string[];
+  noSkills?: boolean;
+  extensions?: string[];
+  noExtensions?: boolean;
+  systemPrompt?: string;
+  appendSystemPrompt?: string[];
+  noContextFiles?: boolean;
+}
+
 export interface RunnerArgs {
   runnerPath: string; // dist/core/runner.js
   stateRoot: string; // FLOCK_HOME
@@ -148,7 +162,10 @@ export interface RunnerArgs {
   trustOption?: string; // fallback: option substring for an unexpected trust dialog
   trustLevel?: string; // sandbox trust level pre-seeded for the pod dir
   extraEnv?: string[]; // flock-managed env for the pi child (K=V, wins over operator shell)
+  pi?: PiChildConfig; // first-class pi axes (serialized as one --pi-config JSON flag)
 }
+
+export const RUNNER_PI_CONFIG_FLAG = '--pi-config';
 
 // The command typed into the pod's tmux pane (shell-quoted).
 export function buildRunnerCommand(o: RunnerArgs): string {
@@ -171,7 +188,38 @@ export function buildRunnerCommand(o: RunnerArgs): string {
     const i = kv.indexOf('=');
     if (i > 0) parts.push('--env', q(kv.slice(0, i)), q(kv.slice(i + 1)));
   }
+  // T1: the whole pi config block in ONE JSON flag — the free-form runner
+  // format grows by exactly one flag, no matter how many axes appear.
+  if (o.pi && Object.keys(o.pi).length > 0) parts.push(RUNNER_PI_CONFIG_FLAG, q(JSON.stringify(o.pi)));
   return parts.join(' ');
+}
+
+// Parse (and validate) the --pi-config JSON flag back into a PiChildConfig.
+// Unknown/extra keys are dropped; the runner must never pass garbage to pi.
+export function parsePiConfig(raw: string | undefined): PiChildConfig {
+  if (!raw) return {};
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {}; // corrupt flag: degrade to defaults, pi still launches
+  }
+  if (typeof obj !== 'object' || obj === null) return {};
+  const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+  const strArr = (v: unknown) => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : undefined);
+  const bool = (v: unknown) => (typeof v === 'boolean' ? v : undefined);
+  return {
+    thinking: str(obj.thinking),
+    tools: strArr(obj.tools),
+    excludeTools: strArr(obj.excludeTools),
+    skills: strArr(obj.skills),
+    noSkills: bool(obj.noSkills),
+    extensions: strArr(obj.extensions),
+    noExtensions: bool(obj.noExtensions),
+    systemPrompt: str(obj.systemPrompt),
+    appendSystemPrompt: strArr(obj.appendSystemPrompt),
+    noContextFiles: bool(obj.noContextFiles),
+  };
 }
 
 export interface PiChildArgs {
@@ -183,6 +231,8 @@ export interface PiChildArgs {
   sessionFile?: string;
   forkRef?: string;
   agentsMdPath?: string; // pod protocol file (loaded explicitly; --no-context-files)
+  // T1: first-class pi config axes (from --pi-config)
+  pi?: PiChildConfig;
 }
 
 // argv for the `pi --mode rpc` child the RUNNER spawns (no shell).
@@ -195,6 +245,12 @@ export interface PiChildArgs {
 //   exact file — never an interactive picker.
 // - --no-context-files + --append-system-prompt <pod AGENTS.md>: full
 //   isolation from ancestor/home context files.
+// - T1 axes map 1:1 to pi flags (verified against `pi --help`):
+//   thinking -> --thinking; tools/excludeTools -> --tools/--exclude-tools
+//   (comma-joined); skills/extensions/appendSystemPrompt -> repeatable
+//   --skill/--extension/--append-system-prompt; noSkills/noExtensions/
+//   noContextFiles -> --no-skills/--no-extensions/--no-context-files;
+//   systemPrompt -> --system-prompt.
 export function buildPiChildArgs(o: PiChildArgs): string[] {
   const args = [
     '--mode', 'rpc',
@@ -207,6 +263,17 @@ export function buildPiChildArgs(o: PiChildArgs): string[] {
     // reset --hard / push --force)
     ...(o.autoAllow ? ['--bash-guard-disabled'] : []),
   ];
+  const pi = o.pi ?? {};
+  if (pi.thinking) args.push('--thinking', pi.thinking);
+  if (pi.tools?.length) args.push('--tools', pi.tools.join(','));
+  if (pi.excludeTools?.length) args.push('--exclude-tools', pi.excludeTools.join(','));
+  for (const s of pi.skills ?? []) args.push('--skill', s);
+  if (pi.noSkills) args.push('--no-skills');
+  for (const e of pi.extensions ?? []) args.push('--extension', e);
+  if (pi.noExtensions) args.push('--no-extensions');
+  if (pi.systemPrompt) args.push('--system-prompt', pi.systemPrompt);
+  for (const a of pi.appendSystemPrompt ?? []) args.push('--append-system-prompt', a);
+  if (pi.noContextFiles) args.push('--no-context-files');
   if (o.agentsMdPath) args.push('--append-system-prompt', o.agentsMdPath);
   if (o.model) args.push('--model', o.model);
   if (o.sessionFile) args.push('--session', o.sessionFile);

@@ -9,6 +9,7 @@ import {
   parseRunnerState,
   buildPiChildEnv,
   buildRunnerCommand,
+  parsePiConfig,
   buildPiChildArgs,
   buildWindowLaunchCmd,
   parseAnswerLine,
@@ -99,6 +100,57 @@ assert.ok(cmd.includes("'o'\\''brien'"));
 assert.ok(cmd.includes('--launch-id') && cmd.includes('la_1'));
 assert.ok(cmd.includes('--approve'));
 assert.ok(!cmd.includes('--no-approve'));
+
+// T1 REGRESSION: no pi block -> byte-identical command to before T1 (no
+// --pi-config flag at all; a manifest without the new axes launches exactly
+// as it did)
+assert.ok(!cmd.includes('--pi-config'), 'no pi block: no --pi-config flag (regression)');
+
+// T1: the pi config block rides in ONE JSON flag and round-trips
+const piBlock = { thinking: 'xhigh', tools: ['read', 'bash'], excludeTools: ['edit'], skills: ['/s/a', '/s/b'], noExtensions: true, extensions: ['builtin:web'], systemPrompt: 'You are terse.', appendSystemPrompt: ['a.md', 'b.md'], noContextFiles: true };
+const cmdPi = buildRunnerCommand({
+  runnerPath: '/d/runner.js',
+  stateRoot: '/h',
+  role: 'dev',
+  cwd: '/d',
+  launchId: 'la_2',
+  trust: 'approve',
+  pi: piBlock,
+});
+assert.ok(cmdPi.includes('--pi-config'), 'pi block serialized');
+// the flag is shell-quoted JSON: extract it back and parse it
+const m = /--pi-config '(.*)'(?= |$)/.exec(cmdPi);
+assert.ok(m, 'pi-config flag extractable');
+let rawJson = m![1].replace(/'\\''/g, "'");
+const rt = parsePiConfig(rawJson);
+assert.deepStrictEqual(rt, { ...piBlock, noSkills: undefined }, 'pi config round-trips build -> parse (value-wise)');
+// corrupt flag degrades to empty (pi still launches with defaults)
+assert.deepStrictEqual(parsePiConfig('not-json'), {}, 'corrupt pi-config degrades to {}');
+assert.deepStrictEqual(parsePiConfig(undefined), {}, 'absent pi-config is {}');
+// unknown keys are dropped by the parser (the runner never passes garbage to pi)
+const rt2 = parsePiConfig('{"thinking":"high","bogus":123,"tools":5}');
+assert.strictEqual(rt2.thinking, 'high', 'valid key parsed');
+assert.strictEqual(rt2.tools, undefined, 'bad-typed key dropped (stays undefined)');
+assert.ok(!('bogus' in rt2), 'unknown key not present');
+
+// T1: pi child args — axes map 1:1 to pi flags (names verified vs pi --help)
+const cargs = buildPiChildArgs({ sessionsDir: '/s', role: 'x', trust: 'approve', pi: piBlock });
+assert.strictEqual(cargs[cargs.indexOf('--thinking') + 1], 'xhigh');
+assert.strictEqual(cargs[cargs.indexOf('--tools') + 1], 'read,bash');
+assert.strictEqual(cargs[cargs.indexOf('--exclude-tools') + 1], 'edit');
+assert.ok(cargs.includes('--skill') && cargs[cargs.indexOf('--skill') + 1] === '/s/a');
+assert.ok(cargs.includes('--extension') && cargs[cargs.indexOf('--extension') + 1] === 'builtin:web');
+assert.ok(cargs.includes('--no-extensions'));
+assert.strictEqual(cargs[cargs.indexOf('--system-prompt') + 1], 'You are terse.');
+const appends = cargs.filter((a, i) => cargs[i - 1] === '--append-system-prompt');
+assert.deepStrictEqual(appends, ['a.md', 'b.md'], 'appendSystemPrompt repeatable');
+// noContextFiles: the base args already carry --no-context-files; a second
+// explicit one is harmless for pi but we must not DOUBLE it silently
+const ncf = cargs.filter((a) => a === '--no-context-files').length;
+assert.ok(ncf >= 1, 'no-context-files present');
+// empty pi config: byte-identical to the pre-T1 argv (regression)
+const preT1 = ['--mode', 'rpc', '--session-dir', '/s', '--approve', '--no-context-files', '--session-id', 'x'];
+assert.deepStrictEqual(buildPiChildArgs({ sessionsDir: '/s', role: 'x', trust: 'approve' }), preT1, 'no pi axes: argv unchanged (regression)');
 
 // window launch command: env prefix + command, JSON-quoted values
 const wlc = buildWindowLaunchCmd('node /d/runner.js --x', {

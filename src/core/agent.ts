@@ -16,6 +16,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+export const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+// MCP server config for an agent's pods (pod-level mcp.json format).
+export interface McpServerConfig {
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
 export interface AgentManifest {
   id: string;
   command: string;
@@ -56,6 +68,23 @@ export interface AgentManifest {
   // the workflow requires the gate (requireTest). Green -> merge, red ->
   // the task is blocked (tests failed).
   testCmd?: string;
+  // pi-specific first-class axes (mapped to pi CLI flags by the pi
+  // adapter/runner; ignored by other runtimes — ponytail: claude/codex may
+  // map some later, e.g. thinking -> --effort).
+  thinking?: ThinkingLevel;
+  tools?: string[]; // allowlist of tool names
+  excludeTools?: string[]; // denylist of tool names
+  skills?: string[]; // paths to skill files/dirs (repeatable --skill)
+  noSkills?: boolean; // disable skills discovery
+  extensions?: string[]; // paths or builtin:<name> (repeatable --extension)
+  noExtensions?: boolean; // disable extension discovery
+  // MCP servers for this agent's pods: written to the pod's
+  // <PI_CODING_AGENT_DIR>/mcp.json at spawn/relaunch (pod-level, NOT the
+  // user's ~/.pi/agent/mcp.json). Replaces any previous mcp.json.
+  mcp?: Record<string, McpServerConfig>;
+  systemPrompt?: string; // replace default pi system prompt
+  appendSystemPrompt?: string[]; // append text/file contents (repeatable flag)
+  noContextFiles?: boolean; // skip AGENTS.md/CLAUDE.md discovery
 }
 
 import { PM_PROTOCOL } from './pm-protocol.js';
@@ -126,21 +155,39 @@ export interface ResolvedAgent {
 // args concatenate (base first); env is key-merged; guidance merges by id
 // (ext entry with the same id replaces base's, others append). Imports and
 // profiles of `base` are NOT inherited — only the importer's own graph.
+// pi axes (T1): scalars (thinking/noSkills/noExtensions/noContextFiles) —
+// ext wins; arrays (tools/excludeTools/skills/extensions/appendSystemPrompt)
+// — concat (like args); mcp — merged per server name (an ext entry with the
+// same name replaces the server wholesale).
 export function mergeManifests(base: AgentManifest, ext: Partial<AgentManifest>): AgentManifest {
   const g = new Map<string, { id: string; content: string }>();
   for (const e of base.guidance ?? []) g.set(e.id, e);
   for (const e of ext.guidance ?? []) g.set(e.id, e);
   const defined = Object.fromEntries(Object.entries(ext).filter(([, v]) => v !== undefined));
-  return {
+  const merged: AgentManifest = {
     ...base,
     ...defined,
     args: [...(base.args ?? []), ...(ext.args ?? [])],
     env: { ...(base.env ?? {}), ...(ext.env ?? {}) },
     guidance: [...g.values()],
+    tools: [...(base.tools ?? []), ...(ext.tools ?? [])],
+    excludeTools: [...(base.excludeTools ?? []), ...(ext.excludeTools ?? [])],
+    skills: [...(base.skills ?? []), ...(ext.skills ?? [])],
+    extensions: [...(base.extensions ?? []), ...(ext.extensions ?? [])],
+    appendSystemPrompt: [...(base.appendSystemPrompt ?? []), ...(ext.appendSystemPrompt ?? [])],
+    mcp: { ...(base.mcp ?? {}), ...(ext.mcp ?? {}) },
     // never bake a profile's own imports into the result as active graph
     imports: ext.imports ?? base.imports,
     profiles: ext.profiles ?? base.profiles,
   };
+  // empty arrays are not a signal (a profile that sets no tools keeps none):
+  // drop the axis when the merge produced nothing, so `tools: []` never
+  // serializes into a runner flag (which would mean "allow nothing")
+  for (const k of ['tools', 'excludeTools', 'skills', 'extensions', 'appendSystemPrompt'] as const) {
+    if ((merged[k] ?? []).length === 0) delete merged[k];
+  }
+  if (merged.mcp && Object.keys(merged.mcp).length === 0) delete merged.mcp;
+  return merged;
 }
 
 // Resolve the imports graph (in order, last wins) with cycle detection.
@@ -166,6 +213,12 @@ export function resolveAgent(id: string | undefined, model?: string | null, prof
     const p = m.profiles?.[profile];
     if (!p) throw new Error(`manifest ${m.id}: unknown profile: ${profile} (has: ${Object.keys(m.profiles ?? {}).join(', ') || 'none'})`);
     m = mergeManifests(m, p);
+  }
+  // T1 validation: thinking is a small closed set — a typo here would fail
+  // deep in pi's flag parser with a worse message. The other axes are
+  // pass-through (pi fails visibly on a bad tool name/skill path).
+  if (m.thinking != null && !THINKING_LEVELS.includes(m.thinking)) {
+    throw new Error(`manifest ${m.id}: unknown thinking level: ${m.thinking} (valid: ${THINKING_LEVELS.join(', ')})`);
   }
   const parts = [m.command, ...(m.args ?? [])];
   if (model && m.modelFlag) parts.push(m.modelFlag, model);

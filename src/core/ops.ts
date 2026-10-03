@@ -7,7 +7,7 @@ import * as gitops from './gitops.js';
 import { parseTeamYaml, TeamParseError } from './team.js';
 import { listConflictResolutions } from './store.js';
 import * as terminal from './terminal.js';
-import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime } from './agent.js';
+import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
 import { seatPaths, frameMessage, newNonce, validateResumeToken } from './runner-protocol.js';
 import { claudeConfigDir, claudeProjectsDir, claudeTranscriptFp, waitForTranscriptGrowth, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
@@ -210,6 +210,9 @@ async function spawnAgent(ctx: CoreCtx, o: {
       seatRoot: path.join(ctx.store.home, 'pods', o.role),
       // the base repo cannot be made visible inside the sandbox -> no bwrap
       trustLevel: o.repo && adapter.runtime === 'pi' ? 'off' : manifest.trustLevel,
+      // T1: first-class pi axes from the resolved manifest (pi runtime only —
+      // other adapters ignore the block)
+      pi: adapter.runtime === 'pi' ? piAxesFromManifest(manifest) : undefined,
     };
     // listInstalled: a clear spawn error instead of a dead window.
     const installed = await adapter.listInstalled(binding);
@@ -292,6 +295,24 @@ async function spawnAgent(ctx: CoreCtx, o: {
 }
 
 const launchPostureUsed = (b: PodBinding): boolean => b.launchPosture !== undefined && b.launchPosture !== 'floor';
+
+// T1: extract the pi config axes from a resolved manifest (only the axes
+// that are actually set — an unset axis must not reach the runner flag).
+function piAxesFromManifest(m: AgentManifest): PodBinding['pi'] {
+  const out: NonNullable<PodBinding['pi']> = {};
+  if (m.thinking != null) out.thinking = m.thinking;
+  if (m.tools?.length) out.tools = m.tools;
+  if (m.excludeTools?.length) out.excludeTools = m.excludeTools;
+  if (m.skills?.length) out.skills = m.skills;
+  if (m.noSkills != null) out.noSkills = m.noSkills;
+  if (m.extensions?.length) out.extensions = m.extensions;
+  if (m.noExtensions != null) out.noExtensions = m.noExtensions;
+  if (m.systemPrompt != null) out.systemPrompt = m.systemPrompt;
+  if (m.appendSystemPrompt?.length) out.appendSystemPrompt = m.appendSystemPrompt;
+  if (m.noContextFiles != null) out.noContextFiles = m.noContextFiles;
+  if (m.mcp && Object.keys(m.mcp).length > 0) out.mcp = m.mcp;
+  return Object.keys(out).length ? out : undefined;
+}
 
 async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);

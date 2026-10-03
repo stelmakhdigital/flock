@@ -17,6 +17,7 @@ import {
   parseRunnerState,
   buildPiChildEnv,
   buildPiChildArgs,
+  parsePiConfig,
   unframeMessage,
   RUNNER_READY_MARKER,
   RUNNER_EXIT_MARKER,
@@ -39,6 +40,7 @@ interface ParsedArgs {
   trustOption: string;
   trustLevel: string;
   extraEnv: Record<string, string>;
+  piConfig: ReturnType<typeof parsePiConfig>;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -60,6 +62,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     extraEnv: Object.fromEntries(
       argv.flatMap((a, i) => (a === '--env' ? [[argv[i + 1], argv[i + 2]] as [string, string]] : [])),
     ) as Record<string, string>,
+    // T1: first-class pi config axes arrive in ONE JSON flag
+    piConfig: parsePiConfig(get('--pi-config')),
   };
   if (!args.stateRoot || !args.role || !args.launchId) {
     throw new Error('missing required args: --state-root --role --launch-id');
@@ -409,6 +413,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     forkRef: args.forkRef,
     agentsMdPath: fs.existsSync(agentsMd) ? agentsMd : undefined,
     autoAllow: args.extraEnv['BASH_GUARD_AUTO_ALLOW'] === '1',
+    pi: Object.keys(args.piConfig).length ? args.piConfig : undefined,
   });
   // Pre-seed the per-pod sandbox trust store: the project-trust DIALOG in RPC
   // mode kills the session (pi exits after the dialog resolves), so we never
