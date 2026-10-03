@@ -99,6 +99,12 @@ export function pmDigest(ctx: CoreCtx): Record<string, unknown> {
   const byStatus: Record<string, number> = {};
   for (const t of tasks) byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
   const open = tasks.filter((t) => t.status === 'active' || t.status === 'needs' || t.status === 'blocked');
+  // 5.0.4: queued tasks waiting on a CLOSED pod (zombie queue) — visible to pm
+  // so it can see the arbiter's wake-ups (and when the cooldown is in effect)
+  const liveRoles = new Set(store.listPods(s).filter((p) => p.state === 'live').map((p) => p.role));
+  const waitingOnClosed = tasks
+    .filter((t) => t.status === 'queued' && !liveRoles.has(t.pod_role))
+    .map((t) => ({ id: t.id, title: t.title.slice(0, 80), pod: t.pod_role }));
   const pods = store.listPods(s).map((p) => ({
     role: p.role,
     state: p.state,
@@ -110,6 +116,7 @@ export function pmDigest(ctx: CoreCtx): Record<string, unknown> {
     at: store.nowIso(),
     tasks: byStatus,
     openTasks: open.map((t) => ({ id: t.id, title: t.title.slice(0, 80), status: t.status, pod: t.pod_role, claimed_at: t.claimed_at ?? null })),
+    waitingOnClosed,
     pods,
     liveRuns: runs,
   };

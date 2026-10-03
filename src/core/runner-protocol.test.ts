@@ -13,13 +13,27 @@ import {
   buildWindowLaunchCmd,
   parseAnswerLine,
   dialogResponse,
+  newNonce,
   type PendingDialog,
 } from './runner-protocol.js';
 
 // frame round-trip (multi-line, unicode)
 const msg = 'Task t_1: заголовок\nстрока 2\nПротокол: flock task done t_1';
-assert.strictEqual(unframeMessage(frameMessage(msg)), msg);
+assert.strictEqual(unframeMessage(frameMessage(msg))?.text, msg, 'v1 frame round-trip');
 assert.strictEqual(unframeMessage('plain text'), null);
+
+// v2 frame: nonce round-trip + v2 line also starts with the v1 prefix,
+// so v2 must win the match (order matters)
+const nonce = newNonce();
+const framed2 = unframeMessage(frameMessage(msg, nonce));
+assert.ok(framed2, 'v2 frame parses');
+assert.strictEqual(framed2!.text, msg);
+assert.strictEqual(framed2!.nonce, nonce);
+assert.notStrictEqual(unframeMessage(frameMessage('a', 'n1'))!.nonce, unframeMessage(frameMessage('a', 'n2'))!.nonce);
+// distinct nonces are distinct (repeat-message false-positive is closed)
+const n1 = newNonce();
+const n2 = newNonce();
+assert.notStrictEqual(n1, n2);
 
 // seat paths
 const p = seatPaths('/home/u/.flock', 'dev');

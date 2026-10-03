@@ -19,17 +19,46 @@ export const RUNNER_ERROR_MARKER = '[flock-runner] ERROR';
 // Delivery framing: core pastes `flockmsg <base64>` + Enter. One wire line
 // = one message block, multi-line safe (improvement over TTY paste
 // semantics: tmux paste of raw newlines would submit each line separately).
+// v2 adds a nonce: the ack is a nonce match, so a REPEATED identical message
+// can never false-positive against the previous one's ack.
 export const FLOCKMSG_PREFIX = 'flockmsg';
-export function frameMessage(text: string): string {
-  return `${FLOCKMSG_PREFIX} ${Buffer.from(text, 'utf8').toString('base64')}`;
+export const FLOCKMSG_V2_PREFIX = 'flockmsg v2';
+
+export function newNonce(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
-export function unframeMessage(line: string): string | null {
-  if (!line.startsWith(`${FLOCKMSG_PREFIX} `)) return null;
-  try {
-    return Buffer.from(line.slice(FLOCKMSG_PREFIX.length + 1), 'base64').toString('utf8');
-  } catch {
-    return null;
+
+export function frameMessage(text: string, nonce?: string): string {
+  if (nonce === undefined) {
+    return `${FLOCKMSG_PREFIX} ${Buffer.from(text, 'utf8').toString('base64')}`;
   }
+  return `${FLOCKMSG_V2_PREFIX} ${Buffer.from(JSON.stringify({ n: nonce, t: text }), 'utf8').toString('base64')}`;
+}
+
+export interface FramedMessage {
+  text: string;
+  nonce?: string;
+}
+
+export function unframeMessage(line: string): FramedMessage | null {
+  // v2 first: a v2 line also starts with the v1 prefix
+  if (line.startsWith(`${FLOCKMSG_V2_PREFIX} `)) {
+    try {
+      const obj = JSON.parse(Buffer.from(line.slice(FLOCKMSG_V2_PREFIX.length + 1), 'base64').toString('utf8')) as { n?: string; t?: string };
+      if (typeof obj.t !== 'string') return null;
+      return { text: obj.t, nonce: typeof obj.n === 'string' ? obj.n : undefined };
+    } catch {
+      return null;
+    }
+  }
+  if (line.startsWith(`${FLOCKMSG_PREFIX} `)) {
+    try {
+      return { text: Buffer.from(line.slice(FLOCKMSG_PREFIX.length + 1), 'base64').toString('utf8') };
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 export interface SeatPaths {
@@ -58,7 +87,7 @@ export interface RunnerState {
   sessionFile?: string;
   sessionId?: string;
   streaming?: boolean; // typed busy flag (improvement: arbiter/health use it)
-  lastPrompt?: { text: string; at: string }; // delivery ack (improvement over fire-and-forget)
+  lastPrompt?: { nonce?: string; text: string; at: string }; // delivery ack (nonce-match in v2)
   exited?: { code: number | null; signal?: string | null; at: string };
 }
 

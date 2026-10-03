@@ -8,7 +8,7 @@ import * as store from './store.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, manifestRuntime } from './agent.js';
 import { getAdapter, type AdapterEnv } from './runtime-adapter.js';
-import { apply, OpError, type CoreCtx } from './ops.js';
+import { apply, listOps, OpError, type CoreCtx } from './ops.js';
 import { listAlerts, healthOptsFromEnv } from './health.js';
 import { pmDigest } from './pm.js';
 
@@ -47,9 +47,27 @@ export function createHttp(ctx: CoreCtx) {
     });
   });
 
+  // checkReady cache: N tmux calls per /api/pods is wasted on a busy board;
+  // ready-state changes on the scale of seconds, so 5s TTL is imperceptible.
+  // Override with FLOCK_READY_CACHE_MS (0 = disabled).
+  const readyCacheTtlMs = Number(process.env.FLOCK_READY_CACHE_MS ?? 5000);
+  const readyCache = new Map<string, { at: number; result: unknown }>();
+  const checkReadyCached = async (adapter: { checkReady(b: { role: string; cwd: string }): Promise<unknown> }, b: { role: string; cwd: string }) => {
+    if (readyCacheTtlMs <= 0) {
+      return adapter.checkReady(b).catch(() => ({ ready: false, reason: 'check failed' }));
+    }
+    const hit = readyCache.get(b.role);
+    const now = Date.now();
+    if (hit && now - hit.at < readyCacheTtlMs) return hit.result;
+    const result = await adapter
+      .checkReady(b)
+      .catch(() => ({ ready: false, reason: 'check failed' }));
+    readyCache.set(b.role, { at: now, result });
+    return result;
+  };
+
   app.get('/api/pods', async (c) => {
-    // pods + typed runner state (sidecar) + checkReady (live: sidecar +
-    // foreground-pane guard) + runs with meta parsed
+    // pods + typed runner state (sidecar) + checkReady (cached 5s) + runs
     const adapterEnv: AdapterEnv = {
       home: ctx.store.home,
       token: ctx.store.token,
@@ -65,11 +83,7 @@ export function createHttp(ctx: CoreCtx) {
           const resolved = resolveAgent(p.agent, null);
           if (resolved && manifestRuntime(resolved.manifest) !== 'cmd') {
             const adapter = getAdapter(resolved.manifest, adapterEnv);
-            if (adapter) {
-              row.ready = await adapter
-                .checkReady({ role: p.role, cwd: p.dir })
-                .catch(() => ({ ready: false, reason: 'check failed' }));
-            }
+            if (adapter) row.ready = await checkReadyCached(adapter, { role: p.role, cwd: p.dir });
           }
         }
         return row;
@@ -85,6 +99,10 @@ export function createHttp(ctx: CoreCtx) {
   app.get('/api/health', (c) => {
     const alerts = listAlerts(ctx);
     return c.json({ alerts, opts: healthOptsFromEnv() });
+  });
+
+  app.get('/api/ops', (c) => {
+    return c.json({ ops: listOps() });
   });
 
   app.get('/api/pm', (c) => {

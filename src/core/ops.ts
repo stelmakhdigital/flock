@@ -4,7 +4,7 @@ import * as store from './store.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
-import { seatPaths, frameMessage, validateResumeToken } from './runner-protocol.js';
+import { seatPaths, frameMessage, newNonce, validateResumeToken } from './runner-protocol.js';
 import { claudeConfigDir, claudeProjectsDir, claudeTranscriptFp, waitForTranscriptGrowth, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
 import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
@@ -53,69 +53,68 @@ function requireLivePod(ctx: CoreCtx, role: string): store.Pod {
 export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): Promise<unknown> {
   const o = op ?? {};
   const t = String(o.type ?? '');
-  switch (t) {
-    case 'pod_spawn':
-      return podSpawn(o, ctx);
-    case 'pod_relaunch':
-      return podRelaunch(o, ctx);
-    case 'pod_set_resume_token':
-      return podSetResumeToken(o, ctx);
-    case 'pod_send':
-      return podSend(o, ctx);
-    case 'pod_answer':
-      return podAnswer(o, ctx);
-    case 'pod_capture':
-      return podCapture(o, ctx);
-    case 'pod_close':
-      return podClose(o, ctx);
-    case 'watchdog_register':
-      return watchdogRegister(o, ctx);
-    case 'watchdog_cancel':
-      return watchdogCancel(o, ctx);
-    case 'watchdog_list':
-      return { jobs: store.listWatchdogJobs(ctx.store) };
-    case 'workflow_define':
-      return workflowDefine(o, ctx);
-    case 'workflow_start':
-      return workflowStart(o, ctx);
-    case 'workflow_ls':
-      return { workflows: store.listWorkflows(ctx.store), instances: store.listWorkflowInstances(ctx.store) };
-    case 'workflow_status':
-      return workflowStatus(o, ctx);
-    case 'task_add':
-      return taskAdd(o, ctx);
-    case 'task_list':
-      return { tasks: store.listTasks(ctx.store, o.status ? String(o.status) : undefined) };
-    case 'task_history':
-      return taskHistory(o, ctx);
-    case 'task_cancel':
-      await pmNotifyMaybe(ctx, 'task_cancelled', o, 'cancelled');
-      return taskReport(o, ctx, 'cancelled');
-    case 'task_unblock':
-      await pmNotifyMaybe(ctx, 'task_unblocked', o, 'queued');
-      return taskReport(o, ctx, 'queued');
-    case 'task_done':
-      await pmNotifyMaybe(ctx, 'task_done', o, 'done');
-      return taskReport(o, ctx, 'done');
-    case 'task_blocked':
-      await pmNotifyMaybe(ctx, 'task_blocked', o, 'blocked');
-      return taskReport(o, ctx, 'blocked');
-    case 'task_needs':
-      await pmNotifyMaybe(ctx, 'task_needs', o, 'needs');
-      return taskReport(o, ctx, 'needs');
-    case 'pm_up':
-      return pmUp(ctx);
-    case 'pm_state':
-      return { pm: pmDigest(ctx), alerts: listAlerts(ctx) };
-    case 'pm_intents':
-      return pmIntents(o, ctx);
-    case 'health_list':
-      return { alerts: listAlerts(ctx) };
-    case 'terminal_check':
-      return terminalCheck(ctx);
-    default:
-      throw new OpError(400, `unknown op: ${t || '(empty)'}`);
-  }
+  const d = OP_REGISTRY[t];
+  if (!d) throw new OpError(400, `unknown op: ${t || '(empty)'}`);
+  d.validate?.(o, ctx);
+  return d.run(o, ctx);
+}
+
+// Op registry: every op is {group, summary, scopes, validate?, run}.
+// apply() is the single mutation path (CLI, ticks, pm intents all route
+// through it); the registry makes ops introspectable (/api/ops) and gives a
+// home for per-scope authorization (5.3: pod-scoped tokens get the 'pod'
+// scope). validate = cheap pre-checks before run (most validation stays in
+// the handler, where it can see ctx).
+export interface OpDef {
+  group: string;
+  summary: string;
+  scopes: Array<'operator' | 'pod'>;
+  validate?: (o: Record<string, unknown>, ctx: CoreCtx) => void;
+  run: (o: Record<string, unknown>, ctx: CoreCtx) => Promise<unknown> | unknown;
+}
+
+export const OP_REGISTRY: Record<string, OpDef> = {
+  // -- pods -----------------------------------------------------------------
+  pod_spawn: { group: 'pod', scopes: ['operator'], summary: 'spawn a pod (agent manifest, optional --repo worktree)', run: (o, c) => podSpawn(o, c) },
+  pod_relaunch: { group: 'pod', scopes: ['operator'], summary: 'new run on the same pod (honest resume, --fork)', run: (o, c) => podRelaunch(o, c) },
+  pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
+  pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
+  pod_answer: { group: 'pod', scopes: ['operator'], summary: 'answer a pending dialog (gate) in a pod', run: (o, c) => podAnswer(o, c) },
+  pod_capture: { group: 'pod', scopes: ['operator'], summary: 'capture pod pane text', run: (o, c) => podCapture(o, c) },
+  pod_close: { group: 'pod', scopes: ['operator'], summary: 'close a pod (kill window, state=closed)', run: (o, c) => podClose(o, c) },
+  // -- watchdog --------------------------------------------------------------
+  watchdog_register: { group: 'watchdog', scopes: ['operator'], summary: 'register a watchdog check (agent-registered)', run: (o, c) => watchdogRegister(o, c) },
+  watchdog_cancel: { group: 'watchdog', scopes: ['operator'], summary: 'cancel a watchdog job', run: (o, c) => watchdogCancel(o, c) },
+  watchdog_list: { group: 'watchdog', scopes: ['operator'], summary: 'list watchdog jobs', run: (_o, c) => ({ jobs: store.listWatchdogJobs(c.store) }) },
+  // -- workflows -------------------------------------------------------------
+  workflow_define: { group: 'workflow', scopes: ['operator'], summary: 'define a workflow (named step list)', run: (o, c) => workflowDefine(o, c) },
+  workflow_start: { group: 'workflow', scopes: ['operator'], summary: 'start a workflow instance', run: (o, c) => workflowStart(o, c) },
+  workflow_ls: { group: 'workflow', scopes: ['operator'], summary: 'list workflows and instances', run: (_o, c) => ({ workflows: store.listWorkflows(c.store), instances: store.listWorkflowInstances(c.store) }) },
+  workflow_status: { group: 'workflow', scopes: ['operator'], summary: 'instance status (steps, states)', run: (o, c) => workflowStatus(o, c) },
+  // -- tasks -----------------------------------------------------------------
+  task_add: { group: 'task', scopes: ['operator'], summary: 'add a task to the queue (pod must exist)', run: (o, c) => taskAdd(o, c) },
+  task_list: { group: 'task', scopes: ['operator', 'pod'], summary: 'list tasks (filter by status)', run: (o, c) => ({ tasks: store.listTasks(c.store, o.status ? String(o.status) : undefined) }) },
+  task_history: { group: 'task', scopes: ['operator', 'pod'], summary: 'task transitions (audit)', run: (o, c) => taskHistory(o, c) },
+  task_cancel: { group: 'task', scopes: ['operator'], summary: 'cancel a task', run: async (o, c) => { await pmNotifyMaybe(c, 'task_cancelled', o, 'cancelled'); return taskReport(o, c, 'cancelled'); } },
+  task_unblock: { group: 'task', scopes: ['operator'], summary: 'unblock a task (-> queued)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
+  task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task done (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
+  task_blocked: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task blocked (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_blocked', o, 'blocked'); return taskReport(o, c, 'blocked'); } },
+  task_needs: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task needs help (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_needs', o, 'needs'); return taskReport(o, c, 'needs'); } },
+  // -- pm / goal loop ---------------------------------------------------------
+  pm_up: { group: 'pm', scopes: ['operator'], summary: 'start the pm pod (goal loop)', run: (_o, c) => pmUp(c) },
+  pm_state: { group: 'pm', scopes: ['operator'], summary: 'pm digest snapshot + alerts', run: (_o, c) => ({ pm: pmDigest(c), alerts: listAlerts(c) }) },
+  pm_intents: { group: 'pm', scopes: ['operator'], summary: 'typed intents from pm (whitelist, applied via apply)', run: (o, c) => pmIntents(o, c) },
+  // -- health / system ---------------------------------------------------------
+  health_list: { group: 'health', scopes: ['operator', 'pod'], summary: 'built-in health alerts (gate/idle)', run: (_o, c) => ({ alerts: listAlerts(c) }) },
+  terminal_check: { group: 'system', scopes: ['operator'], summary: 'tmux transport self-check', run: (_o, c) => terminalCheck(c) },
+};
+
+// Introspection: op names + metadata (for /api/ops, `flock ops ls`, and
+// future scope enforcement).
+export function listOps(): Array<{ type: string; group: string; summary: string; scopes: string[] }> {
+  return Object.entries(OP_REGISTRY)
+    .map(([type, d]) => ({ type, group: d.group, summary: d.summary, scopes: d.scopes }))
+    .sort((a, b) => (a.group + a.type).localeCompare(b.group + b.type));
 }
 
 // Shared spawn path for pod_spawn and pod_relaunch.
@@ -272,7 +271,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 // is retry_fresh (recorded in the run meta, never silent). bash: fresh window.
 const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js') });
 
-async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod) throw new OpError(404, `no pod: ${role}`);
@@ -386,13 +385,14 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   if (podRuntime(pod.agent) === 'pi') {
     // runner bridge: framed message + raw paste, verified by the sidecar ack
     // (the visual probe breaks on long/wrapped lines in a TTY line editor).
-    const wire = frameMessage(text);
+    const nonce = newNonce();
+    const wire = frameMessage(text, nonce);
     const res = await terminal.send(pod.terminal_target!, wire, { raw: true });
     const deadline = Date.now() + 5000;
     let acked = false;
     while (Date.now() < deadline) {
       const st = terminal.readRunnerState(ctx.store.home, pod.role);
-      if (st?.lastPrompt && st.lastPrompt.text.startsWith(text.slice(0, 200))) {
+      if (st?.lastPrompt?.nonce === nonce) {
         acked = true;
         break;
       }

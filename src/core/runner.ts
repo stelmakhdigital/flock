@@ -91,7 +91,7 @@ export class RunnerCore {
   private sessionId: string | undefined;
   private exited = false;
   private trustOption: string;
-  private lastPrompt: { text: string; at: string } | undefined;
+  private lastPrompt: { nonce?: string; text: string; at: string } | undefined;
   // extension dialogs waiting for a client response (select/confirm/input/editor).
   // pi has no timeout — these block the agent forever until answered (/answer)
   // or the runner dies. Cap: newest 10.
@@ -337,12 +337,14 @@ export class RunnerCore {
       }
       return;
     }
-    const text = unframeMessage(block) ?? rawBlock;
+    const framed = unframeMessage(block);
+    const text = framed?.text ?? rawBlock;
     const kind = this.streaming ? 'steer' : 'prompt';
     this.io.sendRpc({ type: kind, message: text });
     this.io.mirrorLine(`you ${kind === 'steer' ? '(steer) ' : ''}▸ ${firstLine(text)}`);
-    // delivery ack: core verifies against this (survives streaming toggles)
-    this.lastPrompt = { text: text.slice(0, 2000), at: this.io.now() };
+    // delivery ack: core verifies against this (survives streaming toggles);
+    // nonce (v2 frame) makes the ack unambiguous for repeated messages
+    this.lastPrompt = { text: text.slice(0, 2000), nonce: framed?.nonce, at: this.io.now() };
     this.io.writeSidecar(this.baseState());
     this.io.appendActivity({ event: kind, bytes: text.length });
   }

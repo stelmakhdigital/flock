@@ -22,7 +22,7 @@ import { seatPaths } from './runner-protocol.js';
 import type { CoreCtx } from './ops.js';
 import { apply } from './ops.js';
 import * as store from './store.js';
-import { readRunnerState } from './terminal.js';
+import { readRunnerState, capture, sendKey, winTarget } from './terminal.js';
 import { podRuntime } from './agent.js';
 
 export interface HealthOpts {
@@ -190,6 +190,31 @@ export async function runHealthTick(ctx: CoreCtx): Promise<void> {
       console.error(`[core] health: ${pod.role}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+  // claude pods have no /answer channel (raw TUI pane): in-session
+  // notification dialogs ("Enter to continue") would stall the pod forever.
+  // Boot/permission dialogs are launch-time only and are answered by the
+  // ready-wait loop - the sweeper only dismisses the known notification.
+  for (const pod of store.listPods(ctx.store)) {
+    if (pod.state !== 'live' || podRuntime(pod.agent) !== 'claude') continue;
+    try {
+      sweepClaudeDialog(ctx, pod.role);
+    } catch {
+      /* pane gone mid-sweep; the runkeeper owns crash detection */
+    }
+  }
+}
+
+function sweepClaudeDialog(ctx: CoreCtx, role: string): void {
+  const target = winTarget(role);
+  capture(target, 40)
+    .then((out) => {
+      if (out.includes('Enter to continue')) {
+        console.log(`[core] health: claude pod ${role}: dismissing in-session notification`);
+        return sendKey(target, 'Enter');
+      }
+      return undefined;
+    })
+    .catch(() => {});
 }
 
 async function checkPod(ctx: CoreCtx, role: string, opts: HealthOpts, nowMs: number): Promise<void> {

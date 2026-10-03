@@ -42,6 +42,7 @@ const USAGE = `flock — core CLI
   flock pm state                       # снимок pipeline для pm
   flock pm intent '<json>'             # typed intent: {"op":"task_done","id":"t_x"} или {"intents":[...]}
   flock health ls                      # built-in health-алерты (gate/idle)
+  flock ops ls                         # реестр ops (introspection: group, scopes)
   flock watchdog add --policy <marker|timer|stall|file> --target <role> [opts]
       marker: --text T [--lines N] [--repeat]
       timer:  --after N
@@ -228,6 +229,15 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'health_list' }));
       } else {
         console.log('usage: flock health ls');
+      }
+      return;
+    }
+
+    case 'ops': {
+      if (sub === 'ls') {
+        print(await api('GET', '/api/ops'));
+      } else {
+        console.log('usage: flock ops ls');
       }
       return;
     }
