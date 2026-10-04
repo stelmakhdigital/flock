@@ -66,7 +66,9 @@ const USAGE = `flock — core CLI
   flock task done <id> <reason: finished|blocked|denied|canceled|escalated>
   flock task blocked <id> [reason...]
   flock task needs <id> [reason...]
-  flock task handoff <id> <to-role>   # transactional: close (handed-off) + successor у to
+  flock task handoff <id> <to-role>
+  flock task gate <id> <checker-role>       # owner→checker review gate (task не закрывается до вердикта)
+  flock task verdict <id> <pass|reject> [reason...]   # transactional: close (handed-off) + successor у to
   flock task cancel <id>
   flock events tail [--since N]        # event-лог (SSE, live)
   flock message send <role> <text...>   # durable-сообщение в inbox (+ poke живому)
@@ -757,6 +759,18 @@ async function main(): Promise<void> {
           { type: 'task_cancel', id: args[0] };
         // from inside a pod window attribute the report to the pod
         print(await api('POST', '/api/ops', { ...op, ...(process.env.FLOCK_POD_ROLE ? { registeredBy: process.env.FLOCK_POD_ROLE } : {}) }));
+      } else if (action === 'gate') {
+        if (!args[0] || !args[1]) {
+          console.error('usage: flock task gate <id> <checker-role>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'task_gate', id: args[0], checker: args[1] }));
+      } else if (action === 'verdict') {
+        if (!args[0] || !args[1]) {
+          console.error('usage: flock task verdict <id> <pass|reject> [reason...]');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'task_verdict', id: args[0], verdict: args[1], reason: args.slice(2).join(' ') || undefined }));
       } else {
         console.log(USAGE);
       }

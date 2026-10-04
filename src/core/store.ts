@@ -414,6 +414,12 @@ ALTER TABLE tasks ADD COLUMN campaign_id TEXT;
 CREATE INDEX IF NOT EXISTS tasks_campaign_idx ON tasks(campaign_id);
 `,
   },
+  {
+    name: '022_tasks_gate',
+    sql: `
+ALTER TABLE tasks ADD COLUMN gate TEXT;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -673,6 +679,7 @@ export interface Task {
   priority: number;
   closed: string | null; // C3: JSON {reason, target?, at, by} — terminal states only
   campaign_id: string | null; // 5.6: campaign container (nullable = ad-hoc task)
+  gate: string | null; // review gate: JSON {status: pending|cleared, checker, set_at, verdict?}
 }
 
 // C3: hot-potato closure vocabulary. A unit of work cannot be closed
@@ -846,6 +853,96 @@ export function handoffTask(
     throw e;
   }
   return { from: getTask(store, id)!, to: getTask(store, succId)! };
+}
+
+// ---------- review gate (owner → checker, via queue/ops) ---------------------
+// The owner's active task gets a gate: it cannot be closed as done until the
+// checker pod (a SEPARATE pod) issues a verdict. The gate goes through the
+// ordinary task queue — the checker receives a review task — not through
+// prompts. Enforced in the ops layer (task_done/task_handoff refuse a gatted
+// task), so guidance alone can never bypass it.
+
+export interface TaskGate {
+  status: 'pending' | 'cleared';
+  checker: string;
+  set_at: string;
+  cleared_at?: string;
+  verdict?: 'passed' | 'rejected';
+  reason?: string;
+}
+
+export function pendingGate(task: { gate: string | null } | null): TaskGate | null {
+  if (!task?.gate) return null;
+  try {
+    const g = JSON.parse(task.gate) as TaskGate;
+    return g.status === 'pending' ? g : null;
+  } catch {
+    return null;
+  }
+}
+
+// Open the gate + create the checker's review task in ONE transaction.
+export function openReviewGate(store: Store, id: string, checker: string, by: string): { reviewTaskId: string } {
+  const db = dbOf(store);
+  const t = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | undefined;
+  if (!t) throw new Error(`no task: ${id}`);
+  if (t.status !== 'active') throw new Error(`gate needs an active task (task is ${t.status})`);
+  const pg = pendingGate(t);
+  if (pg) throw new Error(`task already has a pending gate (checker: ${pg.checker})`);
+  const gate: TaskGate = { status: 'pending', checker, set_at: nowIso() };
+  const reviewId = newId('t');
+  const reviewBody = [
+    `Review-gate на таске ${id} (owner: ${t.pod_role}).`,
+    `Проверь работу, затем вердикт: \`flock task verdict ${id} pass\` или \`flock task verdict ${id} reject '<причина>'\`.`,
+    t.body ? `\nИсходная задача:\n${t.body}` : null,
+  ].filter(Boolean).join('\n');
+  db.exec('BEGIN');
+  try {
+    db.prepare('UPDATE tasks SET gate = ? WHERE id = ?').run(JSON.stringify(gate), id);
+    insertTask(store, { id: reviewId, title: `review: ${id} (${t.title})`, body: reviewBody, podRole: checker });
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { reviewTaskId: reviewId };
+}
+
+// Checker's verdict — the ONLY way to close a gatted task as done.
+// pass: close 'done' (finished) + clear the gate. reject: the task goes back
+// to 'queued' for the owner to rework (re-gate later); the gate is cleared
+// with the verdict recorded (audit in the gate JSON).
+export function resolveReviewGate(store: Store, id: string, verdict: 'passed' | 'rejected', by: string, reason?: string): Task {
+  const db = dbOf(store);
+  const t = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | undefined;
+  if (!t) throw new Error(`no task: ${id}`);
+  const gate = pendingGate(t);
+  if (!gate) throw new Error(`task ${id} has no pending gate`);
+  const now = nowIso();
+  const cleared: TaskGate = { status: 'cleared', checker: gate.checker, set_at: gate.set_at, cleared_at: now, verdict, reason: reason || undefined };
+  const clearedJson = JSON.stringify(cleared);
+  db.exec('BEGIN');
+  try {
+    if (verdict === 'passed') {
+      const closed: Closure = { reason: 'finished', at: now, by };
+      const closedJson = JSON.stringify(closed);
+      db.prepare('UPDATE tasks SET status = ?, closed = ?, finished_at = ?, gate = ? WHERE id = ?').run('done', closedJson, now, clearedJson, id);
+      db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, closed, ts) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(id, t.status, 'done', 'finished', closedJson, now);
+    } else {
+      if (!TASK_FLOW[t.status]?.includes('queued')) {
+        throw new Error(`bad task transition: ${t.status} -> queued (gate reject)`);
+      }
+      db.prepare('UPDATE tasks SET status = ?, gate = ? WHERE id = ?').run('queued', clearedJson, id);
+      db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, ?, ?, ?, ?)')
+        .run(id, t.status, 'queued', `gate rejected by ${by}`, now);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return getTask(store, id)!;
 }
 
 // ---------- events (C5) ----------

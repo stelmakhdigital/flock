@@ -34,7 +34,7 @@ npm run build
 ## Единый путь мутаций
 
 Все изменения — через `apply(op)` в core: один writer (node:sqlite), один
-`OP_REGISTRY` (34 ops: `flock ops ls`), один аудит (event-лог +
+`OP_REGISTRY` (57 ops: `flock ops ls`), один аудит (event-лог +
 `task_transitions` + `runs.meta`). CLI, тики (arbiter/watchdog/escalation),
 pm и MCP `tools/call` — все идут через тот же путь. Под-токены ограничены
 `pod`-scoped ops (свои задачи, свой inbox, свой под).
@@ -71,6 +71,25 @@ pm и MCP `tools/call` — все идут через тот же путь. По
 `blocked`/`needs` — НЕ терминальные: под всё ещё «держит горячую картошку»,
 а stuck-детекция — на watchdog/лестнице эскалаций (автоматических повторов
 нет — scribe model ниже).
+
+## Review gate: owner → checker (first-class, через очередь/ops)
+
+Owner-шаг не закрывается, пока checker-шаг (отдельный под) не выдал
+вердикт. Гейт — в ops-слое, не в промптах: пока гейт pending, `task done`
+i `task handoff` на таске **отклоняются** (409) — обход через guidance
+невозможен.
+
+```sh
+flock task gate <id> <checker>              # owner: гейт + review-таск у checker (одна транзакция)
+flock task verdict <id> pass                # checker: таск закрывается done (finished)
+flock task verdict <id> reject "нет тестов"  # checker: таск возвращается в queued на доработку (re-gate позже)
+```
+
+- Review-таск уходит checker'у в обычную очередь (arbiter claim'ит как
+  любую задачу); вердикт может выдать только назначенный checker (pod-
+  токен) или оператор; `blocked`/`needs` гейтом не ограничены (hot-potato
+  не меняется). Аудит: `task_transitions` + gate-JSON в таске
+  (`pending`/`cleared` + verdict).
 
 ## Inboxes / outboxes: durable-сообщения
 

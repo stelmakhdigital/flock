@@ -189,6 +189,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   task_cancel: { group: 'task', scopes: ['operator', 'pod'], summary: 'cancel a task (pod token: pm only)', run: async (o, c) => { requireCoordinator(c, 'task_cancel'); await pmNotifyMaybe(c, 'task_cancelled', o, 'cancelled'); return taskReport(o, c, 'cancelled'); } },
   task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod or pm)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
   task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'close a task (C3 hot-potato: {reason, target?} from the closure vocabulary)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
+  task_gate: { group: 'task', scopes: ['operator', 'pod'], summary: 'set an owner→checker review gate on an active task (the checker receives a review task; the task cannot close as done before the verdict)', run: (o, c) => taskGate(o, c) },
+  task_verdict: { group: 'task', scopes: ['operator', 'pod'], summary: 'checker verdict on a review gate (pass: close done; reject: back to queued for rework)', run: (o, c) => taskVerdict(o, c) },
   task_handoff: { group: 'task', scopes: ['operator', 'pod'], summary: 'transactional handoff: close (handed-off) + create the successor at {to}', run: (o, c) => taskHandoff(o, c) },
   // -- messages (C4: inboxes + outboxes) ---------------------------------
   message_send: { group: 'message', scopes: ['operator', 'pod'], summary: 'send a durable message to a pod inbox (+ poke if live; from = caller pod or operator)', run: (o, c) => messageSend(o, c) },
@@ -1267,6 +1269,12 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
   assertTaskScope(ctx, task.pod_role, 'task report');
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
   if (to === 'done') {
+    // review gate: a gatted task cannot be closed as done by anyone but the
+    // checker's verdict (task_verdict) — enforced here, not in prompts
+    const g = store.pendingGate(task);
+    if (g) {
+      throw new OpError(409, `task ${id} is under review gate (checker: ${g.checker}) — close it with: flock task verdict ${id} pass|reject`);
+    }
     // C3: hot-potato — a done task must carry its closure (reason from the
     // vocabulary; target for handed-off/escalated)
     const reason = String(op.reason ?? '').trim();
@@ -1386,6 +1394,11 @@ async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   }
 
   if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad target role: ${to}`);
+  // review gate: a gatted task cannot be handed off before the verdict
+  const gGate = store.pendingGate(task);
+  if (gGate) {
+    throw new OpError(409, `task ${id} is under review gate (checker: ${gGate.checker}) — resolve it first: flock task verdict ${id} pass|reject`);
+  }
   const targetPod = store.getPodByRole(ctx.store, to);
   if (!targetPod) throw new OpError(404, `no pod: ${to} (spawn it first)`);
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
@@ -1396,6 +1409,59 @@ async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   } catch (e) {
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
+}
+
+// review gate: the owner submits the active task for review by a SEPARATE
+// checker pod. One transaction (store.openReviewGate): gate row + the
+// checker's review task in the ordinary queue (the arbiter claims it like
+// any task — the gate goes through queue/ops, not prompts).
+function taskGate(op: Record<string, unknown>, ctx: CoreCtx): unknown {
+  const id = String(op.id ?? '');
+  const checker = String(op.checker ?? '').trim();
+  const task = store.getTask(ctx.store, id);
+  if (!task) throw new OpError(404, `no task: ${id}`);
+  assertTaskScope(ctx, task.pod_role, 'set a review gate');
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(checker)) throw new OpError(400, `bad checker role: ${checker}`);
+  if (checker === task.pod_role) throw new OpError(400, `checker must be a separate pod (task belongs to ${task.pod_role})`);
+  if (!store.getPodByRole(ctx.store, checker)) throw new OpError(404, `no pod: ${checker} (spawn it first)`);
+  if (task.status !== 'active') throw new OpError(409, `gate needs an active task (task is ${task.status})`);
+  const by = op.registeredBy ? String(op.registeredBy) : (ctx.caller?.kind === 'pod' ? ctx.caller.role : 'cli');
+  try {
+    const { reviewTaskId } = store.openReviewGate(ctx.store, id, checker, by);
+    ctx.emit?.({ type: 'task_gated', taskId: id, checker, reviewTaskId });
+    return { task: store.getTask(ctx.store, id), reviewTask: store.getTask(ctx.store, reviewTaskId) };
+  } catch (e) {
+    throw new OpError(409, e instanceof Error ? e.message : String(e));
+  }
+}
+
+// The checker's verdict — the only way to close a gatted task as done.
+function taskVerdict(op: Record<string, unknown>, ctx: CoreCtx): unknown {
+  const id = String(op.id ?? '');
+  const verdict = String(op.verdict ?? '').trim();
+  const task = store.getTask(ctx.store, id);
+  if (!task) throw new OpError(404, `no task: ${id}`);
+  const gate = store.pendingGate(task);
+  if (!gate) throw new OpError(409, `task ${id} has no pending gate`);
+  // pod token: only the designated checker pod; the operator is unrestricted
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== gate.checker) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: verdict belongs to the checker pod (${gate.checker})`);
+  }
+  if (verdict === 'pass') {
+    const by = ctx.caller?.kind === 'pod' ? gate.checker : 'cli';
+    const t = store.resolveReviewGate(ctx.store, id, 'passed', by);
+    ctx.emit?.({ type: 'task_gate_verdict', taskId: id, verdict: 'passed', by });
+    advanceWorkflow(ctx, id);
+    return t;
+  }
+  if (verdict === 'reject') {
+    const reason = String(op.reason ?? '').trim() || 'rejected by review';
+    const by = ctx.caller?.kind === 'pod' ? gate.checker : 'cli';
+    const t = store.resolveReviewGate(ctx.store, id, 'rejected', by, reason);
+    ctx.emit?.({ type: 'task_gate_verdict', taskId: id, verdict: 'rejected', by, reason });
+    return t;
+  }
+  throw new OpError(400, `bad verdict: ${verdict} (want pass|reject)`);
 }
 
 // ---------- messages (C4) ----------
