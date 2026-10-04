@@ -191,7 +191,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod or pm)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
   task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'close a task (C3 hot-potato: {reason, target?} from the closure vocabulary)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
   task_gate: { group: 'task', scopes: ['operator', 'pod'], summary: 'set an owner→checker review gate on an active task (the checker receives a review task; the task cannot close as done before the verdict)', run: (o, c) => taskGate(o, c) },
-  task_verdict: { group: 'task', scopes: ['operator', 'pod'], summary: 'checker verdict on a review gate (pass: close done; reject: back to queued for rework)', run: (o, c) => taskVerdict(o, c) },
+  task_verdict: { group: 'task', scopes: ['operator', 'pod'], summary: 'checker verdict on a review gate (pass: close done; reject: back to queued for rework)', run: async (o, c) => { if (o.verdict === 'pass') await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskVerdict(o, c); } },
   task_handoff: { group: 'task', scopes: ['operator', 'pod'], summary: 'transactional handoff: close (handed-off) + create the successor at {to}', run: (o, c) => taskHandoff(o, c) },
   // -- messages (C4: inboxes + outboxes) ---------------------------------
   message_send: { group: 'message', scopes: ['operator', 'pod'], summary: 'send a durable message to a pod inbox (+ poke if live; from = caller pod or operator)', run: (o, c) => messageSend(o, c) },

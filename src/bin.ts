@@ -70,7 +70,7 @@ const USAGE = `flock — core CLI
   flock task needs <id> [reason...]
   flock task handoff <id> <to-role>
   flock task gate <id> <checker-role>       # owner→checker review gate (task не закрывается до вердикта)
-  flock task verdict <id> <pass|reject> [reason...]   # transactional: close (handed-off) + successor у to
+  flock task verdict <id> <pass|reject> [reason...]   # review-gate-вердикт: pass: таск → done; reject: → queued на переделку
   flock task cancel <id>
   flock events tail [--since N]        # event-лог (SSE, live)
   flock message send <role> <text...>   # durable-сообщение в inbox (+ poke живому)
