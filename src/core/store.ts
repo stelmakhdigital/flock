@@ -325,6 +325,35 @@ ALTER TABLE tasks ADD COLUMN closed TEXT;
 ALTER TABLE task_transitions ADD COLUMN closed TEXT;
 `,
   },
+  {
+    // C4: inboxes + outboxes — the coordination plane. inboxes: the pod's
+    // durable mailbox (claimed = read-by-owner). outboxes: the sender-side
+    // record (pending = still not forwarded, C15 cross-profile sends).
+    // ponytail: OpenRIG's `streams` (append-only intake log) is NOT built
+    // in v1 — the C5 event log already plays the typed intake role; the
+    // table appears together with a concrete untyped source (YAGNI).
+    name: '018_inboxes',
+    sql: `
+CREATE TABLE IF NOT EXISTS inboxes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  from_ TEXT NOT NULL,
+  "to" TEXT NOT NULL,
+  text TEXT NOT NULL,
+  claimed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS inboxes_to_idx ON inboxes("to", claimed, id);
+CREATE TABLE IF NOT EXISTS outboxes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  from_ TEXT NOT NULL,
+  "to" TEXT NOT NULL,
+  text TEXT NOT NULL,
+  pending INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS outboxes_pending_idx ON outboxes(pending, id);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -756,6 +785,72 @@ export function handoffTask(
     throw e;
   }
   return { from: getTask(store, id)!, to: getTask(store, succId)! };
+}
+
+// ---------- inboxes / outboxes (C4) ----------
+
+export interface InboxMessage {
+  id: number;
+  at: string;
+  from_: string;
+  to: string;
+  text: string;
+  claimed: number;
+}
+
+export interface OutboxMessage {
+  id: number;
+  at: string;
+  from_: string;
+  to: string;
+  text: string;
+  pending: number;
+}
+
+export function insertInboxMessage(
+  store: Store,
+  m: { from: string; to: string; text: string; pending?: number },
+): { inboxId: number; outboxId: number } {
+  const db = dbOf(store);
+  const now = nowIso();
+  db.exec('BEGIN');
+  try {
+    const ir = db.prepare('INSERT INTO inboxes(at, from_, "to", text) VALUES (?, ?, ?, ?)').run(now, m.from, m.to, m.text);
+    const or = db.prepare('INSERT INTO outboxes(at, from_, "to", text, pending) VALUES (?, ?, ?, ?, ?)').run(now, m.from, m.to, m.text, m.pending ? 1 : 0);
+    db.exec('COMMIT');
+    return { inboxId: Number(ir.lastInsertRowid), outboxId: Number(or.lastInsertRowid) };
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+export function listInboxMessages(store: Store, to: string, unclaimedOnly = false, limit = 50): InboxMessage[] {
+  const sql = unclaimedOnly
+    ? 'SELECT id, at, from_ AS from_, "to" AS "to", text, claimed FROM inboxes WHERE "to" = ? AND claimed = 0 ORDER BY id DESC LIMIT ?'
+    : 'SELECT id, at, from_ AS from_, "to" AS "to", text, claimed FROM inboxes WHERE "to" = ? ORDER BY id DESC LIMIT ?';
+  return dbOf(store).prepare(sql).all(to, limit) as unknown as InboxMessage[];
+}
+
+export function markInboxClaimed(store: Store, id: number, to: string): void {
+  dbOf(store)
+    .prepare('UPDATE inboxes SET claimed = 1 WHERE id = ? AND "to" = ? AND claimed = 0')
+    .run(id, to);
+}
+
+export function getInboxMessage(store: Store, id: number): InboxMessage | null {
+  const r = dbOf(store).prepare('SELECT id, at, from_ AS from_, "to" AS "to", text, claimed FROM inboxes WHERE id = ?').get(id) as InboxMessage | undefined;
+  return r ?? null;
+}
+
+export function listPendingOutboxMessages(store: Store, limit = 100): OutboxMessage[] {
+  return dbOf(store)
+    .prepare('SELECT id, at, from_ AS from_, "to" AS to, text, pending FROM outboxes WHERE pending = 1 ORDER BY id ASC LIMIT ?')
+    .all(limit) as unknown as OutboxMessage[];
+}
+
+export function markOutboxForwarded(store: Store, id: number): void {
+  dbOf(store).prepare('UPDATE outboxes SET pending = 0 WHERE id = ?').run(id);
 }
 
 // ---------- workflows (multi-step pipelines over the task queue) ----------

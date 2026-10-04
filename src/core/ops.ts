@@ -114,6 +114,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
   task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'close a task (C3 hot-potato: {reason, target?} from the closure vocabulary)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
   task_handoff: { group: 'task', scopes: ['operator', 'pod'], summary: 'transactional handoff: close (handed-off) + create the successor at {to}', run: (o, c) => taskHandoff(o, c) },
+  // -- messages (C4: inboxes + outboxes) ---------------------------------
+  message_send: { group: 'message', scopes: ['operator', 'pod'], summary: 'send a durable message to a pod inbox (+ poke if live; from = caller pod or operator)', run: (o, c) => messageSend(o, c) },
+  message_list: { group: 'message', scopes: ['operator', 'pod'], summary: 'list inbox messages (pod token: own inbox; {unclaimed?})', run: (o, c) => messageList(o, c) },
+  message_claim: { group: 'message', scopes: ['operator', 'pod'], summary: 'mark an inbox message claimed (pod token: own inbox only)', run: (o, c) => messageClaim(o, c) },
   task_blocked: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task blocked (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_blocked', o, 'blocked'); return taskReport(o, c, 'blocked'); } },
   task_needs: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task needs help (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_needs', o, 'needs'); return taskReport(o, c, 'needs'); } },
   // -- pm / goal loop ---------------------------------------------------------
@@ -745,6 +749,73 @@ async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   } catch (e) {
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
+}
+
+// ---------- messages (C4) ----------
+
+// message_send: the durable coordination primitive. The inbox row is the
+// record (survives restarts); the pane poke is a best-effort wake-up through
+// the same verified transport as pod_send (a dead target keeps the message
+// in its inbox — it is never lost).
+async function messageSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const to = String(op.to ?? '').trim();
+  const text = String(op.text ?? '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad target role: ${to}`);
+  if (!text) throw new OpError(400, 'text required');
+  const targetPod = store.getPodByRole(ctx.store, to);
+  if (!targetPod) throw new OpError(404, `no pod: ${to} (spawn it first)`);
+  const from = ctx.caller?.kind === 'pod' ? ctx.caller.role : 'operator';
+  // pod token: can only address other pods (own inbox is pointless)
+  if (ctx.caller?.kind === 'pod' && to === ctx.caller.role) {
+    throw new OpError(400, `cannot message your own pod: ${to} (read your inbox with message_list)`);
+  }
+  const { inboxId, outboxId } = store.insertInboxMessage(ctx.store, { from, to, text });
+  ctx.emit?.({ type: 'message_sent', from, to, inboxId, outboxId });
+  // delivery: poke the target through the verified transport (best-effort)
+  let poked: boolean | 'target-not-live' | 'failed' = false;
+  if (targetPod.state === 'live') {
+    try {
+      await apply(
+        { type: 'pod_send', role: to, text: `[flock-message from ${from}]\n${text}` },
+        ctx,
+      );
+      poked = true;
+    } catch {
+      poked = 'failed'; // the inbox row already committed; the message is durable
+    }
+  } else {
+    poked = 'target-not-live';
+  }
+  return { ok: true, inboxId, outboxId, poked };
+}
+
+async function messageList(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  // pod token: own inbox only; operator: any pod's inbox (or all unclaimed)
+  const to = ctx.caller?.kind === 'pod' ? ctx.caller.role : (String(op.to ?? '').trim() || null);
+  if (to && !/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad role: ${to}`);
+  const unclaimed = op.unclaimed === true || op.unclaimed === 'true';
+  const limit = Math.max(1, Math.min(500, Number(op.limit ?? 50)));
+  const messages = to
+    ? store.listInboxMessages(ctx.store, to, unclaimed, limit)
+    : (() => { // operator without {to}: unclaimed across all pods
+        const pods = store.listPods(ctx.store);
+        const all: store.InboxMessage[] = [];
+        for (const p of pods) all.push(...store.listInboxMessages(ctx.store, p.role, true, limit));        return all.sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, limit);
+      })();
+  return { to: to ?? '(all)', messages };
+}
+
+async function messageClaim(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = Number(op.id ?? 0);
+  if (!Number.isInteger(id) || id <= 0) throw new OpError(400, 'id required (inbox message id)');
+  const msg = store.getInboxMessage(ctx.store, id);
+  if (!msg) throw new OpError(404, `no inbox message: ${id}`);
+  if (ctx.caller?.kind === 'pod' && msg.to !== ctx.caller.role) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: message ${id} belongs to pod ${msg.to}`);
+  }
+  store.markInboxClaimed(ctx.store, id, msg.to);
+  ctx.emit?.({ type: 'message_claimed', id, to: msg.to });
+  return { ok: true, id, to: msg.to };
 }
 
 // ---------- team ----------

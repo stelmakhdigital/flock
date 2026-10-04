@@ -65,6 +65,9 @@ const USAGE = `flock — core CLI
   flock task needs <id> [reason...]
   flock task handoff <id> <to-role>   # transactional: close (handed-off) + successor у to
   flock task cancel <id>
+  flock message send <role> <text...>   # durable-сообщение в inbox (+ poke живому)
+  flock message ls [role] [--unclaimed] [--all]
+  flock message claim <id>
   flock task unblock <id>               # blocked → queued (arbiter возьмёт заново)
   flock workflow define <name> --steps "id1:role1,id2:role2"
   flock workflow rm <name>
@@ -239,6 +242,37 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'esc_ack', id }));
       } else {
         console.log('usage: flock esc ls [--all] | flock esc ack <id>');
+      }
+      return;
+    }
+
+    case 'message': {
+      // C4: inboxes + outboxes — durable pod↔pod/operator messages
+      if (sub === 'send') {
+        const role = rest[0];
+        const text = rest.slice(1).join(' ');
+        if (!role || !text) {
+          console.error('usage: flock message send <role> <text...>');
+          process.exit(1);
+        }
+        print(await api('POST', '/api/ops', { type: 'message_send', to: role, text }));
+      } else if (sub === 'ls') {
+        const role = rest.find((r) => !r.startsWith('-'));
+        print(await api('POST', '/api/ops', {
+          type: 'message_list',
+          to: role,
+          unclaimed: rest.includes('--unclaimed'),
+          limit: rest.includes('--all') ? 500 : 50,
+        }));
+      } else if (sub === 'claim') {
+        const id = rest[0];
+        if (!id) {
+          console.error('usage: flock message claim <id>');
+          process.exit(1);
+        }
+        print(await api('POST', '/api/ops', { type: 'message_claim', id: Number(id) }));
+      } else {
+        console.log('usage: flock message send <role> <text...> | ls [role] [--unclaimed] [--all] | claim <id>');
       }
       return;
     }
