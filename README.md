@@ -427,6 +427,24 @@ flock plugins ls
 flock plugins show <source>               # entry + SKILL.md/README (≤4KB)
 ```
 
+## Discover / adopt: живые tmux-сессии без перезапуска
+
+Уже запущенная сессия (pi/bash/что угодно в tmux-панели) прикрепляется к
+core как под — **без перезапуска**: `tmux break-pane` переносит панель
+вместе с process-tree в окно core `flock-<role>`.
+
+```sh
+flock pod discover             # live-панели вне core: %id  session:win.pane  cmd  pid  cwd
+flock pod adopt <role> <pane> [--dir d]
+flock pod close <role>         # как обычно: убивает окно (и процесс!)
+```
+
+- Adopted-под — `cmd`-под: трекается pid-liveness'ом (runkeeper),
+  claim/send/capture/close работают как обычно; **resume-источника нет**
+  (агента не знает — честно: adopted-сессию core не перезапускает).
+- Запреты: повторный adopt живого пода (409), мёртвая панель (404),
+  панель уже в core-сессии (400).
+
 ## Multi-flock (profiles)
 
 Несколько изолированных core-инстансов:

@@ -173,6 +173,61 @@ export async function killWindow(role: string): Promise<void> {
   await tmux(['kill-window', '-t', winTarget(role)]);
 }
 
+// ---------- discover / adopt (attach a live pane without restart) ----------
+
+export interface PaneInfo {
+  paneId: string;
+  target: string; // session:window.pane
+  session: string;
+  pid: number | null;
+  cmd: string;
+  cwd: string;
+}
+
+const PANE_FMT = ['#{pane_id}', '#{session_name}:#{window_index}.#{pane_index}', '#{session_name}', '#{pane_pid}', '#{pane_current_command}', '#{pane_current_path}'].join('\n');
+
+function parsePane(line: string): PaneInfo | null {
+  const [paneId, target, session, pid, cmd, cwd] = line.split('\n');
+  if (!paneId || !paneId.startsWith('%')) return null;
+  return { paneId, target, session, pid: Number(pid) || null, cmd: cmd ?? '', cwd: cwd ?? '' };
+}
+
+// A single pane by id (%N) or target (session:win.pane). null = no live pane.
+export async function paneInfo(ref: string): Promise<PaneInfo | null> {
+  const r = await tmux(['display-message', '-p', '-t', ref, PANE_FMT]);
+  if (r.code !== 0 || !r.out.trim()) return null;
+  return parsePane(r.out.replace(/\n+$/, ''));
+}
+
+// All panes of ALL sessions (discover: candidates outside the core session).
+export async function listAllPanes(): Promise<PaneInfo[]> {
+  const r = await tmux(['list-panes', '-a', '-F', PANE_FMT]);
+  if (r.code !== 0) return [];
+  const out: PaneInfo[] = [];
+  // panes are separated by the pane_id line starting with '%'
+  const blocks = r.out.split(/\n(?=%)/);
+  for (const b of blocks) {
+    const p = parsePane(b);
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+// Move the pane INTO the core session as the pod's window (flock-<role>).
+// tmux break-pane transfers the pane with its process tree into a new window
+// in the target session — NO restart. A single-pane source window closes by
+// itself; multi-pane sources keep their other panes.
+export async function movePaneToPodWindow(paneId: string, role: string): Promise<void> {
+  await ensureSession();
+  const r = await tmux(['break-pane', '-s', paneId, '-n', winName(role), '-t', TMUX_SESSION]);
+  if (r.code !== 0) throw new Error(`tmux break-pane failed: ${r.err.trim()}`);
+  await tmux(['set-option', '-w', '-t', winTarget(role), 'automatic-rename', 'off']);
+  const names = (await tmux(['list-windows', '-t', TMUX_SESSION, '-F', '#{window_name}'])).out;
+  if (!names.trim().split('\n').includes(winName(role))) {
+    throw new Error('tmux break-pane: pod window not found after the move');
+  }
+}
+
 export async function paneAlive(role: string): Promise<boolean> {
   const r = await tmux(['list-panes', '-t', winTarget(role), '-F', '#{pane_dead}']);
   return r.code === 0 && r.out.trim() === '0';

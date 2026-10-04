@@ -32,6 +32,8 @@ const USAGE = `flock — core CLI
       pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
   flock pod relaunch <role> [--model M] [--fork [role]] [--profile P] [--fresh]   # --fork (без аргумента) = форк своей сессии; --fresh = явный чистый старт (C6)
   flock pod spawn <role> [--agent X] [--profile P]   # профиль манифеста (override-set)
+  flock pod discover                                 # live tmux-панели вне core (кандидаты на adopt)
+  flock pod adopt <role> <pane> [--dir d]            # прицепить живую сессию к core без перезапуска
   flock pod resume-token <role> <file|reset>   # зафиксировать сессию для resume (иначе — последняя)
   flock pod status [role]
   flock pod send <role> <text...>
@@ -198,6 +200,29 @@ async function main(): Promise<void> {
     case 'pod': {
       const action = sub;
       const role = rest[0];
+      if (action === 'discover') {
+        // local read: list live panes outside the core session (adopt candidates)
+        const { listAllPanes, TMUX_SESSION } = await import('./core/terminal.js');
+        const panes = (await listAllPanes()).filter((p) => p.session !== TMUX_SESSION);
+        if (!panes.length) {
+          console.log(`(no panes outside the core session ${TMUX_SESSION})`);
+          return;
+        }
+        for (const p of panes) {
+          console.log(`${p.paneId}  ${p.target}  ${p.cmd}  pid=${p.pid ?? '-'}  ${p.cwd}`);
+        }
+        console.log(`adopt: flock pod adopt <role> <pane-id> [--dir d]`);
+        return;
+      }
+      if (action === 'adopt') {
+        const flags = rest.slice(2);
+        if (!role || !rest[1]) {
+          console.error('usage: flock pod adopt <role> <pane> [--dir d]   (pane from: flock pod discover)');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'pod_adopt', role, pane: rest[1], dir: flag(flags, '--dir') }));
+        return;
+      }
       if (action === 'spawn') {
         const flags = rest.slice(1);
         print(await api('POST', '/api/ops', {

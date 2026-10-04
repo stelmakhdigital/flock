@@ -145,6 +145,7 @@ export interface OpDef {
 export const OP_REGISTRY: Record<string, OpDef> = {
   // -- pods -----------------------------------------------------------------
   pod_spawn: { group: 'pod', scopes: ['operator', 'pod'], summary: 'spawn a pod (agent manifest, plain-dir; git is owned by the agents; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_spawn'); return podSpawn(o, c); } },
+  pod_adopt: { group: 'pod', scopes: ['operator', 'pod'], summary: 'adopt a live tmux pane as a pod (move it into the core session, no restart; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_adopt'); return podAdopt(o, c); } },
   pod_relaunch: { group: 'pod', scopes: ['operator', 'pod'], summary: 'new run on the same pod (honest resume, --fork; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_relaunch'); return podRelaunch(o, c); } },
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
   team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
@@ -459,6 +460,54 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 // pod. pi (v3.1): HONEST resume — the exact persisted session file is
 // relaunched (--session <file>), never an interactive picker; a missing file
 // is attention_required (recorded in the run meta, never silent; C6). bash: fresh window.
+
+// adopt: attach an ALREADY RUNNING tmux pane to the core as a pod, without
+// restart. The pane is moved into the core session (tmux move-pane transfers
+// the process tree — nothing is re-launched) and registered as a 'cmd' pod:
+// tracked by pid liveness, claim/send/capture/close work as usual, but there
+// is no agent manifest to resume from (honest: an adopted session is not
+// re-launchable by the core).
+async function podAdopt(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const ref = String(op.pane ?? '').trim();
+  if (!ref) throw new OpError(400, 'pane required (e.g. %12 or other:0.1 — `flock pod discover` lists them)');
+  const existing = store.getPodByRole(ctx.store, role);
+  if (existing && existing.state !== 'closed') {
+    throw new OpError(409, `pod ${role} already ${existing.state}`);
+  }
+  const info = await terminal.paneInfo(ref);
+  if (!info) throw new OpError(404, `no live pane: ${ref}`);
+  if (info.session === terminal.TMUX_SESSION) {
+    throw new OpError(400, `pane ${info.paneId} is already in the core session (${info.session}) — use pod spawn/relaunch`);
+  }
+  if (await terminal.windowExists(role)) {
+    throw new OpError(409, `pod window already exists: ${terminal.winTarget(role)} (close the pod first: flock pod close ${role})`);
+  }
+  const dir = String(op.dir ?? (info.cwd || path.join(ctx.store.home, 'pods', role)));
+  try {
+    await terminal.movePaneToPodWindow(info.paneId, role);
+  } catch (e) {
+    throw new OpError(409, `adopt failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  store.openPod(ctx.store, {
+    id: existing?.id ?? store.newId('pod'),
+    role,
+    dir,
+    terminalTarget: terminal.winTarget(role),
+    model: null,
+    agent: 'cmd', // tracked by pid liveness; no resume source (honest)
+  });
+  const cur = store.currentRun(ctx.store, role);
+  if (cur && !cur.ended_at) store.endRun(ctx.store, cur.id, 'replaced');
+  const run = store.insertRun(ctx.store, {
+    id: store.newId('run'),
+    podRole: role,
+    pid: info.pid,
+    meta: { kind: 'adopted', source: info.target, pane: info.paneId, cmd: info.cmd },
+  });
+  ctx.emit?.({ type: 'pod_adopted', role, source: info.target, pane: info.paneId });
+  return { pod: store.getPodByRole(ctx.store, role), run, source: info.target };
+}
 const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'pi-bridge.js') });
 
 // Resolve the adapter for a stored pod (manifest -> runtime -> adapter) and
