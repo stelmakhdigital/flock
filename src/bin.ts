@@ -69,6 +69,7 @@ const USAGE = `flock — core CLI
   flock message send <role> <text...>   # durable-сообщение в inbox (+ poke живому)
   flock message ls [role] [--unclaimed] [--all]
   flock message claim <id>
+  flock mcp serve                         # stdio JSON-RPC (MCP): tools = OP_REGISTRY (C9)
   flock task unblock <id>               # blocked → queued (arbiter возьмёт заново)
   flock workflow define <name> --steps "id1:role1,id2:role2"
   flock workflow rm <name>
@@ -173,6 +174,16 @@ async function main(): Promise<void> {
       else console.log(USAGE);
       return;
 
+    case 'mcp': {
+      // C9: stdio JSON-RPC MCP server — tools = OP_REGISTRY, zero-dep
+      if (sub === 'serve') {
+        const { mcpServe } = await import('./core/mcp.js');
+        await mcpServe();
+      } else {
+        console.log('usage: flock mcp serve   # stdio JSON-RPC (MCP), tools = OP_REGISTRY');
+      }
+      return;
+    }
     case 'healthz': {
       const h = await healthz();
       print(h.body);
