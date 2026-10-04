@@ -99,7 +99,7 @@ instance останавливается. DAG/зависимости/retry — п
 
 **Агент-адаптеры** — manifest-driven: один generic-реализатор + декларация
 `{id, command, runtime?, modelFlag?, args?, env?, guidance?, firstPrompt?,
-imports?, profiles?}`. Встроенные: `pi`, `bash`, `claude`, `pm`;
+imports?, profiles?}`. Встроенные: `pi`, `bash`, `claude`, `codex`, `pm`;
 свой рантайм = `<FLOCK_HOME>/agents/<id>.json` (не код). `imports` —
 наследование фрагментов манифестов (merge: скаляры — потомок, args —
 конкатенация, env/guidance — по ключу/id); `profiles` — per-spawn override
@@ -175,8 +175,8 @@ trust/resume/fork-решения; hermetic-тест `npm test`) +
 Запуск рантайма — через 5-методный **RuntimeAdapter**:
 `listInstalled / project / deliverStartup / launchHarness / checkReady`.
 Адаптеры: **pi** (RPC-мост, typed session identity), **claude** (Claude Code
-TUI, transcript-сессии), **bash** (plain window). Новый рантайм
-= адаптер + manifest (`runtime` в JSON).
+TUI, transcript-сессии), **codex** (exec-мост, thread-сессии), **bash**
+(plain window). Новый рантайм = адаптер + manifest (`runtime` в JSON).
 
 - **launch posture**: `pod spawn --posture full_bypass` форсирует полный
   bypass (pi: trust+approve; claude: `--permission-mode bypassPermissions`,
@@ -215,6 +215,37 @@ TUI, transcript-сессии), **bash** (plain window). Новый рантай�
 ./bin/flock pod relaunch ctest --fork               # форк своей сессии
 ```
 
+## Codex-под (этап 5.5)
+
+- **Почему не TUI**: codex TUI — клиент общего app-server демона
+  (C-c = «отключиться», работа продолжается в демоне; trust-персистентность
+  ломается при рестарте демона — всё live-наблюдено). Поэтому pod работает
+  через **exec-мост** (`codex-bridge.js`, аналог pi-runner): `codex exec --json`
+  на ход, сессия продолжается через `exec resume <thread>` / `exec fork <thread>`.
+- **Изоляция**: `CODEX_HOME=<pod>/.codex`; `config.toml` проецируется
+  адаптером (approval `never`, sandbox `danger-full-access`, provider →
+  in-core **responses-шим**).
+- **Шим** (`FLOCK_PORT+11`, 127.0.0.1, в core): codex шлёт системный промпт
+  как `developer`-сообщение в `input`, а vLLM этот role не принимает
+  (`Unexpected message role.`) — шим сливает developer в `instructions` и
+  проксирует остальное как есть (streaming включительно).
+  Upstream: `FLOCK_CODEX_UPSTREAM` (default `http://192.168.1.114:8000`).
+- **Сессия = thread id (UUID v7)** — создаётся на ПЕРВОМ ходе (sidecar
+  `sessionId`); relaunch (pm-intent) = честный `exec resume <thread>`;
+  operator-relaunch / `--fork` = `exec fork <thread>` (fork-правило: новый
+  thread, parent не трогается; mост отказывает, если codex вернул parent).
+  Тread'а нет → ошибка на первом ходе (честно в панели).
+- **Сигналы — те же, что у pi**: sidecar (ready/streaming/lastPrompt/exited),
+  flockmsg v2 + nonce-ack, foreground-guard в runkeeper; usage-события из
+  `turn.completed` уходят в общий usage-пайплайн.
+- **Built-in `codex`**: модель — `--model` или bare id из models.json.
+
+```sh
+./bin/flock pod spawn cxdemo --agent codex --model qwen3.8-27b-fp8
+./bin/flock pod send cxdemo "..."            # ack = sidecar nonce
+./bin/flock pod relaunch cxdemo              # форк своего thread (память сохраняется)
+```
+
 ## Runtime-agnostic signal contract
 
 Core больше не знает, какой рантайм под окном. Три утечки (runkeeper-ветка
@@ -226,16 +257,20 @@ Core больше не знает, какой рантайм под окном. 
   run?». reason попадает в `runs.exit_state` (форма прежняя: `clean` /
   `crashed(...)`; core считает `crashed…` крахом + pm-уведомление). pi:
   typed sidecar exit (launchId-scoped) + foreground-guard; claude:
-  foreground-guard (pane на shell = TUI умер). Метода нет → общий pid-check
+  foreground-guard (pane на shell = TUI умер); codex: те же typed sidecar +
+  foreground-guard (мост — foreground панели). Метода нет → общий pid-check
   (bash/cmd).
 - **`sendVerified(binding, text) → {ok, attempts, ack, detail?}`** —
   «доставь и докажи». pi: flockmsg v2 + ack по sidecar nonce; claude: raw
-  paste + рост transcript. Метода нет → legacy visual probe.
+  paste + рост transcript; codex: flockmsg v2 + ack по sidecar nonce
+  (ack при enqueue в мост). Метода нет → legacy visual probe.
 - **`healthProbe(binding) → {ready, busy, lastActivityAt?, gate?}`** —
   «что агент делает?». pi: sidecar ready/streaming/lastPrompt.at + gate из
   activity log (`channel: 'answer'`); claude: склейн панели + mtime
   transcript + `detectClaudeGate` (permission-промпт; idle-footer — НЕ
-  gate; `channel: 'attach'` — отвечать tmux attach, а не `flock pod answer`).
+  gate; `channel: 'attach'` — отвечать tmux attach, а не `flock pod
+  answer`); codex: только sidecar (у `codex exec` нет интерактивных
+  диалогов — approval never, gate всегда отсутствует).
   Метода нет → health для пода пропускается.
 
 Правило «gate жив только для текущего run» (`gate.at >= run.started_at`)

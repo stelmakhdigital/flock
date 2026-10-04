@@ -107,6 +107,10 @@ export const BUILTIN_AGENTS: Record<string, AgentManifest> = {
     // the local model accepts xhigh/medium/low effort; "high" -> 500
     args: ['--effort', 'medium'],
   },
+  // codex-cli: pane-hosted exec bridge (codex-bridge.js); the model provider
+  // is projected into the pod CODEX_HOME config.toml by the codex adapter
+  // (in-core responses shim -> vLLM, FLOCK_CODEX_UPSTREAM, default below).
+  codex: { id: 'codex', command: 'codex', runtime: 'codex' },
   // goal-loop lead: wakes on triggers, issues typed intents (whitelist) via the CLI
   pm: {
     id: 'pm',

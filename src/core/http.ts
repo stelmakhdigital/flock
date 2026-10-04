@@ -86,6 +86,7 @@ export function createHttp(ctx: CoreCtx) {
       home: ctx.store.home,
       token: ctx.store.token,
       runnerPath: path.join(import.meta.dirname, 'runner.js'),
+      codexBridgePath: path.join(import.meta.dirname, 'codex-bridge.js'),
     };
     const pods = (await Promise.all(
       store.listPods(ctx.store).map(async (p) => {

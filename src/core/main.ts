@@ -13,6 +13,8 @@ import { ingestUsage } from './usage.js';
 import { runRetentionSweep } from './retention.js';
 import { writePodAgentsMd, tickConflictResolvers, adapterForPod } from './ops.js';
 import { runEscalationTick } from './escalation.js';
+import { startCodexShim } from './codex-shim.js';
+import { codexShimPort } from './codex-protocol.js';
 import type { RunLike } from './runtime-adapter.js';
 import type { CoreCtx } from './ops.js';
 
@@ -157,6 +159,17 @@ const pidFile = path.join(FLOCK_HOME, 'core.pid');
 
 const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: FLOCK_PORT }, () => {
   injectWebSocket(server);
+  // codex shim (5.5): in-process OpenAI-responses proxy that merges codex's
+  // developer-role messages into `instructions` (vLLM rejects the role in
+  // input). Only the pod's codex reaches it; local-only, no auth.
+  try {
+    const shim = startCodexShim(codexShimPort(FLOCK_PORT), process.env.FLOCK_CODEX_UPSTREAM ?? 'http://192.168.1.114:8000');
+    console.log(`[core] codex shim listening http://127.0.0.1:${shim.port} (upstream ${process.env.FLOCK_CODEX_UPSTREAM ?? 'http://192.168.1.114:8000'})`);
+  } catch (e) {
+    // shim down is not fatal: pi/claude pods are unaffected; codex spawns
+    // will fail at the first model call (visible in the pod pane)
+    console.warn('[core] codex shim failed to start:', e instanceof Error ? e.message : e);
+  }
   // pod-local unix sockets (visible to the pi sandbox, no network needed);
   // role tags the socket so the operator token arriving on it is scoped to
   // that pod's 'pod'-scope ops (5.3)

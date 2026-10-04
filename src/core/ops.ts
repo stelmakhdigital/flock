@@ -11,6 +11,7 @@ import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, 
 import { startPodSocket, stopPodSocket } from './http.js';
 import { seatPaths, validateResumeToken } from './runner-protocol.js';
 import { claudeConfigDir, claudeProjectsDir, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
+import { validateCodexSessionToken } from './codex-protocol.js';
 import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type RuntimeAdapter, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
@@ -195,8 +196,8 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (o.repo && adapter.runtime === 'pi') childEnv['BASH_GUARD_AUTO_ALLOW'] = '1';
 
     if (adapter.runtime === 'pi' && !model) model = firstUserModel();
-    if (adapter.runtime === 'claude' && !model) {
-      // pi config uses provider/model syntax; claude wants the bare model id
+    if ((adapter.runtime === 'claude' || adapter.runtime === 'codex') && !model) {
+      // pi config uses provider/model syntax; claude/codex want the bare model id
       const fm = firstUserModel();
       model = fm ? (fm.split('/').pop() ?? fm) : fm;
     }
@@ -394,7 +395,7 @@ function podMergePolicyFrom(op: Record<string, unknown>, agentId: string | undef
 // pod. pi (v3.1): HONEST resume — the exact persisted session file is
 // relaunched (--session <file>), never an interactive picker; a missing file
 // is retry_fresh (recorded in the run meta, never silent). bash: fresh window.
-const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js') });
+const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js'), codexBridgePath: path.join(import.meta.dirname, 'codex-bridge.js') });
 
 // Resolve the adapter for a stored pod (manifest -> runtime -> adapter) and
 // the minimal binding the signal-contract methods need (role/cwd/seatRoot).
@@ -452,10 +453,12 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   const runtime = resolved ? manifestRuntime(resolved.manifest) : 'cmd';
   const isPi = runtime === 'pi';
   const isClaude = runtime === 'claude';
+  const isCodex = runtime === 'codex';
   // pinned resume token wins; otherwise the latest session (honest resume).
-  // Token shape is per-runtime: pi = session file path, claude = transcript uuid.
-  const pinned = isPi || isClaude ? (cur.resume_token ?? undefined) : undefined;
-  const tokenValid = isPi ? validateResumeToken(pinned!) : validateClaudeSessionToken(pinned!);
+  // Token shape is per-runtime: pi = session file path, claude = transcript
+  // uuid, codex = thread id (UUID v7).
+  const pinned = isPi || isClaude || isCodex ? (cur.resume_token ?? undefined) : undefined;
+  const tokenValid = isPi ? validateResumeToken(pinned!) : isCodex ? validateCodexSessionToken(pinned!) : validateClaudeSessionToken(pinned!);
   if (pinned && !tokenValid) {
     throw new OpError(400, `pinned resume token is invalid: ${pinned} (flock pod resume-token ${role} reset)`);
   }
@@ -463,9 +466,9 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   const forkRef = op.fork !== undefined ? resolveForkRef(ctx, String(op.fork)) : undefined;
   if (isPi) {
     resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
-  } else if (isClaude) {
+  } else if (isClaude || isCodex) {
     const adapter = getAdapter(resolved!.manifest, adapterEnv(ctx));
-    resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: cur.dir })) ?? undefined;
+    resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: cur.dir, seatRoot: path.join(ctx.store.home, 'pods', role) })) ?? undefined;
   }
   const res = await spawnAgent(ctx, {
     role,
@@ -498,9 +501,11 @@ async function podSetResumeToken(op: Record<string, unknown>, ctx: CoreCtx): Pro
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod) throw new OpError(404, `no pod: ${role}`);
+  const rt = podRuntime(pod.agent);
   const raw = op.token === undefined || op.token === '' || op.token === 'reset' ? null : String(op.token);
-  if (raw !== null && !validateResumeToken(raw)) {
-    throw new OpError(400, `invalid resume token: ${raw}`);
+  if (raw !== null) {
+    const valid = rt === 'codex' ? validateCodexSessionToken(raw) : validateResumeToken(raw);
+    if (!valid) throw new OpError(400, `invalid resume token: ${raw}`);
   }
   store.setPodResumeToken(ctx.store, role, raw);
   ctx.emit?.({ type: 'pod_resume_token', role, token: raw });
@@ -517,6 +522,13 @@ function resolveForkRef(ctx: CoreCtx, ref: string): string {
     const s = latestClaudeSession(claudeProjectsDir(claudeConfigDir(pod.dir), pod.dir));
     if (!s) throw new OpError(404, `no session for pod ${ref} (no transcript yet)`);
     return s.token;
+  }
+  if (podRuntime(pod.agent) === 'codex') {
+    // the fork ref is a codex thread id (UUID — no slashes, so it reaches
+    // here only as a role ref): the pod's current thread from the sidecar
+    const st = terminal.readRunnerState(ctx.store.home, ref);
+    if (!st?.sessionId) throw new OpError(404, `no session for pod ${ref} (no codex thread yet)`);
+    return st.sessionId;
   }
   const dir = seatPaths(ctx.store.home, ref).sessionsDir;
   let files: string[] = [];
