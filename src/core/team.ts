@@ -21,6 +21,9 @@ export interface TeamPodSpec {
   profile?: string;
   posture?: 'floor' | 'full_bypass';
   guidance?: string;
+  // C12: workspace ref — `ws:<name>` resolves through the profile's
+  // workspace.json (repos.<name> or `ws:root`); an absolute path works too.
+  dir?: string;
 }
 
 export interface TeamSpec {
@@ -95,7 +98,7 @@ export function parseTeamYaml(src: string): TeamSpec {
         continue;
       }
       if (value === '') err(`empty value for ${role}.${key} (use a block '|' for multi-line)`);
-      const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'posture'];
+      const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'posture', 'dir'];
       if (!allowed.includes(key as keyof TeamPodSpec)) err(`unknown field ${role}.${key} (allowed: ${allowed.join(', ')}, guidance)`);
       if (key === 'posture' && value !== 'floor' && value !== 'full_bypass') err(`${role}.posture: want floor|full_bypass`);
       (pod as Record<string, unknown>)[key] = value;
@@ -132,7 +135,7 @@ export function parseTeamYaml(src: string): TeamSpec {
           guidanceLines = [];
         } else pod.guidance = value;
       } else {
-        const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'posture'];
+        const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'posture', 'dir'];
         if (!allowed.includes(key as keyof TeamPodSpec)) err(`unknown field ${role}.${key}`);
         if (value === '') err(`empty value for ${role}.${key}`);
         if (key === 'posture' && value !== 'floor' && value !== 'full_bypass') err(`${role}.posture: want floor|full_bypass`);

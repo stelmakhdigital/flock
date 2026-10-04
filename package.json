@@ -7,7 +7,7 @@
   "bin": { "flock": "bin/flock" },
   "scripts": {
     "build": "tsc",
-    "test": "node dist/core/bridge-protocol.test.js && node dist/core/runtime-adapter.test.js && node dist/core/health.test.js && node dist/core/pm.test.js && node dist/core/agent.test.js && node dist/core/claude-protocol.test.js && node dist/core/codex-protocol.test.js && node dist/core/team.test.js && node dist/core/messages.test.js && node dist/core/events.test.js && node dist/core/resume.test.js && node dist/core/mcp.test.js && node dist/core/retention.test.js && node dist/core/task-flow.test.js && node dist/core/wf.test.js && node dist/core/escalation.test.js && node dist/core/agents-cli.test.js",
+    "test": "node dist/core/bridge-protocol.test.js && node dist/core/runtime-adapter.test.js && node dist/core/health.test.js && node dist/core/pm.test.js && node dist/core/agent.test.js && node dist/core/claude-protocol.test.js && node dist/core/codex-protocol.test.js && node dist/core/team.test.js && node dist/core/messages.test.js && node dist/core/events.test.js && node dist/core/resume.test.js && node dist/core/mcp.test.js && node dist/core/retention.test.js && node dist/core/task-flow.test.js && node dist/core/wf.test.js && node dist/core/escalation.test.js && node dist/core/agents-cli.test.js && node dist/core/content.test.js",
     "flock": "sh bin/flock",
     "start": "node dist/core/main.js"
   },

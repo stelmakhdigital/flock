@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { listPacks } from './packs.js';
+import { readWorkspace } from './workspace.js';
 
 // daemonize: `flock core up` spawns core detached with pidfile + log.
 
@@ -105,5 +107,23 @@ export async function coreStatus(): Promise<string> {
     .map((t) => `${t.name} ${t.runs}x${t.lastError ? ` ERR ${t.lastError}` : ''}`)
     .join(', ');
   const pods = b.pods.map((p) => `${p.role}:${p.state}`).join(', ') || 'none';
-  return `running: pid ${pid}, port ${port()}, db ${b.db}, ticks [${ticks}], pods: ${pods}`;
+  // C12: workspace + packs inventory (filesystem-canonical, no sqlite)
+  const inv = contentInventory(home());
+  return `running: pid ${pid}, port ${port()}, db ${b.db}, ticks [${ticks}], pods: ${pods}${inv}`;
+}
+
+// One-line content-layer inventory for `flock core status` (C12).
+function contentInventory(h: string): string {
+  try {
+    const packs = listPacks(h);
+    const ws = readWorkspace(h);
+    const parts: string[] = [];
+    if (packs.length) parts.push(`packs: ${packs.map((p) => p.name).join(', ')}`);
+    if (ws.root || Object.keys(ws.repos).length) {
+      parts.push(`workspace: ${ws.root ?? '(no root)'} [${Object.keys(ws.repos).join(', ') || 'no repos'}]`);
+    }
+    return parts.length ? `, ${parts.join(', ')}` : '';
+  } catch {
+    return '';
+  }
 }

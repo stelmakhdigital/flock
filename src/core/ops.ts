@@ -12,6 +12,9 @@ import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, typ
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
 import { validateIntent, applyIntents, pmDigest, notifyPm } from './pm.js';
+import { listPacks, readPackMeta, buildPackBundle } from './packs.js';
+import { readWorkspace, resolveWorkspaceRef, workspacePath } from './workspace.js';
+import { piList, pluginShowDetail, type PluginEntry } from './plugins.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -153,6 +156,12 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   // -- health / system ---------------------------------------------------------
   health_list: { group: 'health', scopes: ['operator', 'pod'], summary: 'built-in health alerts (gate/idle)', run: (_o, c) => ({ alerts: listAlerts(c) }) },
   terminal_check: { group: 'system', scopes: ['operator'], summary: 'tmux transport self-check', run: (_o, c) => terminalCheck(c) },
+  // -- content layer (C12: packs / workspace / plugins) ----------------------
+  pack_ls: { group: 'content', scopes: ['operator', 'pod'], summary: 'list context packs (filesystem: <FLOCK_HOME>/packs/)', run: (_o, c) => packLs(c) },
+  pack_show: { group: 'content', scopes: ['operator', 'pod'], summary: 'assemble + show a pack bundle (paste-ready)', run: (o, c) => packShow(o, c) },
+  workspace_show: { group: 'content', scopes: ['operator', 'pod'], summary: 'show the workspace declaration (workspace.json, per profile)', run: (_o, c) => workspaceShow(c) },
+  plugins_ls: { group: 'content', scopes: ['operator', 'pod'], summary: 'list the host pi extensions the pods inherit (read-only)', run: async (_o, c) => pluginsLs(c) },
+  plugins_show: { group: 'content', scopes: ['operator', 'pod'], summary: 'show one pi extension entry + its SKILL.md/README (read-only)', run: (o, c) => pluginsShow(o, c) },
 };
 
 // Introspection: op names + metadata (for /api/ops, `flock ops ls`, and
@@ -256,9 +265,21 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (o.teamGuidance) {
       mergeManagedBlock(path.join(o.dir, 'AGENTS.md'), `team:${o.role}`, o.teamGuidance);
     }
+    // C12: context packs -> `pack:<name>` managed blocks (filesystem-canonical:
+    // the bundle is reassembled from disk at every spawn/relaunch)
+    const packBlockIds: string[] = [];
+    for (const packName of manifest.packs ?? []) {
+      try {
+        mergeManagedBlock(path.join(o.dir, 'AGENTS.md'), `pack:${packName}`, buildPackBundle(ctx.store.home, packName));
+        packBlockIds.push(`pack:${packName}`);
+      } catch (e) {
+        // a broken pack is a launch error, not a silent shrink
+        throw new OpError(400, `pack ${packName}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
     // guidance hygiene: drop managed blocks the current manifest no longer
     // provides (e.g. left over from a previous profile)
-    pruneManagedBlocks(path.join(o.dir, 'AGENTS.md'), new Set(['flock-protocol', 'team:' + o.role, ...(manifest.guidance ?? []).map((g) => g.id)]));
+    pruneManagedBlocks(path.join(o.dir, 'AGENTS.md'), new Set(['flock-protocol', 'team:' + o.role, ...(manifest.guidance ?? []).map((g) => g.id), ...packBlockIds]));
 
     let launchId = store.newId('la');
     let launch = await adapter.launchHarness(binding, {
@@ -565,6 +586,48 @@ async function terminalCheck(ctx: CoreCtx): Promise<unknown> {
   return terminal.checkTransport(ctx.store.home);
 }
 
+// ---------- content layer (C12: packs / workspace / plugins) --------------
+
+// Context packs: filesystem-canonical (no sqlite, no cache — assembly is a
+// handful of small reads, done only on demand). A manifest's `packs: []`
+// axis turns them into `pack:<name>` managed blocks in <pod>/AGENTS.md at
+// spawn/relaunch (see spawnAgent).
+function packLs(ctx: CoreCtx): unknown {
+  return { packs: listPacks(ctx.store.home) };
+}
+
+function packShow(op: Record<string, unknown>, ctx: CoreCtx): unknown {
+  const name = String(op.name ?? '').trim();
+  if (!name) throw new OpError(400, 'name required');
+  try {
+    return { name, files: readPackMeta(ctx.store.home, name).files, bundle: buildPackBundle(ctx.store.home, name) };
+  } catch (e) {
+    throw new OpError(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
+function workspaceShow(ctx: CoreCtx): unknown {
+  try {
+    return { path: workspacePath(ctx.store.home), workspace: readWorkspace(ctx.store.home) };
+  } catch (e) {
+    throw new OpError(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function pluginsLs(_ctx: CoreCtx): Promise<unknown> {
+  return piList();
+}
+
+async function pluginsShow(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const source = String(op.source ?? '').trim();
+  if (!source) throw new OpError(400, 'source required');
+  const ls = await piList();
+  if (!ls.ok) throw new OpError(500, ls.error ?? 'pi list failed');
+  const entry = ls.entries.find((e) => e.source === source);
+  if (!entry) throw new OpError(404, `extension not found: ${source}`);
+  return { entry, detail: pluginShowDetail(entry) };
+}
+
 // Per-pod protocol doc: pi reads AGENTS.md from its cwd on startup.
 // Overwritten on every spawn/boot so protocol updates propagate.
 export function podAgentsMd(role: string): string {
@@ -820,7 +883,8 @@ async function messageList(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
     : (() => { // operator without {to}: unclaimed across all pods
         const pods = store.listPods(ctx.store);
         const all: store.InboxMessage[] = [];
-        for (const p of pods) all.push(...store.listInboxMessages(ctx.store, p.role, true, limit));        return all.sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, limit);
+        for (const p of pods) all.push(...store.listInboxMessages(ctx.store, p.role, true, limit));
+        return all.sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, limit);
       })();
   return { to: to ?? '(all)', messages };
 }
@@ -880,6 +944,8 @@ async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknow
         profile: s.profile,
         posture: s.posture,
         teamGuidance: s.guidance,
+        // C12: `dir: ws:<name>` resolves through the profile's workspace
+        dir: s.dir ? (s.dir.startsWith('ws:') ? resolveWorkspaceRef(ctx.store.home, s.dir) : s.dir) : undefined,
       }, ctx)) as { run?: { id: string } };
       results[role] = { action: existing ? 'respawned' : 'spawned', run: res?.run?.id };
     } catch (e) {

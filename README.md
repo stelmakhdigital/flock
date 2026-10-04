@@ -296,6 +296,40 @@ Pod'ы — plain-dir: рабочая директория пода — прос�
 review-гейты, merge-queue, conflict-резолвер и вся экономика — **убраны из
 core** (C1/C2).
 
+## Content layer (C12): packs, workspace, plugins
+
+Файл-канонический (OpenRIG-модель): sqlite не трогаем, кэша нет —
+ассамбл бандлов — горстка маленьких чтений по требованию.
+
+**Context packs** — `~/.flock/packs/<name>/`: `pack.json` {id, files: […]}
++ файлы. Ассамбл в один paste-ready бандл. Манифест-ось `packs: [names]`
+→ managed-блок `pack:<name>` в `<pod>/AGENTS.md` при spawn/relaunch:
+
+```sh
+flock pack ls
+flock pack show <name>                    # бандл (paste-ready)
+
+# manifest: { "id": "dev", "imports": ["pi"], "packs": ["style"] }
+```
+
+**Workspace** — `~/.flock/workspace.json` (per-profile):
+`{root, repos: {name: path}, knowledge?}`. Team-файл: `dir: ws:<name>`
+резолвится через workspace (или абсолютный путь). Inventory — в
+`flock core status`.
+
+```sh
+flock workspace show
+# pods.yaml: pods: dev: { agent: pi, dir: ws:flock }
+```
+
+**Plugins** — read-only инспекция pi-расширений хоста, которые наследуют
+поды (`pi list`). Install — нет (операторская копия в ~/.pi/agent):
+
+```sh
+flock plugins ls
+flock plugins show <source>               # entry + SKILL.md/README (≤4KB)
+```
+
 ## Multi-flock (profiles)
 
 Несколько изолированных core-инстансов:

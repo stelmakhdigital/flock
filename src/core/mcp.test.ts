@@ -5,7 +5,7 @@ import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-const OP_COUNT = 34; // OP_REGISTRY entries (keep in sync; pod_answer removed in C10)
+const OP_COUNT = 39; // OP_REGISTRY entries (keep in sync; C12 added 5 content ops)
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 

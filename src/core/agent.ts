@@ -77,6 +77,11 @@ export interface AgentManifest {
   systemPrompt?: string; // replace default pi system prompt
   appendSystemPrompt?: string[]; // append text/file contents (repeatable flag)
   noContextFiles?: boolean; // skip AGENTS.md/CLAUDE.md discovery
+  // C12: context packs — names of ~/.flock/packs/<name>/ bundles. At
+  // spawn/relaunch each pack's files are assembled into ONE paste-ready
+  // bundle written as a managed block `pack:<name>` in <pod>/AGENTS.md
+  // (filesystem-canonical: packs live on disk, never in sqlite).
+  packs?: string[];
   // C10: UNIFIED child-args (form a). RAW passthrough into the child
   // process's argv/env — the bridge is dumb about it (appends args last,
   // merges env). Runtime-agnostic: pi, codex, any bridge runtime. The

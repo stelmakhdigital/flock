@@ -38,6 +38,9 @@ const USAGE = `flock — core CLI
   flock pod capture <role> [--lines N]
   flock pod close <role>
   flock team up [pods.yaml]              # team-реконсиляция: spawn недостающих, refresh живых
+  flock pack ls | pack show <name>       # context packs (filesystem: ~/.flock/packs/)
+  flock workspace show                   # декларация workspace (workspace.json, per-profile)
+  flock plugins ls | plugins show <src>  # pi-расширения хоста (read-only)
   flock pm up                          # поднять pm-под (goal loop)
   flock pm down                        # остановить goal loop (close pm-пода)
   flock pm state                       # снимок pipeline для pm
@@ -241,6 +244,48 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'team_up', file: rest[0] }));
       } else {
         console.log(USAGE);
+      }
+      return;
+    }
+
+    // C12: content layer — packs / workspace / plugins (read-only surface)
+    case 'pack': {
+      if (sub === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'pack_ls' }));
+      } else if (sub === 'show') {
+        const name = rest.find((r) => !r.startsWith('-'));
+        if (!name) {
+          console.error('usage: flock pack show <name>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'pack_show', name }));
+      } else {
+        console.log('usage: flock pack ls | flock pack show <name>');
+      }
+      return;
+    }
+
+    case 'workspace': {
+      if (sub === 'show') {
+        print(await api('POST', '/api/ops', { type: 'workspace_show' }));
+      } else {
+        console.log('usage: flock workspace show');
+      }
+      return;
+    }
+
+    case 'plugins': {
+      if (sub === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'plugins_ls' }));
+      } else if (sub === 'show') {
+        const source = rest.find((r) => !r.startsWith('-'));
+        if (!source) {
+          console.error('usage: flock plugins show <source>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'plugins_show', source }));
+      } else {
+        console.log('usage: flock plugins ls | flock plugins show <source>');
       }
       return;
     }
