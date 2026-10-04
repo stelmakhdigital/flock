@@ -74,5 +74,13 @@ assert.strictEqual(again.archivedRuns, 0);
 assert.deepStrictEqual(again.trimmedActivity, []);
 assert.strictEqual(again.coreLogRotated, false);
 
+// regression: raw-cmd spawns insert a run with NO meta — the schema is
+// meta TEXT NOT NULL DEFAULT '[]', so an explicit NULL insert failed with
+// "NOT NULL constraint failed: runs.meta" (pod spawn --cmd broken)
+const noMeta = store.insertRun(db, { id: 'run_nometa', podRole: 'dev', pid: 9 });
+assert.strictEqual(noMeta.meta, '[]', 'empty run meta must be stored as [] (not NULL)');
+const emptyMeta = store.insertRun(db, { id: 'run_emptymeta', podRole: 'rev', pid: 10, meta: {} });
+assert.strictEqual(emptyMeta.meta, '[]');
+
 fs.rmSync(home, { recursive: true, force: true });
 console.log('retention: all checks passed');

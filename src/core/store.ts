@@ -507,10 +507,12 @@ export function setPodState(store: Store, role: string, state: string): void {
 // ---------- runs ----------
 
 export function insertRun(store: Store, r: { id: string; podRole: string; pid: number | null; meta?: Record<string, unknown> }): Run {
+  // schema: meta TEXT NOT NULL DEFAULT '[]' — never insert explicit null
+  // (raw-cmd spawns have no run meta; NULL violated the constraint)
   const meta =
     r.meta && Object.keys(r.meta).length
       ? JSON.stringify([{ ts: nowIso(), kind: 'created', ...r.meta }])
-      : null;
+      : '[]';
   dbOf(store)
     .prepare('INSERT INTO runs(id, pod_role, pid, started_at, meta) VALUES (?, ?, ?, ?, ?)')
     .run(r.id, r.podRole, r.pid, nowIso(), meta);
