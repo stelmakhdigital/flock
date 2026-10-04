@@ -88,3 +88,46 @@ fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(home2, { recursive: true, force: true });
   console.log('task-flow: frozen step task checks passed');
 }
+
+// C8 nuance: coordinator elevation — the pm role manages the team's tasks,
+// every other pod stays own-pod. (5.6: decomposition needs pm -> task_add
+// for worker pods.)
+{
+  const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-coord-'));
+  const db3 = openStore(home3);
+  const raw3 = new DatabaseSync(path.join(home3, 'flock.db'));
+  raw3.prepare("INSERT INTO pods(id, role, dir, state, created_at) VALUES (?, ?, ?, 'live', ?)").run('pod_pm', 'pm', path.join(home3, 'pods', 'pm'), new Date().toISOString());
+  raw3.prepare("INSERT INTO pods(id, role, dir, state, created_at) VALUES (?, ?, ?, 'live', ?)").run('pod_dev', 'dev', path.join(home3, 'pods', 'dev'), new Date().toISOString());
+  raw3.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_own', 'x', 'dev', 'active', ?)").run(new Date().toISOString());
+  raw3.close();
+  const { apply: ap } = await import('./ops.js');
+  const as = (role: string) => ({ store: db3, ticks: {}, caller: { kind: 'pod', role } } as never);
+  // pm adds a task FOR dev (the whole point of decomposition)
+  const added = (await ap({ type: 'task_add', role: 'dev', title: 'from pm' }, as('pm'))) as { id: string };
+  assert.ok(added.id, 'pm (coordinator) can task_add for another pod');
+  // a plain pod cannot
+  let denied = false;
+  try { await ap({ type: 'task_add', role: 'pm', title: 'from dev' }, as('dev')); } catch (e) { denied = /coordinator|own pod|cannot add/.test(String((e as Error).message)); }
+  assert.ok(denied, 'non-pm pod cannot task_add for another pod');
+  // pm cancels a dev task; dev cannot
+  const cancelled = (await ap({ type: 'task_cancel', id: 't_own' }, as('pm'))) as { status: string };
+  assert.strictEqual(cancelled.status, 'cancelled', 'pm can cancel any pod\u0027s task');
+  let denied2 = false;
+  try { await ap({ type: 'task_cancel', id: added.id }, as('dev')); } catch (e) { denied2 = /coordinator/.test(String((e as Error).message)); }
+  assert.ok(denied2, 'non-pm pod cannot cancel a foreign task');
+  // pm_intents / workflow_start: coordinator-gated for pods
+  for (const op of ['pm_intents', 'workflow_start'] as const) {
+    let gated = false;
+    try { await ap({ type: op, intents: [], name: 'x' }, as('dev')); } catch (e) { gated = /coordinator/.test(String((e as Error).message)); }
+    assert.ok(gated, `pod token: ${op} is coordinator-gated`);
+  }
+  // pod_spawn: no manifest/pane — refuse cleanly before touching tmux
+  let spawnDenied = false;
+  try { await ap({ type: 'pod_spawn', role: 'nope2' }, as('dev')); } catch (e) { spawnDenied = /coordinator/.test(String((e as Error).message)); }
+  assert.ok(spawnDenied, 'pod token: pod_spawn is coordinator-gated (before tmux)');
+  // the operator token remains unrestricted (no caller)
+  const opTask = (await ap({ type: 'task_add', role: 'dev', title: 'from operator' }, { store: db3, ticks: {} } as never)) as { id: string };
+  assert.ok(opTask.id, 'operator can still task_add for any pod');
+  fs.rmSync(home3, { recursive: true, force: true });
+  console.log('task-flow: coordinator elevation checks passed');
+}

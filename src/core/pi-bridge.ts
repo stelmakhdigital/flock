@@ -114,6 +114,9 @@ export class RunnerCore {
       ready: this.ready,
       launchId: this.launchId,
       updatedAt: this.io.now(),
+      // protocol marker: lets the core tell a pre-v2 (v1-only) runner apart
+      // and refuse to paste v2 frames to it (binary garbage otherwise)
+      bridge: 'v2',
       ...(this.sessionFile ? { sessionFile: this.sessionFile } : {}),
       ...(this.sessionId ? { sessionId: this.sessionId } : {}),
       streaming: this.streaming,

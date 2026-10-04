@@ -154,7 +154,15 @@ Relaunch = честный resume ТОЧНОЙ сессии; silent fresh зап�
   (ready/streaming/lastPrompt/exited), flockmsg v2 + nonce-ack, session
   identity = session-файл. Dialog'и расширений без оператора: авто-ответ
   strictest option (deny) + LOUD mirror + `ext_dialog_auto_denied` в
-  activity (gate-канал = `attach`: рычаг оператора — pane);
+  activity (gate-канал = `attach`: рычаг оператора — pane).
+  **Stale-bridge guard**: sidecar несёт marker `bridge: "v2"`; раннер
+  без marker (пред-v2 сборка) не декодирует v2-фреймы — core
+  отказывается ему кидать (честная ошибка «relaunch the pod»), а не
+  бинарный мусор в сессию; liveness такой раннер считает мёртвым.
+  **Headless bash-guard**: `FLOCK_PI_BASH_GUARD_FLOOR=1` у core'а —
+  все pi-поды стартуют с `--bash-guard-disabled` (интерактивное
+  подтверждение в под'е никому не ответить; катастрофический «пол»
+  — rm -rf/sudo/git commit — действует). Без флага — как у оператора.
 
 **Terminal-native** (delta маленькая: нет моста, сигналы — с панели):
 
@@ -191,8 +199,9 @@ concat, `mcp` по имени сервера.
 ## pm — обычный под (C8)
 
 pm — не подсистема core, а обычный pod (manifest `pm`), который будится
-inbox-сообщениями/poke и решает **обычными pod-ops**. У core нет pm-тика
-и pm-sweep; special-case `pmNotify` убран — delivery = `message_send
+inbox-сообщениями/poke и решает **pod-ops** (+ координатор-права: см.
+«Pod-scoped авторизация»). У core нет pm-тика и pm-sweep;
+special-case `pmNotify` убран — delivery = `message_send
 {to:'pm'}` + poke.
 
 ```sh
@@ -429,6 +438,44 @@ Event log на **обеих** сторонах фиксирует фазы (`tas
 store (другая архитектура, не сейчас). НЕ делаем: центральный
 оркестратор-процесс, mesh-синхронизацию состояний, репликацию sqlite.
 
+## Кампании (5.6): именованные персистентные цели
+
+**Кампания = именованная персистентная цель с жизненным циклом и
+прогрессом; переживает много pm-пробуждений и движется без
+оператора.** Tasks — юниты выполнения; pm — мозг декомпозиции; кампания
+— контейнер + цикл. `ponytail:` без бюджета — экономика (usage-tracking)
+убрана из core в C2: кампания — цель + цикл, не расход.
+
+```sh
+flock campaign new "Сделать X" [--pod <role>]   # planning, pm получил триггер
+flock campaign ls                                # id, status, done/total
+flock campaign status <id>                       # цель, задачи, note
+flock campaign pause|resume|cancel <id>
+flock task add <pod> "title" --campaign <id>     # задача в кампанию (pm/оператор)
+```
+
+Жизненный цикл (детерминированный тик 30s, **без LLM**):
+
+```
+planning -> running:    появилась первая задача (campaign_id)
+planning -> blocked:    FLOCK_CAMPAIGN_PLAN_TTL_MIN (15) без задач
+                        -> эскалация 5.4c (pm не декомпозировал)
+running -> done:        все задачи терминальны и есть хотя бы одна done
+running -> blocked:     открытой работы нет, что-то застряло (blocked/
+                        needs) или всё отменено -> эскалация 5.4c
+blocked -> running:     pm разблокировал / добавил задачу (лестница
+                        закрывается сама, когда условие исцелилось)
+paused/cancelled/done — терминальны для тика (resume — только оператор)
+```
+
+Декомпозиция — pm'ом: `campaign_new` шлёт ему durable-триггер (inbox +
+poke), он раскладывает цель в `flock task add <pod> "<title>" --campaign <id>`
+(координатор-права pm). Cancel — статус, не cascade: задачи не трогаем.
+Task в кампанию — поле `campaign_id` в `task_add` / флаг `--campaign`
+(валидация: существует, не cancelled/done); handoff наследует campaign_id.
+Поверхность: SSE `campaign_status`, `flock pm state` (строка кампаний),
+README-примеры в CLI.
+
 ## Retention
 
 Тик 24h (env-настраивается): runs старше N дней (default 14) →
@@ -442,6 +489,12 @@ rotate. Usage-аудит: bridge'и пишут `usage`-события в `activi
 (`<pod>/core.sock`) видит только `pod`-scoped ops (свои задачи, свой
 inbox, свой под); operator-only ops через сокет пода → 403. Узкие места
 (own-pod/own-task) проверяются в op.
+
+**Координатор (pm)**: роль `pm` — единственный повышенный scope среди
+подов (PM_PROTOCOL обещает ему управление командой): `task_add` для
+любого пода, `task_cancel`/`task_unblock`/`task_handoff` на чужие
+задачи, `pod_spawn`/`pod_relaunch`/`pod_close`, `workflow_start`,
+`pm_intents`. Все остальные поды — только own-pod/own-task.
 
 ## Принципы
 

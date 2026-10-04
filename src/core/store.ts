@@ -395,6 +395,25 @@ CREATE INDEX IF NOT EXISTS outbound_handoffs_pending_idx ON outbound_handoffs(st
 ALTER TABLE outboxes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
 `,
   },
+  {
+    // 5.6: campaigns — named persistent goals with a lifecycle that
+    // survives many pm wake-ups. tasks join a campaign via campaign_id.
+    // ponytail: NO budget column — the economy (usage tracking) was
+    // dropped from core in C2; a campaign is a goal + cycle, not a spend.
+    name: '021_campaigns',
+    sql: `CREATE TABLE IF NOT EXISTS campaigns(
+  id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL,
+  status TEXT NOT NULL,
+  pod TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  note TEXT
+);
+ALTER TABLE tasks ADD COLUMN campaign_id TEXT;
+CREATE INDEX IF NOT EXISTS tasks_campaign_idx ON tasks(campaign_id);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -653,6 +672,7 @@ export interface Task {
   workflow_step: string | null;
   priority: number;
   closed: string | null; // C3: JSON {reason, target?, at, by} — terminal states only
+  campaign_id: string | null; // 5.6: campaign container (nullable = ad-hoc task)
 }
 
 // C3: hot-potato closure vocabulary. A unit of work cannot be closed
@@ -679,11 +699,11 @@ const TASK_FLOW: Record<string, string[]> = {
 
 export function insertTask(
   store: Store,
-  t: { id: string; title: string; body: string | null; podRole: string; workflowInstanceId?: string | null; workflowStep?: string | null; priority?: number },
+  t: { id: string; title: string; body: string | null; podRole: string; workflowInstanceId?: string | null; workflowStep?: string | null; priority?: number; campaignId?: string | null },
 ): void {
   dbOf(store)
-    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso(), t.workflowInstanceId ?? null, t.workflowStep ?? null, t.priority ?? 0);
+    .prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step, priority, campaign_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(t.id, t.title, t.body, t.podRole, 'queued', nowIso(), t.workflowInstanceId ?? null, t.workflowStep ?? null, t.priority ?? 0, t.campaignId ?? null);
   dbOf(store)
     .prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, NULL, ?, ?, ?)')
     .run(t.id, 'queued', 'created', nowIso());
@@ -816,8 +836,8 @@ export function handoffTask(
     db.prepare('UPDATE tasks SET status = ?, closed = ?, finished_at = ? WHERE id = ?').run('done', closedJson, now, id);
     db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, closed, ts) VALUES (?, ?, ?, ?, ?, ?)')
       .run(id, t.status, 'done', 'handed-off', closedJson, now);
-    db.prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(succId, t.title, body, toRole, 'queued', now, null, null, t.priority);
+    db.prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step, priority, campaign_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(succId, t.title, body, toRole, 'queued', now, null, null, t.priority, t.campaign_id ?? null);
     db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, NULL, ?, ?, ?)')
       .run(succId, 'queued', `handoff from ${id}`, now);
     db.exec('COMMIT');
@@ -1193,4 +1213,95 @@ export function archiveOldRuns(store: Store, olderThanIso: string): number {
     db.prepare('DELETE FROM runs WHERE id = ?').run(r.id);
   }
   return rows.length;
+}
+
+// ---------- campaigns (5.6) ----------
+//
+// A campaign is a named persistent goal with a lifecycle that survives
+// many pm wake-ups: planning -> running -> (blocked <-> running) ->
+// done/cancelled. Tasks join it via tasks.campaign_id. The campaign tick
+// (campaign-tick.ts) walks the lifecycle deterministically (no LLM); the
+// pm does the actual work (decompose, unblock) through ordinary ops.
+//
+// ponytail: no budget — the economy (usage tracking) was dropped from
+// core in C2; a campaign is a goal + cycle, not a spend.
+
+export interface Campaign {
+  id: string;
+  goal: string;
+  status: 'planning' | 'running' | 'blocked' | 'paused' | 'done' | 'cancelled';
+  pod: string | null;
+  created_at: string;
+  updated_at: string;
+  note: string | null;
+}
+
+export const CAMPAIGN_STATUSES = ['planning', 'running', 'blocked', 'paused', 'done', 'cancelled'] as const;
+export const CAMPAIGN_TERMINAL: Campaign['status'][] = ['done', 'cancelled'];
+
+// goal -> short slug id; collision -> -2, -3, ...
+export function campaignIdFromGoal(db: DatabaseSync, goal: string): string {
+  const base =
+    goal
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 32)
+      .replace(/-+$/g, '') || 'campaign';
+  let id = base;
+  let n = 2;
+  while ((db.prepare('SELECT 1 FROM campaigns WHERE id = ?').get(id)) !== undefined) {
+    id = `${base}-${n++}`;
+  }
+  return id;
+}
+
+export function createCampaign(store: Store, c: { id: string; goal: string; pod?: string | null }): Campaign {
+  const now = nowIso();
+  dbOf(store)
+    .prepare('INSERT INTO campaigns(id, goal, status, pod, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(c.id, c.goal, 'planning', c.pod ?? null, now, now);
+  return getCampaign(store, c.id)!;
+}
+
+export function getCampaign(store: Store, id: string): Campaign | null {
+  const r = dbOf(store).prepare('SELECT * FROM campaigns WHERE id = ?').get(id) as Campaign | undefined;
+  return r ?? null;
+}
+
+export function listCampaigns(store: Store, includeTerminal = true): Campaign[] {
+  const sql = includeTerminal
+    ? 'SELECT * FROM campaigns ORDER BY created_at DESC, rowid DESC LIMIT 200'
+    : 'SELECT * FROM campaigns WHERE status NOT IN (?, ?) ORDER BY created_at DESC, rowid DESC LIMIT 200';
+  return dbOf(store).prepare(sql).all(...(includeTerminal ? [] : ['done', 'cancelled'])) as unknown as Campaign[];
+}
+
+export function setCampaignStatus(
+  store: Store,
+  id: string,
+  to: Campaign['status'],
+  note?: string,
+): Campaign {
+  dbOf(store)
+    .prepare('UPDATE campaigns SET status = ?, note = COALESCE(?, note), updated_at = ? WHERE id = ?')
+    .run(to, note ?? null, nowIso(), id);
+  return getCampaign(store, id)!;
+}
+
+export function setCampaignNote(store: Store, id: string, note: string): void {
+  dbOf(store).prepare('UPDATE campaigns SET note = ?, updated_at = ? WHERE id = ?').run(note, nowIso(), id);
+}
+
+export function campaignTasks(store: Store, id: string): Task[] {
+  return dbOf(store)
+    .prepare('SELECT * FROM tasks WHERE campaign_id = ? ORDER BY created_at ASC, rowid ASC')
+    .all(id) as unknown as Task[];
+}
+
+export function countTasksByCampaign(store: Store): Map<string, number> {
+  const rows = dbOf(store)
+    .prepare('SELECT campaign_id, COUNT(*) AS c FROM tasks WHERE campaign_id IS NOT NULL GROUP BY campaign_id')
+    .all() as { campaign_id: string; c: number }[];
+  return new Map(rows.map((r) => [r.campaign_id, r.c]));
 }

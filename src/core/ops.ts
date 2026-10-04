@@ -58,6 +58,28 @@ function requireLivePod(ctx: CoreCtx, role: string): store.Pod {
   return pod;
 }
 
+// C8 nuance: the pm pod is the COORDINATOR. The PM_PROTOCOL promises it
+// task/pod management over the whole team (task_add for any pod,
+// task_cancel/unblock/handoff for any task, pod_spawn/relaunch/close,
+// workflow_start, pm_intents). Every other pod keeps its narrow scope.
+// Role-based elevation: exactly the role 'pm', never a manifest field.
+function isCoordinator(ctx: CoreCtx): boolean {
+  return ctx.caller?.kind === 'pod' && ctx.caller.role === 'pm';
+}
+// Gate for elevated ops reached with a pod token: only the pm role passes.
+function requireCoordinator(ctx: CoreCtx, what: string): void {
+  if (ctx.caller?.kind === 'pod' && !isCoordinator(ctx)) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: ${what} is a coordinator (pm) action`);
+  }
+}
+// Per-resource narrowing shared by task_* handlers: own pod's tasks for
+// plain pods, anything for the coordinator.
+function assertTaskScope(ctx: CoreCtx, taskPodRole: string, what: string): void {
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== taskPodRole && !isCoordinator(ctx)) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: task belongs to pod ${taskPodRole} (${what} is own-pod only)`);
+  }
+}
+
 export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): Promise<unknown> {
   const o = op ?? {};
   const t = String(o.type ?? '');
@@ -121,8 +143,8 @@ export interface OpDef {
 
 export const OP_REGISTRY: Record<string, OpDef> = {
   // -- pods -----------------------------------------------------------------
-  pod_spawn: { group: 'pod', scopes: ['operator'], summary: 'spawn a pod (agent manifest, plain-dir; git is owned by the agents)', run: (o, c) => podSpawn(o, c) },
-  pod_relaunch: { group: 'pod', scopes: ['operator'], summary: 'new run on the same pod (honest resume, --fork)', run: (o, c) => podRelaunch(o, c) },
+  pod_spawn: { group: 'pod', scopes: ['operator', 'pod'], summary: 'spawn a pod (agent manifest, plain-dir; git is owned by the agents; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_spawn'); return podSpawn(o, c); } },
+  pod_relaunch: { group: 'pod', scopes: ['operator', 'pod'], summary: 'new run on the same pod (honest resume, --fork; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_relaunch'); return podRelaunch(o, c); } },
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
   team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
   esc_ls: { group: 'team', scopes: ['operator', 'pod'], summary: '5.4c durable escalations (ladder audit)', run: (o, c) => { const activeOnly = o.active === true || o.active === 'true'; return store.listEscalations(c.store, activeOnly); } },
@@ -132,6 +154,13 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_close: { group: 'pod', scopes: ['operator', 'pod'], summary: 'close a pod (kill window, state=closed)', run: (o, c) => podClose(o, c) },
   team_down: { group: 'team', scopes: ['operator'], summary: 'close all live pods of a named team + auto-snapshot (C14)', run: (o, c) => teamDown(o, c) },
   team_restore: { group: 'team', scopes: ['operator'], summary: 'restore a named team from a snapshot (C14, honest per-node outcomes)', run: (o, c) => teamRestore(o, c) },
+  // -- campaigns (5.6: named persistent goals) -------------------------------
+  campaign_new: { group: 'campaign', scopes: ['operator'], summary: 'create a campaign (named persistent goal); triggers pm to decompose', run: (o, c) => campaignNew(o, c) },
+  campaign_ls: { group: 'campaign', scopes: ['operator', 'pod'], summary: 'list campaigns with progress (done/total)', run: (o, c) => campaignLs(o, c) },
+  campaign_status: { group: 'campaign', scopes: ['operator', 'pod'], summary: 'campaign detail: goal, tasks, status, note', run: (o, c) => campaignStatus(o, c) },
+  campaign_pause: { group: 'campaign', scopes: ['operator'], summary: 'pause a campaign (the tick stops walking it)', run: (o, c) => campaignMove(o, c, 'paused') },
+  campaign_resume: { group: 'campaign', scopes: ['operator'], summary: 'resume a paused campaign', run: (o, c) => campaignResume(o, c) },
+  campaign_cancel: { group: 'campaign', scopes: ['operator'], summary: 'cancel a campaign (status only — tasks are left as-is)', run: (o, c) => campaignMove(o, c, 'cancelled') },
   // -- agent images (C13) ----------------------------------------------------
   agent_image_save: { group: 'pod', scopes: ['operator'], summary: 'save an agent image (manifest + session copy) from a live pi pod', run: (o, c) => agentImageSave(o, c) },
   agent_image_ls: { group: 'pod', scopes: ['operator', 'pod'], summary: 'list agent images', run: (_o, c) => listImages(c.store.home) },
@@ -147,7 +176,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   watchdog_list: { group: 'watchdog', scopes: ['operator'], summary: 'list watchdog jobs', run: (_o, c) => ({ jobs: store.listWatchdogJobs(c.store) }) },
   // -- workflows -------------------------------------------------------------
   workflow_define: { group: 'workflow', scopes: ['operator'], summary: 'define a workflow (named step list)', run: (o, c) => workflowDefine(o, c) },
-  workflow_start: { group: 'workflow', scopes: ['operator'], summary: 'start a workflow instance', run: (o, c) => workflowStart(o, c) },
+  workflow_start: { group: 'workflow', scopes: ['operator', 'pod'], summary: 'start a workflow instance (pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'workflow_start'); return workflowStart(o, c); } },
   workflow_rm: { group: 'workflow', scopes: ['operator'], summary: 'delete a workflow definition (instances survive)', run: (o, c) => workflowRm(o, c) },
   workflow_ls: { group: 'workflow', scopes: ['operator'], summary: 'list workflows and instances', run: (_o, c) => ({ workflows: store.listWorkflows(c.store), instances: store.listWorkflowInstances(c.store) }) },
   workflow_status: { group: 'workflow', scopes: ['operator'], summary: 'instance status (steps, states)', run: (o, c) => workflowStatus(o, c) },
@@ -155,8 +184,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   task_add: { group: 'task', scopes: ['operator', 'pod'], summary: 'add a task to the queue (pod must exist; pod token: own pod only)', run: (o, c) => taskAdd(o, c) },
   task_list: { group: 'task', scopes: ['operator', 'pod'], summary: 'list tasks (filter by status, limit default 50)', run: (o, c) => ({ tasks: store.listTasks(c.store, o.status ? String(o.status) : undefined, Math.max(1, Math.min(500, Number(o.limit ?? 50)))) }) },
   task_history: { group: 'task', scopes: ['operator', 'pod'], summary: 'task transitions (audit)', run: (o, c) => taskHistory(o, c) },
-  task_cancel: { group: 'task', scopes: ['operator'], summary: 'cancel a task', run: async (o, c) => { await pmNotifyMaybe(c, 'task_cancelled', o, 'cancelled'); return taskReport(o, c, 'cancelled'); } },
-  task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
+  task_cancel: { group: 'task', scopes: ['operator', 'pod'], summary: 'cancel a task (pod token: pm only)', run: async (o, c) => { requireCoordinator(c, 'task_cancel'); await pmNotifyMaybe(c, 'task_cancelled', o, 'cancelled'); return taskReport(o, c, 'cancelled'); } },
+  task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod or pm)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
   task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'close a task (C3 hot-potato: {reason, target?} from the closure vocabulary)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
   task_handoff: { group: 'task', scopes: ['operator', 'pod'], summary: 'transactional handoff: close (handed-off) + create the successor at {to}', run: (o, c) => taskHandoff(o, c) },
   // -- messages (C4: inboxes + outboxes) ---------------------------------
@@ -168,7 +197,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   // -- pm / goal loop ---------------------------------------------------------
   pm_up: { group: 'pm', scopes: ['operator'], summary: 'start the pm pod (goal loop)', run: (_o, c) => pmUp(c) },
   pm_state: { group: 'pm', scopes: ['operator'], summary: 'pm digest snapshot + alerts', run: async (_o, c) => ({ pm: await pmDigest(c), alerts: listAlerts(c) }) },
-  pm_intents: { group: 'pm', scopes: ['operator'], summary: 'typed intents from pm (whitelist, applied via apply)', run: (o, c) => pmIntents(o, c) },
+  pm_intents: { group: 'pm', scopes: ['operator', 'pod'], summary: 'typed intents from pm (whitelist, applied via apply; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pm_intents'); return pmIntents(o, c); } },
   // -- health / system ---------------------------------------------------------
   health_list: { group: 'health', scopes: ['operator', 'pod'], summary: 'built-in health alerts (gate/idle)', run: (_o, c) => ({ alerts: listAlerts(c) }) },
   terminal_check: { group: 'system', scopes: ['operator'], summary: 'tmux transport self-check', run: (_o, c) => terminalCheck(c) },
@@ -247,6 +276,14 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (!adapter) throw new OpError(400, `agent ${agentId}: no runtime adapter (manifest needs a supported "runtime")`);
 
     const childEnv: Record<string, string> = { ...(manifest.env ?? {}) };
+    // FLOCK_PI_BASH_GUARD_FLOOR=1: flock pods are headless — bash-guard's
+    // interactive confirm can never be answered there, so run pi with the
+    // guard disabled (its catastrophic floor stays). Opt-in per profile
+    // because pi REJECTS the flag when the bash-guard extension is not
+    // loaded (unknown option), so it must never be a builtin default.
+    if (adapter.runtime === 'pi' && process.env.FLOCK_PI_BASH_GUARD_FLOOR === '1') {
+      childEnv.BASH_GUARD_AUTO_ALLOW ??= '1';
+    }
     // C10: the raw manifest `child` env rides through the unified --child-args
     // channel (form a) — merged over the flock-managed vars in the bridge
     if (manifest.child?.env) Object.assign(childEnv, manifest.child.env);
@@ -674,6 +711,91 @@ type NodeOutcome =
 // team down: close all LIVE pods of the named team + auto-snapshot.
 // A pod with a foreign runtime (non-pi) is NOT snapshotted — the honest
 // note goes to the report (the prompt: "team down их не включает").
+// ---------- campaigns (5.6) ----------
+//
+// A campaign is a named persistent goal with a lifecycle that survives
+// many pm wake-ups. The ops set the goal and the operator's intent; the
+// campaign tick walks the lifecycle deterministically; the pm does the
+// work (decompose / unblock) through ordinary ops.
+
+async function campaignNew(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const goal = String(op.goal ?? '').trim();
+  if (!goal) throw new OpError(400, 'goal required');
+  if (goal.length > 500) throw new OpError(400, 'goal too long (max 500)');
+  const pod = op.pod ? String(op.pod).trim() : null;
+  if (pod && !/^[a-z0-9][a-z0-9-]{0,30}$/.test(pod)) throw new OpError(400, `bad pod: ${pod}`);
+  const id = store.campaignIdFromGoal(ctx.store.db, goal);
+  const c = store.createCampaign(ctx.store, { id, goal, pod });
+  ctx.emit?.({ type: 'campaign_status', id, from: null, to: 'planning', reason: 'created' });
+  // pm trigger (durable inbox + poke): the pm decomposes the goal into
+  // tasks with task_add {campaign_id} — the tick picks it up (planning -> running).
+  void notifyPm(
+    ctx,
+    {
+      type: 'campaign_new',
+      detail: `Кампания ${id}: расклади цель в задачи — task_add {title, pod_role, campaign_id: "${id}"} (${pod ? `основной под: ${pod}` : 'под выбирай сам'}). Цель: ${goal.slice(0, 200)}`,
+      subject: id,
+    },
+  ).catch(() => {});
+  return c;
+}
+
+async function campaignLs(_op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const rows = store.listCampaigns(ctx.store).map((c) => {
+    const ts = store.campaignTasks(ctx.store, c.id);
+    const done = ts.filter((t) => t.status === 'done').length;
+    return { id: c.id, status: c.status, goal: c.goal.slice(0, 120), pod: c.pod, done, total: ts.length, note: c.note, updated_at: c.updated_at };
+  });
+  return { campaigns: rows };
+}
+
+async function campaignStatus(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '').trim();
+  const c = store.getCampaign(ctx.store, id);
+  if (!c) throw new OpError(404, `no campaign: ${id}`);
+  const tasks = store.campaignTasks(ctx.store, id).map((t) => ({
+    id: t.id,
+    title: t.title.slice(0, 120),
+    status: t.status,
+    pod: t.pod_role,
+    closed: t.closed,
+  }));
+  return { campaign: c, tasks };
+}
+
+async function campaignMove(op: Record<string, unknown>, ctx: CoreCtx, to: 'paused' | 'cancelled'): Promise<unknown> {
+  const id = String(op.id ?? '').trim();
+  const c = store.getCampaign(ctx.store, id);
+  if (!c) throw new OpError(404, `no campaign: ${id}`);
+  const allowed: Record<string, store.Campaign['status'][]> = {
+    paused: ['planning', 'running', 'blocked'],
+    cancelled: ['planning', 'running', 'blocked', 'paused'],
+  };
+  if (!allowed[to].includes(c.status)) {
+    throw new OpError(409, `campaign ${id} is ${c.status} — cannot ${to} from here`);
+  }
+  const from = c.status;
+  store.setCampaignStatus(ctx.store, id, to);
+  ctx.emit?.({ type: 'campaign_status', id, from, to, reason: 'operator' });
+  // ponytail: cancel/pause is a STATUS, not a cascade — tasks are left
+  // as-is (the operator or pm closes them deliberately).
+  return store.getCampaign(ctx.store, id);
+}
+
+async function campaignResume(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '').trim();
+  const c = store.getCampaign(ctx.store, id);
+  if (!c) throw new OpError(404, `no campaign: ${id}`);
+  if (c.status !== 'paused') throw new OpError(409, `campaign ${id} is ${c.status} — only paused campaigns resume`);
+  // resume target: running if work exists, planning if the pm never decomposed
+  const hasTasks = store.campaignTasks(ctx.store, id).length > 0;
+  const to = hasTasks ? 'running' : 'planning';
+  const from = c.status;
+  store.setCampaignStatus(ctx.store, id, to);
+  ctx.emit?.({ type: 'campaign_status', id, from, to, reason: 'operator resume' });
+  return store.getCampaign(ctx.store, id);
+}
+
 async function teamDown(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const name = String(op.name ?? '');
   if (!validateTeamName(name)) throw new OpError(400, `invalid team name: ${name || '(empty)'}`);
@@ -860,7 +982,7 @@ async function podClose(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   const role = requireRole(op);
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod) throw new OpError(404, `no pod: ${role}`);
-  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role) {
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role && !isCoordinator(ctx)) {
     throw new OpError(403, `pod token ${ctx.caller.role}: cannot close pod ${role}`);
   }
   try {
@@ -969,9 +1091,19 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   if (!title) throw new OpError(400, 'title required');
   // only enqueue for pods that exist (spawned or closed-then-reopenable)
   if (!store.getPodByRole(ctx.store, role)) throw new OpError(404, `no pod: ${role}`);
-  // pod token: own pod only (a pod cannot queue work for another pod)
-  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role) {
+  // pod token: own pod only, unless the coordinator (pm) queues team work
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== role && !isCoordinator(ctx)) {
     throw new OpError(403, `pod token ${ctx.caller.role}: cannot add a task for pod ${role}`);
+  }
+  // 5.6: optional campaign container (validates: exists, not terminal)
+  let campaignId: string | null = null;
+  if (op.campaign_id !== undefined) {
+    campaignId = String(op.campaign_id).trim();
+    const camp = store.getCampaign(ctx.store, campaignId);
+    if (!camp) throw new OpError(404, `no campaign: ${campaignId}`);
+    if (camp.status === 'cancelled' || camp.status === 'done') {
+      throw new OpError(409, `campaign ${campaignId} is ${camp.status} — add the task before closing it`);
+    }
   }
   const id = store.newId('t');
   store.insertTask(ctx.store, {
@@ -979,6 +1111,8 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
     title,
     body: op.body ? String(op.body) : null,
     podRole: role,
+    priority: op.priority !== undefined ? Number(op.priority) : undefined,
+    campaignId,
   });
   ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
   void notifyPm(ctx, { type: 'task_added', detail: `таск ${id} "${title.slice(0, 80)}" → pod ${role} (очередь)` }).catch(() => {});
@@ -1127,10 +1261,8 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
     }
   }
   // pod token: own pod's tasks only (an agent cannot report on another
-  // pod's work or cancel operator tasks)
-  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== task.pod_role) {
-    throw new OpError(403, `pod token ${ctx.caller.role}: task ${id} belongs to pod ${task.pod_role}`);
-  }
+  // pod's work or cancel operator tasks); the coordinator manages all
+  assertTaskScope(ctx, task.pod_role, 'task report');
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
   if (to === 'done') {
     // C3: hot-potato — a done task must carry its closure (reason from the
@@ -1188,10 +1320,8 @@ async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   if (task.workflow_instance_id) {
     throw new OpError(400, `task ${id} is a workflow step — close it with task_done (the DAG decides the next step)`);
   }
-  // pod token: own pod's tasks only
-  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== task.pod_role) {
-    throw new OpError(403, `pod token ${ctx.caller.role}: task ${id} belongs to pod ${task.pod_role}`);
-  }
+  // pod token: own pod's tasks only; the coordinator manages all
+  assertTaskScope(ctx, task.pod_role, 'handoff');
   // C15: cross-profile handoff — two-phase (honest, not atomic).
   // ponytail: an atomic cross-DB handoff is impossible under the single-
   // writer invariant (two cores = two writers). The ceiling is an EVENTUAL

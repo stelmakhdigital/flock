@@ -97,10 +97,19 @@ export async function pmDigest(ctx: CoreCtx): Promise<Record<string, unknown>> {
   );
   const runs = store.listRuns(s).filter((r) => !r.ended_at).map((r) => ({ pod: r.pod_role, run: r.id, started_at: r.started_at }));
   const messages = store.listInboxMessages(s, PM_ROLE, true, 20);
+  // 5.6: active campaigns — where the pm should look (status + progress)
+  const campaigns = store
+    .listCampaigns(s, false)
+    .map((c) => {
+      const ts = store.campaignTasks(s, c.id);
+      const done = ts.filter((t) => t.status === 'done').length;
+      return { id: c.id, status: c.status, goal: c.goal.slice(0, 120), done, total: ts.length, note: c.note };
+    });
   return {
     at: store.nowIso(),
     tasks: byStatus,
-    openTasks: open.map((t) => ({ id: t.id, title: t.title.slice(0, 80), status: t.status, pod: t.pod_role, claimed_at: t.claimed_at ?? null, closed: t.closed })),
+    openTasks: open.map((t) => ({ id: t.id, title: t.title.slice(0, 80), status: t.status, pod: t.pod_role, claimed_at: t.claimed_at ?? null, closed: t.closed, campaign_id: t.campaign_id })),
+    campaigns,
     waitingOnClosed,
     pods,
     liveRuns: runs,

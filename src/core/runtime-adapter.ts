@@ -480,6 +480,11 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       return { alive: false, reason: ex.code === 0 && !ex.signal ? 'clean' : `crashed(${ex.signal ? `signal ${ex.signal}` : `code ${ex.code}`})` };
     }
     if (launchId && st && st.launchId === launchId && !st.exited) {
+      if (st.bridge !== 'v2') {
+        // pre-v2 runner: cannot decode v2 frames — treat as unusable so the
+        // runkeeper marks the run and notifies instead of pokes rotting
+        return { alive: false, reason: `crashed(stale bridge: ${st.bridge ?? 'no marker'})` };
+      }
       const fg = await terminal.paneCommand(terminal.winTarget(binding.role)).catch(() => '');
       if (terminal.SHELL_COMMANDS.has(fg)) {
         return { alive: false, reason: 'crashed(runner gone, pane at shell)' };
@@ -491,6 +496,14 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   // (2) sendVerified — flockmsg v2: framed message (nonce), raw paste, ack =
   //     the sidecar's lastPrompt carrying our nonce (5s deadline, 300ms poll).
   async sendVerified(binding: PodBinding, text: string): Promise<SendVerifiedResult> {
+    // Stale-bridge guard: a pre-v2 runner (no `bridge` marker in its sidecar)
+    // decodes `flockmsg v2 <b64>` as v1 and forwards binary garbage to the
+    // agent. Refuse cleanly instead of pasting — the message stays in the
+    // inbox (durable) and the operator relaunches the pod.
+    const pre = terminal.readRunnerState(this.env.home, binding.role);
+    if (pre?.ready && pre.bridge !== 'v2') {
+      return { ok: false, attempts: 0, detail: `stale bridge (marker: ${pre.bridge ?? 'none'}) — relaunch the pod: flock pod relaunch ${binding.role}` };
+    }
     const nonce = newNonce();
     const wire = frameMessage(text, nonce);
     const res = await terminal.send(terminal.winTarget(binding.role), wire, { raw: true });

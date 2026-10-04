@@ -159,7 +159,14 @@ try {
   // `sleep` = the agent's foreground) -> alive. (The shell-foreground branch
   // is the same SHELL_COMMANDS rule as the old runkeeper — verified live in
   // E2E, where a dead claude/pi foreground reports crashed.)
+  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', bridge: 'v2' }));
+  // stale bridge: a pre-v2 runner (no `bridge` marker) cannot decode v2
+  // frames — liveness reports it unusable (runkeeper marks + notifies)
   fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x' }));
+  r = await adapter.liveness!(binding, run('la_1'));
+  assert.strictEqual(r.alive, false, 'stale bridge is not alive');
+  assert.match(String(r.reason), /stale bridge/);
+  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', bridge: 'v2' }));
   const { execFile: ef } = await import('node:child_process');
   const { promisify: pf } = await import('node:util');
   const tmuxTry = (a: string[]) => pf(ef)('tmux', a).then(() => true).catch(() => false);

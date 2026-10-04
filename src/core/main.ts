@@ -13,6 +13,7 @@ import { runRetentionSweep } from './retention.js';
 import { writePodAgentsMd, adapterForPod } from './ops.js';
 import { runEscalationTick } from './escalation.js';
 import { runFleetTick } from './fleet-tick.js';
+import { runCampaignTick } from './campaign-tick.js';
 import type { RunLike } from './runtime-adapter.js';
 import type { CoreCtx } from './ops.js';
 
@@ -137,6 +138,13 @@ ticks.register('escalation', 30_000, () => {
 ticks.register('fleet', 60_000, () => {
   runFleetTick(ctx).catch((e) => {
     console.warn('[core] fleet tick failed:', e instanceof Error ? e.message : e);
+  });
+});
+// 5.6: campaigns (30s): deterministic lifecycle walk (planning/running/
+// blocked + the 5.4c ladder for stalls). No LLM — the pm does the work.
+ticks.register('campaigns', 30_000, () => {
+  runCampaignTick(ctx).catch((e) => {
+    console.warn('[core] campaigns tick failed:', e instanceof Error ? e.message : e);
   });
 });
 // watchdog: declarative checks registered by agents/CLI (1s tick)

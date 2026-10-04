@@ -85,6 +85,10 @@ export interface RunnerState {
   ready: boolean;
   launchId: string;
   updatedAt: string;
+  /** Bridge protocol marker ("v2"). Pre-marker builds (v1-only runners)
+   *  cannot decode `flockmsg v2` frames — the core refuses to paste to them
+   *  instead of delivering binary garbage (see sendVerified). */
+  bridge?: string;
   sessionFile?: string;
   sessionId?: string;
   streaming?: boolean; // typed busy flag (improvement: arbiter/health use it)

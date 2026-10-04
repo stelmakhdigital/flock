@@ -59,7 +59,7 @@ const USAGE = `flock — core CLI
   flock watchdog ls
   flock watchdog history <id>
   flock watchdog cancel <id>
-  flock task add <role> <title...> [--body TEXT]
+  flock task add <role> <title...> [--body TEXT] [--campaign ID]
   flock task ls [status]
   flock task history <id>
   flock task done <id> <reason: finished|blocked|denied|canceled|escalated>
@@ -79,7 +79,7 @@ const USAGE = `flock — core CLI
   flock workflow start <name> [payload...]
   flock workflow ls
   flock workflow status <instance_id>
-  flock task add <role> "title" [--body ...]
+  flock task add <role> "title" [--body ...] [--campaign ID]
   flock terminal check`;
 
 const [, , cmd, sub, ...rest] = process.argv;
@@ -308,6 +308,41 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'fleet_rm', name }));
       } else {
         console.log('usage: flock fleet add <name> <url> [--token] | ls | rm <name>');
+      }
+      return;
+    }
+
+    // 5.6: campaigns — named persistent goals
+    case 'campaign': {
+      if (sub === 'new') {
+        // goal = everything except the flags (join the words back)
+        const pi = rest.indexOf('--pod');
+        const goalParts = rest.filter((r, i) => !r.startsWith('--') && (pi < 0 || i !== pi + 1));
+        const goal = goalParts.join(' ').trim();
+        const pod = pi >= 0 ? rest[pi + 1] : undefined;
+        if (!goal) {
+          console.error('usage: flock campaign new <goal> [--pod <role>]');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'campaign_new', goal, pod }));
+      } else if (sub === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'campaign_ls' }));
+      } else if (sub === 'status') {
+        const id = rest.find((r) => !r.startsWith('-'));
+        if (!id) {
+          console.error('usage: flock campaign status <id>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'campaign_status', id }));
+      } else if (sub === 'pause' || sub === 'resume' || sub === 'cancel') {
+        const id = rest.find((r) => !r.startsWith('-'));
+        if (!id) {
+          console.error(`usage: flock campaign ${sub} <id>`);
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: `campaign_${sub}`, id }));
+      } else {
+        console.log('usage: flock campaign new <goal> [--pod] | ls | status <id> | pause|resume|cancel <id>');
       }
       return;
     }
@@ -665,18 +700,24 @@ async function main(): Promise<void> {
         const role = args[0];
         const rest2 = args.slice(1);
         const bi = rest2.indexOf('--body');
+        const ci = rest2.indexOf('--campaign');
         let body: string | undefined;
+        let campaignId: string | undefined;
         let titleArgs = rest2;
         if (bi >= 0) {
           body = rest2[bi + 1];
           titleArgs = [...rest2.slice(0, bi), ...rest2.slice(bi + 2)];
         }
+        if (ci >= 0) {
+          campaignId = rest2[ci + 1];
+          titleArgs = [...titleArgs.slice(0, ci), ...titleArgs.slice(ci + 2)];
+        }
         const title = titleArgs.join(' ').trim();
         if (!role || !title) {
-          console.error('usage: flock task add <role> <title...> [--body TEXT]');
+          console.error('usage: flock task add <role> <title...> [--body TEXT] [--campaign ID]');
           process.exit(1);
         }
-        print(await api('POST', '/api/ops', { type: 'task_add', role, title, body }));
+        print(await api('POST', '/api/ops', { type: 'task_add', role, title, body, ...(campaignId ? { campaign_id: campaignId } : {}) }));
       } else if (action === 'ls') {
         print(await api('GET', `/api/tasks${args[0] ? `?status=${encodeURIComponent(args[0])}` : ''}`));
       } else if (action === 'history') {
