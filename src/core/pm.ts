@@ -47,6 +47,11 @@ export function validateIntent(i: Record<string, unknown>): string | null {
   }
   if (op === 'task_done' || op === 'task_blocked' || op === 'task_needs' || op === 'task_cancel' || op === 'task_unblock') {
     if (!String(i.id ?? '').trim()) return `${op}: id required`;
+    if (op === 'task_done') {
+      // C3: hot-potato — the closure reason is required
+      if (!String(i.reason ?? '').trim()) return 'task_done: reason required (closure vocabulary)';
+      return null;
+    }
     if (op === 'task_blocked' || op === 'task_needs') return String(i.reason ?? '').trim() ? null : `${op}: reason required`;
   }
   if (op === 'pod_send') {

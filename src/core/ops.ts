@@ -112,7 +112,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   task_history: { group: 'task', scopes: ['operator', 'pod'], summary: 'task transitions (audit)', run: (o, c) => taskHistory(o, c) },
   task_cancel: { group: 'task', scopes: ['operator'], summary: 'cancel a task', run: async (o, c) => { await pmNotifyMaybe(c, 'task_cancelled', o, 'cancelled'); return taskReport(o, c, 'cancelled'); } },
   task_unblock: { group: 'task', scopes: ['operator', 'pod'], summary: 'unblock a task (-> queued; pod token: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_unblocked', o, 'queued'); return taskReport(o, c, 'queued'); } },
-  task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task done (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
+  task_done: { group: 'task', scopes: ['operator', 'pod'], summary: 'close a task (C3 hot-potato: {reason, target?} from the closure vocabulary)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_done', o, 'done'); return taskReport(o, c, 'done'); } },
+  task_handoff: { group: 'task', scopes: ['operator', 'pod'], summary: 'transactional handoff: close (handed-off) + create the successor at {to}', run: (o, c) => taskHandoff(o, c) },
   task_blocked: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task blocked (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_blocked', o, 'blocked'); return taskReport(o, c, 'blocked'); } },
   task_needs: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task needs help (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_needs', o, 'needs'); return taskReport(o, c, 'needs'); } },
   // -- pm / goal loop ---------------------------------------------------------
@@ -555,7 +556,8 @@ Core присылает задачи сообщением вида:
 
 Выполни работу, затем отчитайся ИМЕННО командой (не просто текстом в ответе):
 
-- задача выполнена:        flock task done <id>
+- задача выполнена:        flock task done <id> '<reason: finished|blocked|denied|canceled|escalated>'
+  (reason из этого набора — закрытие без причины отклоняется core)
 - заблокирован:            flock task blocked <id> '<краткая причина>'
 - нужен человек/решение:    flock task needs <id> '<что именно нужно>'
 
@@ -672,22 +674,77 @@ async function taskReport(op: Record<string, unknown>, ctx: CoreCtx, to: string)
     throw new OpError(403, `pod token ${ctx.caller.role}: task ${id} belongs to pod ${task.pod_role}`);
   }
   const by = op.registeredBy ? String(op.registeredBy) : 'cli';
-  const finalTo = to;
-  const reason =
-    (finalTo === 'blocked' || finalTo === 'needs') && op.reason ? String(op.reason).slice(0, 200) :
-    finalTo === 'cancelled' ? 'cancelled' : `reported by ${by}`;
-  // done: optional result text (carried into the next workflow step)
-  const result =
-    finalTo === 'blocked' || finalTo === 'needs' ? reason :
-    finalTo === 'done' && op.result ? String(op.result).slice(0, 400) : null;
+  if (to === 'done') {
+    // C3: hot-potato — a done task must carry its closure (reason from the
+    // vocabulary; target for handed-off/escalated)
+    const reason = String(op.reason ?? '').trim();
+    if (!reason) {
+      throw new OpError(400, `task done requires a closure reason (want: ${store.CLOSURE_REASONS.join(' | ')})`);
+    }
+    try {
+      store.closeWorkItem(ctx.store, id, 'done', {
+        reason: reason as store.ClosureReason,
+        target: op.target !== undefined ? String(op.target) : undefined,
+        by,
+        result: op.result !== undefined ? String(op.result).slice(0, 400) : null,
+      });
+    } catch (e) {
+      throw new OpError(409, e instanceof Error ? e.message : String(e));
+    }
+    ctx.emit?.({ type: 'task_done', taskId: id, pod: task.pod_role, reason });
+    advanceWorkflow(ctx, id);
+    return store.getTask(ctx.store, id);
+  }
+  if (to === 'cancelled') {
+    // C3: cancelled is terminal too — closed with reason 'canceled'
+    try {
+      store.closeWorkItem(ctx.store, id, 'cancelled', { reason: 'canceled', by, result: null });
+    } catch (e) {
+      throw new OpError(409, e instanceof Error ? e.message : String(e));
+    }
+    ctx.emit?.({ type: 'task_cancelled', taskId: id, pod: task.pod_role, reason: 'cancelled' });
+    advanceWorkflow(ctx, id);
+    return store.getTask(ctx.store, id);
+  }
+  // non-terminal (blocked / needs / queued via unblock): status only, no
+  // closure — the escalation ladder (5.4c) reads these as before
+  const reason = (to === 'blocked' || to === 'needs') && op.reason ? String(op.reason).slice(0, 200) : 'unblocked';
   try {
-    store.setTaskStatus(ctx.store, id, finalTo, { reason, result });
+    store.setTaskStatus(ctx.store, id, to, { reason, result: to === 'blocked' || to === 'needs' ? reason : null });
   } catch (e) {
     throw new OpError(409, e instanceof Error ? e.message : String(e));
   }
-  ctx.emit?.({ type: `task_${finalTo}`, taskId: id, pod: task.pod_role, reason });
+  ctx.emit?.({ type: `task_${to}`, taskId: id, pod: task.pod_role, reason });
   advanceWorkflow(ctx, id);
   return store.getTask(ctx.store, id);
+}
+
+// C3: transactional handoff — the task closes (reason 'handed-off') and the
+// successor is created for the target pod in the same store transaction.
+async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '');
+  const to = String(op.to ?? '').trim();
+  const task = store.getTask(ctx.store, id);
+  if (!task) throw new OpError(404, `no task: ${id}`);
+  if (task.status === 'done' || task.status === 'cancelled') throw new OpError(409, `task ${id} is already ${task.status}`);
+  if (task.workflow_instance_id) {
+    throw new OpError(400, `task ${id} is a workflow step — close it with task_done (the DAG decides the next step)`);
+  }
+  // pod token: own pod's tasks only
+  if (ctx.caller?.kind === 'pod' && ctx.caller.role !== task.pod_role) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: task ${id} belongs to pod ${task.pod_role}`);
+  }
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad target role: ${to}`);
+  const targetPod = store.getPodByRole(ctx.store, to);
+  if (!targetPod) throw new OpError(404, `no pod: ${to} (spawn it first)`);
+  const by = op.registeredBy ? String(op.registeredBy) : 'cli';
+  try {
+    const r = store.handoffTask(ctx.store, id, to, by);
+    ctx.emit?.({ type: 'task_handoff', taskId: id, from: task.pod_role, to, newTaskId: r.to.id });
+    return { closed: r.from, next: r.to };
+  } catch (e) {
+    throw new OpError(409, e instanceof Error ? e.message : String(e));
+  }
 }
 
 // ---------- team ----------

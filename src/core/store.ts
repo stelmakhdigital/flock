@@ -308,12 +308,21 @@ ALTER TABLE pods DROP COLUMN branch;
 ALTER TABLE pods DROP COLUMN merge_policy;
 ALTER TABLE workflow_instances DROP COLUMN require_test;
 `,
-  },
-  {
+  },  {
     // C2: economy is out of core — usage_events goes with the usage tick.
     name: '016_economy_drop',
     sql: `
 DROP TABLE IF EXISTS usage_events;
+`,
+  },
+  {
+    // C3: hot-potato closure — a terminal task state carries the closure
+    // {reason, target?, at, by}; the closure rides the terminal transition
+    // too (task_transitions.closed) so the audit trail is self-contained.
+    name: '017_tasks_closed',
+    sql: `
+ALTER TABLE tasks ADD COLUMN closed TEXT;
+ALTER TABLE task_transitions ADD COLUMN closed TEXT;
 `,
   },
 ];
@@ -573,6 +582,20 @@ export interface Task {
   workflow_instance_id: string | null;
   workflow_step: string | null;
   priority: number;
+  closed: string | null; // C3: JSON {reason, target?, at, by} — terminal states only
+}
+
+// C3: hot-potato closure vocabulary. A unit of work cannot be closed
+// without a reason; handed-off/escalated must name their target.
+export const CLOSURE_REASONS = ['finished', 'handed-off', 'blocked', 'denied', 'canceled', 'escalated'] as const;
+export type ClosureReason = (typeof CLOSURE_REASONS)[number];
+export const CLOSURE_TARGET_REQUIRED: ClosureReason[] = ['handed-off', 'escalated'];
+
+export interface Closure {
+  reason: ClosureReason;
+  target?: string;
+  at: string;
+  by: string;
 }
 
 const TASK_FLOW: Record<string, string[]> = {
@@ -649,6 +672,90 @@ export function listTaskTransitions(store: Store, taskId: string): unknown[] {
   return dbOf(store)
     .prepare('SELECT * FROM task_transitions WHERE task_id = ? ORDER BY id ASC')
     .all(taskId);
+}
+
+// C3: the ONLY path to a terminal task state (done/cancelled). Validates the
+// hot-potato closure (reason from the vocabulary; target required for
+// handed-off/escalated) and writes tasks.closed + the terminal transition
+// (with the closure) in one transaction. ponytail: the event-log row (C5)
+// joins here once the events table exists.
+export function closeWorkItem(
+  store: Store,
+  id: string,
+  to: 'done' | 'cancelled',
+  closure: { reason: ClosureReason; target?: string; by: string; result?: string | null },
+): void {
+  const db = dbOf(store);
+  const cur = db.prepare('SELECT status FROM tasks WHERE id = ?').get(id) as { status: string } | undefined;
+  if (!cur) throw new Error(`no task: ${id}`);
+  if (!(CLOSURE_REASONS as readonly string[]).includes(closure.reason)) {
+    throw new Error(`invalid closure reason: ${String(closure.reason)} (want: ${CLOSURE_REASONS.join(' | ')})`);
+  }
+  if (CLOSURE_TARGET_REQUIRED.includes(closure.reason) && !String(closure.target ?? '').trim()) {
+    throw new Error(`closure ${closure.reason} requires target`);
+  }
+  if (cur.status === to) return; // idempotent no-op (same-state report)
+  if (!TASK_FLOW[cur.status]?.includes(to)) {
+    throw new Error(`bad task transition: ${cur.status} -> ${to}`);
+  }
+  const now = nowIso();
+  const closed: Closure = { reason: closure.reason, at: now, by: closure.by };
+  if (String(closure.target ?? '').trim()) closed.target = String(closure.target).trim();
+  const closedJson = JSON.stringify(closed);
+  db.exec('BEGIN');
+  try {
+    if (closure.result !== undefined) {
+      db.prepare('UPDATE tasks SET status = ?, closed = ?, finished_at = ?, result = ? WHERE id = ?').run(to, closedJson, now, closure.result, id);
+    } else {
+      db.prepare('UPDATE tasks SET status = ?, closed = ?, finished_at = ? WHERE id = ?').run(to, closedJson, now, id);
+    }
+    db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, closed, ts) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, cur.status, to, closure.reason, closedJson, now);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+// C3: transactional handoff — the old task closes (reason 'handed-off',
+// target = toRole) and the successor task is created for toRole in the SAME
+// transaction: a lost handoff is impossible by construction.
+export function handoffTask(
+  store: Store,
+  id: string,
+  toRole: string,
+  by: string,
+): { from: Task; to: Task } {
+  const db = dbOf(store);
+  const t = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | undefined;
+  if (!t) throw new Error(`no task: ${id}`);
+  if (!TASK_FLOW[t.status]?.includes('done')) {
+    throw new Error(`bad task transition: ${t.status} -> done (handoff)`);
+  }
+  const now = nowIso();
+  const closed: Closure = { reason: 'handed-off', target: toRole, at: now, by };
+  const closedJson = JSON.stringify(closed);
+  const succId = newId('t');
+  const body = [
+    t.body,
+    `Передано (handoff) из таска ${id} (pod ${t.pod_role}) — продолжай с места остановки.`,
+  ].filter(Boolean).join('\n') || null;
+  db.exec('BEGIN');
+  try {
+    db.prepare('UPDATE tasks SET status = ?, closed = ?, finished_at = ? WHERE id = ?').run('done', closedJson, now, id);
+    db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, closed, ts) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, t.status, 'done', 'handed-off', closedJson, now);
+    db.prepare('INSERT INTO tasks(id, title, body, pod_role, status, created_at, workflow_instance_id, workflow_step, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(succId, t.title, body, toRole, 'queued', now, null, null, t.priority);
+    db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, ts) VALUES (?, NULL, ?, ?, ?)')
+      .run(succId, 'queued', `handoff from ${id}`, now);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return { from: getTask(store, id)!, to: getTask(store, succId)! };
 }
 
 // ---------- workflows (multi-step pipelines over the task queue) ----------

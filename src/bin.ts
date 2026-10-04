@@ -60,9 +60,10 @@ const USAGE = `flock — core CLI
   flock task add <role> <title...> [--body TEXT]
   flock task ls [status]
   flock task history <id>
-  flock task done <id> [result...]
+  flock task done <id> <reason: finished|blocked|denied|canceled|escalated>
   flock task blocked <id> [reason...]
   flock task needs <id> [reason...]
+  flock task handoff <id> <to-role>   # transactional: close (handed-off) + successor у to
   flock task cancel <id>
   flock task unblock <id>               # blocked → queued (arbiter возьмёт заново)
   flock workflow define <name> --steps "id1:role1,id2:role2"
@@ -449,11 +450,12 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'task_history', id: args[0] }));
       } else if (action === 'unblock') {
         print(await api('POST', '/api/ops', { type: 'task_unblock', id: args[0] }));
-      } else if (action === 'done' || action === 'blocked' || action === 'needs' || action === 'cancel') {
+      } else if (action === 'done' || action === 'blocked' || action === 'needs' || action === 'cancel' || action === 'handoff') {
         const op =
-          action === 'done' ? { type: 'task_done', id: args[0], result: args.slice(1).join(' ') } :
+          action === 'done' ? { type: 'task_done', id: args[0], reason: args.slice(1).join(' ') } :
           action === 'blocked' ? { type: 'task_blocked', id: args[0], reason: args.slice(1).join(' ') } :
           action === 'needs' ? { type: 'task_needs', id: args[0], reason: args.slice(1).join(' ') } :
+          action === 'handoff' ? { type: 'task_handoff', id: args[0], to: args[1] } :
           { type: 'task_cancel', id: args[0] };
         // from inside a pod window attribute the report to the pod
         print(await api('POST', '/api/ops', { ...op, ...(process.env.FLOCK_POD_ROLE ? { registeredBy: process.env.FLOCK_POD_ROLE } : {}) }));

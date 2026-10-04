@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { validateIntent } from './pm.js';
 
 // whitelisted ops pass
-assert.strictEqual(validateIntent({ op: 'task_done', id: 't_1' }), null);
+assert.strictEqual(validateIntent({ op: 'task_done', id: 't_1', reason: 'finished' }), null);
 assert.strictEqual(validateIntent({ op: 'task_add', title: 'x' }), null);
 assert.strictEqual(validateIntent({ op: 'task_add', title: 'x', pod_role: 'dev' }), null);
 assert.strictEqual(validateIntent({ op: 'task_needs', id: 't_1', reason: 'r' }), null);
@@ -26,6 +26,7 @@ assert.ok(validateIntent({})?.includes('whitelist'));
 assert.ok(validateIntent({ op: 'task_add' })?.includes('title'));
 assert.ok(validateIntent({ op: 'task_add', title: '', pod_role: 'dev' })?.includes('title'));
 assert.ok(validateIntent({ op: 'task_done' })?.includes('id'));
+assert.ok(validateIntent({ op: 'task_done', id: 't_1' })?.includes('reason')); // C3: closure reason required
 assert.ok(validateIntent({ op: 'task_needs', id: 't_1' })?.includes('reason'));
 assert.ok(validateIntent({ op: 'task_blocked', id: 't_1' })?.includes('reason'));
 assert.ok(validateIntent({ op: 'task_cancel', id: 't_1' }) === null); // no reason for cancel

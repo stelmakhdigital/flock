@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { openStore, setTaskStatus, setWorkflowInstanceState } from './store.js';
+import { openStore, setTaskStatus, setWorkflowInstanceState, closeWorkItem, handoffTask } from './store.js';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-tf-'));
 const db = openStore(home);
@@ -30,6 +30,28 @@ setTaskStatus(db, 't_a', 'active');
 setTaskStatus(db, 't_a', 'cancelled');
 assert.throws(() => setTaskStatus(db, 't_a', 'done'), /bad task transition/, 'terminal state is terminal');
 
+// C3: hot-potato closure — closeWorkItem is the only terminal path
+const rawC = new DatabaseSync(path.join(home, 'flock.db'));
+rawC.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_c', 'c', 'dev', 'active', ?)").run(new Date().toISOString());
+rawC.close();
+assert.throws(() => closeWorkItem(db, 't_c', 'done', { reason: 'bogus' as never, by: 'test' }), /invalid closure reason/);
+assert.throws(() => closeWorkItem(db, 't_c', 'done', { reason: 'handed-off', by: 'test' }), /requires target/);
+closeWorkItem(db, 't_c', 'done', { reason: 'finished', by: 'dev' });
+const closedTask = (new DatabaseSync(path.join(home, 'flock.db')).prepare('SELECT closed, status FROM tasks WHERE id = ?').get('t_c') as { closed: string; status: string }) || null;
+assert.strictEqual(closedTask!.status, 'done');
+assert.match(closedTask!.closed, /\"reason\":\"finished\"/);
+// handoff: one transaction — old closed (handed-off) + successor created
+const rawC2 = new DatabaseSync(path.join(home, 'flock.db'));
+rawC2.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_c2', 'c', 'dev', 'active', ?)").run(new Date().toISOString());
+rawC2.prepare("INSERT OR IGNORE INTO pods(id, role, dir, state, created_at) VALUES ('pod_q', 'q', ?, 'live', ?)").run(path.join(home, 'pods', 'q'), new Date().toISOString());
+rawC2.close();
+const ho = handoffTask(db, 't_c2', 'q', 'dev');
+assert.strictEqual(ho.from.status, 'done');
+assert.strictEqual(ho.to.status, 'queued');
+assert.strictEqual(ho.to.pod_role, 'q');
+assert.match(ho.to.body ?? '', /handoff/);
+assert.match(ho.from.closed ?? '', /\"target\":\"q\"/);
+
 fs.rmSync(home, { recursive: true, force: true });
 
 // 5.4b S3: frozen step task — a stopped workflow instance rejects late state
@@ -50,11 +72,19 @@ fs.rmSync(home, { recursive: true, force: true });
   setWorkflowInstanceState(db2, 'wfi1', 'blocked');
   let threw = false;
   try {
-    await apply({ type: 'task_done', id: 't_f1' }, ctx);
+    await apply({ type: 'task_done', id: 't_f1', reason: 'finished' }, ctx);
   } catch (e) {
     threw = /frozen/.test(String((e as Error).message));
   }
   assert.ok(threw, 'frozen instance rejects the late state change');
+  // C3: hot-potato — task done without a closure reason is refused
+  let refused = false;
+  try {
+    await apply({ type: 'task_done', id: 't_f1' }, ctx);
+  } catch (e) {
+    refused = /closure reason/.test(String((e as Error).message)) || /frozen/.test(String((e as Error).message));
+  }
+  assert.ok(refused, 'task done without reason is refused');
   fs.rmSync(home2, { recursive: true, force: true });
   console.log('task-flow: frozen step task checks passed');
 }

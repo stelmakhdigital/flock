@@ -84,7 +84,7 @@ function claimPrompt(task: store.Task): string {
     body,
     '',
     'Протокол: когда закончишь — выполни в bash одну из команд:',
-    `  flock task done ${task.id}`,
+    `  flock task done ${task.id} '<reason: finished|blocked|denied|canceled|escalated>'`,
     `  flock task blocked ${task.id} '<краткая причина>'`,
     `  flock task needs ${task.id} '<что нужно от человека>'`,
   ].join('\n');
