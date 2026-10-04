@@ -6,3 +6,13 @@ AGENTS.md
 .flock/
 *.log
 .wt-demo/
+
+# артефакты/память агентов (w1/p1/j1) — не коммитить
+task.md
+agents/
+memory/
+artifacts/
+screenshots/
+*.secret
+.env
+secrets/
