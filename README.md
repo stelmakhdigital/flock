@@ -134,7 +134,7 @@ imports?, profiles?}`. Встроенные: `pi`, `bash`, `claude`, `codex`, `p
   (одна строка для любого текста), ack — из sidecar, не с экрана;
 - **relaunch с памятью (честный resume)**: `flock pod relaunch <role>`
   перезапускает ТОЧНЫЙ persisted session-файл (pi: `--session <file>`,
-  claude: `--resume <uuid>`); файла нет → retry_fresh с записью в meta,
+  claude: `--resume <uuid>`); файла нет → relaunch падает с recovery `attention_required` (C6: failed resume fails loudly; чистый старт — явный `flock pod relaunch <role> --fresh`) с записью в meta,
   никогда silent fresh; `--fork [role]` — форк сессии (pi: `--fork <ref>`,
   claude: `--resume <uuid> --fork-session`); `flock pod resume-token <role>
   <file|uuid|reset>` — зафиксировать сессию для resume (иначе — последняя);

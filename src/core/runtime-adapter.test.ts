@@ -32,7 +32,7 @@ const res = resolveLaunchMode({ resumeToken: '/s/f.jsonl' });
 assert.deepStrictEqual(res, { mode: 'resume', sessionFile: '/s/f.jsonl' });
 const bad = resolveLaunchMode({ resumeToken: 'nope' });
 assert.strictEqual(bad.mode, 'error');
-assert.strictEqual(bad.recovery, 'retry_fresh');
+assert.strictEqual(bad.recovery, 'attention_required'); // C6: no retry_fresh
 const fk = resolveLaunchMode({ forkSource: { kind: 'native_id', value: '/s/parent.jsonl' } });
 assert.deepStrictEqual(fk, { mode: 'fork', forkRef: '/s/parent.jsonl' });
 assert.strictEqual(resolveLaunchMode({ forkSource: { kind: 'name', value: 'x' } }).mode, 'error');

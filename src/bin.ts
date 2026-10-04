@@ -30,7 +30,7 @@ const USAGE = `flock — core CLI
       plain-dir: под получает рабочую директорию; git за агентами (core git не видит)
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
       pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
-  flock pod relaunch <role> [--model M] [--fork [role]] [--profile P]   # --fork (без аргумента) = форк своей сессии
+  flock pod relaunch <role> [--model M] [--fork [role]] [--profile P] [--fresh]   # --fork (без аргумента) = форк своей сессии; --fresh = явный чистый старт (C6)
   flock pod spawn <role> [--agent X] [--profile P]   # профиль манифеста (override-set)
   flock pod resume-token <role> <file|reset>   # зафиксировать сессию для resume (иначе — последняя)
   flock pod status [role]
@@ -197,7 +197,15 @@ async function main(): Promise<void> {
         }));
       } else if (action === 'relaunch') {
         const flags = rest.slice(1);
-        print(await api('POST', '/api/ops', { type: 'pod_relaunch', role, model: flag(flags, '--model'), profile: flag(flags, '--profile'), fork: flag(flags, '--fork') ?? role }));
+        const fresh = flags.includes('--fresh');
+        print(await api('POST', '/api/ops', {
+          type: 'pod_relaunch',
+          role,
+          model: flag(flags, '--model'),
+          profile: flag(flags, '--profile'),
+          fork: fresh ? undefined : (flag(flags, '--fork') ?? role),
+          fresh: fresh || undefined,
+        }));
       } else if (action === 'resume-token') {
         print(await api('POST', '/api/ops', { type: 'pod_set_resume_token', role, token: rest[1] }));
       } else if (action === 'status') {

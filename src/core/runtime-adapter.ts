@@ -31,6 +31,7 @@ import {
   resolveLaunchMode,
   resolveTrust,
   ForkSource,
+  parseRunnerState,
   seatPaths,
   readActivity,
   detectGate,
@@ -56,6 +57,7 @@ import {
   buildCodexBridgeCommand,
   buildCodexConfig,
   codexHome,
+  codexRolloutForThread,
   codexShimPort,
   CODEX_BRIDGE_READY_MARKER,
   validateCodexSessionToken,
@@ -134,7 +136,7 @@ export type LaunchResult =
       resumeToken?: string; // pi: the session file to persist for relaunch; codex: the thread id
       resumeType?: 'pi_session_file' | 'claude_session_uuid' | 'codex_thread_id';
     }
-  | { ok: false; error: string; recovery?: 'retry_fresh' | 'attention_required'; evidence?: string };
+  | { ok: false; error: string; recovery?: 'attention_required'; evidence?: string };
 
 export interface ReadyResult {
   ready: boolean;
@@ -294,6 +296,26 @@ export function pruneManagedBlocks(targetPath: string, keep: Set<string>): void 
 
 // ── Pi runtime ──────────────────────────────────────────────────────────────
 
+// ---------- live session probe (C6) ----------
+// The session file must exist and be non-empty; a corrupt sidecar (parse
+// failure) means the last runner never reached ready — resuming against an
+// assumed session is exactly what C6 forbids. ponytail: the sidecar is
+// written by our own bridge, so parse-failure IS the staleness signal.
+function probePiSession(sessionFile: string): { ok: true } | { ok: false; detail: string } {
+  if (!fs.existsSync(sessionFile)) return { ok: false, detail: `session file missing: ${sessionFile}` };
+  if (fs.statSync(sessionFile).size === 0) return { ok: false, detail: `session file is empty: ${sessionFile}` };
+  const parent = path.dirname(sessionFile);
+  // …/pods/<role>/.pi/sessions/*.jsonl -> seat root is two levels up
+  if (path.basename(parent) === 'sessions') {
+    const statePath = path.join(path.dirname(parent), 'runner-state.json');
+    if (fs.existsSync(statePath)) {
+      const st = parseRunnerState(fs.readFileSync(statePath, 'utf8'));
+      if (!st) return { ok: false, detail: 'runner-state sidecar is corrupt (last launch never reached ready)' };
+    }
+  }
+  return { ok: true };
+}
+
 export class PiRuntimeAdapter implements RuntimeAdapter {
   readonly runtime = 'pi';
   constructor(
@@ -358,8 +380,19 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     const mode = resolveLaunchMode(opts);
     if (mode.mode === 'error') return { ok: false, error: mode.error, recovery: mode.recovery };
 
-    if (mode.mode === 'resume' && !fs.existsSync(mode.sessionFile)) {
-      return { ok: false, error: `resume: session file no longer exists: ${mode.sessionFile}`, recovery: 'retry_fresh' };
+    if (mode.mode === 'resume') {
+      // C6 strict honest resume: a missing session file is attention_required
+      // (the operator decides: --fresh or fix the pin) — never a silent fresh.
+      if (!fs.existsSync(mode.sessionFile)) {
+        return { ok: false, error: `resume: session file no longer exists: ${mode.sessionFile}`, recovery: 'attention_required' };
+      }
+      // probe the live session before committing to it (sidecar must agree
+      // on the launchId scope; a stale sidecar from a dead process is a
+      // failed resume, not an assumption)
+      const probe = probePiSession(mode.sessionFile);
+      if (!probe.ok) {
+        return { ok: false, error: `resume: live session probe failed: ${probe.detail}`, recovery: 'attention_required' };
+      }
     }
     if (mode.mode === 'fork' && (mode.forkRef.includes('/') || fs.existsSync(mode.forkRef))) {
       // Looks like a path (role refs are resolved to paths by the caller).
@@ -626,7 +659,9 @@ export class ClaudeRuntimeAdapter implements RuntimeAdapter {
       return { ok: false, error: `invalid claude session token: ${token ?? '(empty)'}`, recovery: 'attention_required' };
     }
     if (mode !== 'fresh' && !fs.existsSync(path.join(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd), `${token}.jsonl`))) {
-      return { ok: false, error: `resume: transcript not found: ${token}`, recovery: 'retry_fresh' };
+      // C6 strict honest resume: a missing transcript is attention_required
+      // (the operator chooses --fresh) — never a silent fresh start.
+      return { ok: false, error: `resume: transcript not found: ${token}`, recovery: 'attention_required' };
     }
     // permission axis (claude-native): manifest permissionMode, binding
     // override, full_bypass forces bypassPermissions
@@ -864,6 +899,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return st?.sessionId ?? null;
   }
 
+  // C6 probe: does a rollout for this thread exist under $CODEX_HOME/sessions
+  // (recursive — the date-partitioned layout)?
+  probeSession(binding: PodBinding, threadId: string): { ok: true } | { ok: false; detail: string } {
+    const seat = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);
+    const sessions = path.join(codexHome(seat), 'sessions');
+    if (!fs.existsSync(sessions)) return { ok: false, detail: `no sessions dir: ${sessions}` };
+    const found = codexRolloutForThread(sessions, threadId);
+    return found ? { ok: true } : { ok: false, detail: `rollout for thread ${threadId} not found under ${sessions}` };
+  }
+
   async launchHarness(
     binding: PodBinding,
     opts: { launchId: string; resumeToken?: string; forkSource?: ForkSource },
@@ -879,6 +924,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (mode !== 'fresh') {
       const v = validateCodexSessionToken(token);
       if (!v.ok) return { ok: false, error: `codex: ${v.error}`, recovery: 'attention_required' };
+    }
+    // C6 probe: the thread's rollout must exist before we commit to resuming/forking it.
+    if (mode !== 'fresh' && token) {
+      const seat0 = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);
+      const probe = this.probeSession({ ...binding, seatRoot: seat0 }, token);
+      if (!probe.ok) return { ok: false, error: `resume: ${probe.detail}`, recovery: 'attention_required' };
     }
 
     const seat = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);

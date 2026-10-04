@@ -167,7 +167,7 @@ export function listOps(): Array<{ type: string; group: string; summary: string;
 // Shared spawn path for pod_spawn and pod_relaunch.
 // v3.1: the RuntimeAdapter owns projection, startup delivery, harness launch
 // and the typed ready gate; core owns state. pi: honest resume via exact
-// session file (relaunch) / fork via native_id, retry_fresh on a missing
+// session file (relaunch) / fork via native_id; C6: a failed resume is attention_required (operator decides, explicit --fresh)ing
 // file (recorded, never silent). bash: plain window.
 async function spawnAgent(ctx: CoreCtx, o: {
   role: string;
@@ -262,16 +262,15 @@ async function spawnAgent(ctx: CoreCtx, o: {
       resumeToken: o.resumeToken,
       forkSource: o.forkRef ? { kind: 'native_id', value: o.forkRef } : undefined,
     });
-    if (!launch.ok && launch.recovery === 'retry_fresh') {
-      // HONEST fresh (v1): missing session file -> logged + recorded in the
-      // run meta, then retried fresh. Never a silent fresh start.
-      console.warn(`[flock] ${o.role}: ${launch.error} — retrying fresh`);
-      runMeta.resume = 'fresh_after_missing_session';
-      launchId = store.newId('la');
-      launch = await adapter.launchHarness(binding, { launchId });
-    }
     if (!launch.ok) {
-      throw new OpError(500, `launch failed: ${launch.error}${launch.evidence ? `\n${launch.evidence}` : ''}`);
+      // C6 strict honest resume: a failed resume/fork fails loudly and STAYS
+      // failed. recovery 'attention_required' means the operator decides
+      // (explicit --fresh, or fix the pin) — there is no automatic fresh
+      // fallback, not even a "honest" one: the relaunch simply fails with
+      // the evidence.
+      const recovery = launch.recovery ?? 'attention_required';
+      runMeta.resume = o.resumeToken || o.forkRef ? `failed_${recovery}` : runMeta.resume;
+      throw new OpError(409, `launch failed: ${launch.error}${launch.evidence ? `\n${launch.evidence}` : ''}${o.resumeToken || o.forkRef ? `\nrecovery: ${recovery} — an explicit fresh start is: flock pod relaunch ${o.role} --fresh` : ''}`);
     }
     target = launch.target;
     pid = launch.pid ?? null;
@@ -347,7 +346,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 // relaunch: agent dies (or operator wants a fresh one) -> new run on the same
 // pod. pi (v3.1): HONEST resume — the exact persisted session file is
 // relaunched (--session <file>), never an interactive picker; a missing file
-// is retry_fresh (recorded in the run meta, never silent). bash: fresh window.
+// is attention_required (recorded in the run meta, never silent; C6). bash: fresh window.
 const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js'), codexBridgePath: path.join(import.meta.dirname, 'codex-bridge.js') });
 
 // Resolve the adapter for a stored pod (manifest -> runtime -> adapter) and
@@ -400,13 +399,20 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   if (pinned && !tokenValid) {
     throw new OpError(400, `pinned resume token is invalid: ${pinned} (flock pod resume-token ${role} reset)`);
   }
+  // C6 strict honest resume: --fresh is the ONLY way to start fresh; a
+  // failed resume (missing file / corrupt sidecar / no rollout) fails
+  // loudly as attention_required — the operator then chooses --fresh or
+  // fixes the pin. There is no automatic fresh fallback.
+  const fresh = op.fresh === true || op.fresh === 'true';
   let resumeToken: string | undefined;
   const forkRef = op.fork !== undefined ? resolveForkRef(ctx, String(op.fork)) : undefined;
-  if (isPi) {
-    resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
-  } else if (isClaude || isCodex) {
-    const adapter = getAdapter(resolved!.manifest, adapterEnv(ctx));
-    resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: cur.dir, seatRoot: path.join(ctx.store.home, 'pods', role) })) ?? undefined;
+  if (!fresh) {
+    if (isPi) {
+      resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
+    } else if (isClaude || isCodex) {
+      const adapter = getAdapter(resolved!.manifest, adapterEnv(ctx));
+      resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: cur.dir, seatRoot: path.join(ctx.store.home, 'pods', role) })) ?? undefined;
+    }
   }
   const res = await spawnAgent(ctx, {
     role,

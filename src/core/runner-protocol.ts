@@ -320,8 +320,9 @@ export function resolveTrust(
 
 // ── Resume token = the persisted pi session file ────────────────────────────
 // HONEST resume: relaunch with the exact file, never an
-// interactive picker. A missing file is retry_fresh — the caller decides,
-// never a silent fresh start.
+// interactive picker. C6 strict honest resume: a missing file is
+// attention_required (the operator chooses --fresh or fixes the pin) —
+// there is no silent fresh start.
 const MAX_RESUME_TOKEN_LEN = 512;
 const RESUME_TOKEN_CHARSET = /^[A-Za-z0-9._@/-]+$/;
 
@@ -352,10 +353,12 @@ export type LaunchMode =
   | { mode: 'fresh' }
   | { mode: 'resume'; sessionFile: string }
   | { mode: 'fork'; forkRef: string }
-  | { mode: 'error'; error: string; recovery?: 'retry_fresh' };
+  | { mode: 'error'; error: string; recovery?: 'attention_required' };
 
 // The fresh/resume/fork decision — pure, testable. resumeToken and
 // forkSource are mutually exclusive: the adapter refuses, never guesses.
+// C6: recovery is 'attention_required' only. A failed resume fails loudly
+// and stays failed; a fresh start is an explicit operator choice (--fresh).
 export function resolveLaunchMode(opts: { resumeToken?: string; forkSource?: ForkSource }): LaunchMode {
   const { resumeToken, forkSource } = opts;
   if (resumeToken && forkSource) {
@@ -363,7 +366,7 @@ export function resolveLaunchMode(opts: { resumeToken?: string; forkSource?: For
   }
   if (resumeToken) {
     const v = validateResumeToken(resumeToken);
-    if (!v.ok) return { mode: 'error', error: `pi resume: ${v.error}`, recovery: 'retry_fresh' };
+    if (!v.ok) return { mode: 'error', error: `pi resume: ${v.error}`, recovery: 'attention_required' };
     return { mode: 'resume', sessionFile: v.token };
   }
   if (forkSource) {

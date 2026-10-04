@@ -43,6 +43,30 @@ export function codexHome(seatRoot: string): string {
   return `${seatRoot}/.codex`;
 }
 
+import fs from 'node:fs';
+import path from 'node:path';
+
+// A rollout file is named `rollout-<ts>-<thread>.jsonl` — find the one
+// carrying this thread id (recursive walk over the date-partitioned tree).
+export function codexRolloutForThread(sessionsDir: string, threadId: string): string | null {
+  const stack = [sessionsDir];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    let entries: import('node:fs').Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isFile() && e.name.endsWith(`-${threadId}.jsonl`)) return p;
+    }
+  }
+  return null;
+}
+
 export interface CodexConfigOpts {
   model?: string; // unset: codex picks its default (local deploys pass one)
   shimPort: number;
