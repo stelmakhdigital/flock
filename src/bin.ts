@@ -207,6 +207,7 @@ async function main(): Promise<void> {
           fork: flag(flags, '--fork'),
           posture: flag(flags, '--posture'),
           profile: flag(flags, '--profile'),
+          image: flag(flags, '--image'),
         }));
       } else if (action === 'relaunch') {
         const flags = rest.slice(1);
@@ -218,6 +219,7 @@ async function main(): Promise<void> {
           profile: flag(flags, '--profile'),
           fork: fresh ? undefined : (flag(flags, '--fork') ?? role),
           fresh: fresh || undefined,
+          image: flag(flags, '--image'),
         }));
       } else if (action === 'resume-token') {
         print(await api('POST', '/api/ops', { type: 'pod_set_resume_token', role, token: rest[1] }));
@@ -489,7 +491,47 @@ async function main(): Promise<void> {
         console.log('named override sets live under "profiles": {}; pick one with `flock pod spawn <role> --agent ' + id + ' --profile P`');
         return;
       }
-      console.log('usage: flock agents ls | show <id> [--profile P] | new <id> [--from <base>]');
+      if (sub === 'image') {
+        // C13: agent images — a snapshot of a productive agent's resumable
+        // state (manifest + session copy). The ops round-trip keeps the
+        // single-mutation-path rule (the image store is under FLOCK_HOME).
+        const { apply } = await import('./core/ops.js');
+        const { openStore } = await import('./core/store.js');
+        const st = openStore(process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock'));
+        const ctx = { store: st, ticks: null as never, startedAt: new Date().toISOString() } as never;
+        const c = rest;
+        const act = c[0];
+        const err = (m: string) => { console.error(m); process.exitCode = 1; };
+        try {
+          if (act === 'save') {
+            // flock agent image save <role> --as <name>
+            const role = c.find((r) => !r.startsWith('-') && r !== 'save');
+            const asIdx = c.indexOf('--as');
+            const as = asIdx >= 0 ? c[asIdx + 1] : undefined;
+            if (!role || !as) { err('usage: flock agent image save <role> --as <name>'); return; }
+            const r = await apply({ type: 'agent_image_save', role, as }, ctx);
+            console.log(JSON.stringify(r, null, 2));
+          } else if (act === 'ls') {
+            const r = await apply({ type: 'agent_image_ls' }, ctx);
+            const rows = r as { name: string; agent: string; source: string; savedAt: string }[];
+            if (!rows.length) { console.log('(no images)'); return; }
+            const w = (k: keyof (typeof rows)[0]) => Math.max(...rows.map((x) => String(x[k]).length), k.length);
+            for (const row of rows) console.log(`${row.name.padEnd(w('name'))}  ${row.agent.padEnd(w('agent'))}  ${row.source.padEnd(w('source'))}  ${row.savedAt}`);
+          } else if (act === 'rm') {
+            const name = c.find((r) => !r.startsWith('-') && r !== 'rm');
+            const force = c.includes('--force');
+            if (!name) { err('usage: flock agent image rm <name> [--force]'); return; }
+            const r = await apply({ type: 'agent_image_rm', name, force }, ctx);
+            console.log(JSON.stringify(r, null, 2));
+          } else {
+            err('usage: flock agent image save <role> --as <name> | ls | rm <name> [--force]');
+          }
+        } catch (e) {
+          err(e instanceof Error ? e.message : String(e));
+        }
+        return;
+      }
+      console.log('usage: flock agents ls | show <id> [--profile P] | new <id> [--from <base>] | image save|ls|rm');
       return;
     }
 

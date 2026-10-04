@@ -89,6 +89,10 @@ export interface AgentManifest {
   // mapped axes above (thinking/tools/...) stay the manifest DICTIONARY;
   // the flag mapping lives in the runtime implementation (pi-bridge).
   child?: { args?: string[]; env?: Record<string, string> };
+  // C13: agent image — restore this EXACT manifest when a pod is spawned
+  // with --image <name> (the image's own agent id may be user-defined and
+  // absent in another profile's ~/.flock/agents).
+  restore?: AgentManifest;
 }
 
 import { PM_PROTOCOL } from './pm-protocol.js';

@@ -3,7 +3,7 @@ import path from 'node:path';
 import * as store from './store.js';
 import { parseTeamYaml, TeamParseError } from './team.js';
 import * as terminal from './terminal.js';
-import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest } from './agent.js';
+import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest, type ResolvedAgent } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
 import { seatPaths, validateResumeToken } from './bridge-protocol.js';
 import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type RuntimeAdapter, type StartupFile } from './runtime-adapter.js';
@@ -123,6 +123,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
   pod_capture: { group: 'pod', scopes: ['operator'], summary: 'capture pod pane text', run: (o, c) => podCapture(o, c) },
   pod_close: { group: 'pod', scopes: ['operator', 'pod'], summary: 'close a pod (kill window, state=closed)', run: (o, c) => podClose(o, c) },
+  // -- agent images (C13) ----------------------------------------------------
+  agent_image_save: { group: 'pod', scopes: ['operator'], summary: 'save an agent image (manifest + session copy) from a live pi pod', run: (o, c) => agentImageSave(o, c) },
+  agent_image_ls: { group: 'pod', scopes: ['operator', 'pod'], summary: 'list agent images', run: (_o, c) => listImages(c.store.home) },
+  agent_image_rm: { group: 'pod', scopes: ['operator'], summary: 'delete an agent image (guarded: --force required)', run: (o, c) => agentImageRm(o, c) },
   // -- watchdog --------------------------------------------------------------
   watchdog_register: { group: 'watchdog', scopes: ['operator'], summary: 'register a watchdog check (agent-registered)', run: (o, c) => watchdogRegister(o, c) },
   watchdog_cancel: { group: 'watchdog', scopes: ['operator'], summary: 'cancel a watchdog job', run: (o, c) => watchdogCancel(o, c) },
@@ -187,6 +191,7 @@ async function spawnAgent(ctx: CoreCtx, o: {
   profile?: string | null;
   freshStart?: boolean;
   teamGuidance?: string; // team file: extra AGENTS.md block (managed, id team:<role>)
+  restoreManifest?: AgentManifest; // C13: image restore — use this manifest as-is
 }): Promise<{ pod: store.Pod; run: store.Run }> {
   fs.mkdirSync(o.dir, { recursive: true });
   let target: string;
@@ -204,9 +209,18 @@ async function spawnAgent(ctx: CoreCtx, o: {
     pid = r.pid;
   } else {
     writePodAgentsMd(o.dir, o.role);
+    let r: ResolvedAgent;
     const agentId = o.agentId ?? 'pi';
-    const r = resolveAgent(agentId, null, o.profile ?? undefined);
-    if (!r) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
+    if (o.restoreManifest) {
+      // C13 image restore: the manifest is captured verbatim in image.json —
+      // resolve it directly (its agent id may not exist in this profile).
+      const m = o.restoreManifest;
+      r = { id: m.id, cmd: m.command, env: { ...(m.env ?? {}) }, manifest: m };
+    } else {
+      const resolved = resolveAgent(agentId, null, o.profile ?? undefined);
+      if (!resolved) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
+      r = resolved;
+    }
     const manifest = r.manifest;
     agentStored = r.id;
     const rt = manifestRuntime(manifest);
@@ -305,6 +319,7 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (launch.sessionFile) runMeta.sessionFile = launch.sessionFile;
     if (launch.sessionId) runMeta.sessionId = launch.sessionId;
     if (launch.resumeToken) runMeta.resumeToken = launch.resumeToken;
+    if (o.restoreManifest) runMeta.image = o.restoreManifest.id; // C13: spawned from an agent image
     if (launchPostureUsed(binding)) runMeta.launchPosture = binding.launchPosture;
     const post = await adapter.deliverStartup(startup, binding, 'post_ready');
     for (const f of post.failed) console.warn(`[flock] ${o.role}: startup failed for ${f.path}: ${f.error}`);
@@ -354,15 +369,31 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
   // plain-dir pod: the pod's work directory (git is owned by the agents —
   // core never touches it)
   const dir = String(op.dir ?? path.join(ctx.store.home, 'pods', role));
+  // C13: --image <name> — resume from a saved checkpoint. The session file
+  // is copied into the NEW pod's own sessions dir (seat isolation: the image
+  // store never mutates on relaunch); the manifest comes from image.json.
+  let imageRef: ReturnType<typeof readImage> | undefined;
+  let imageSessionFile: string | undefined;
+  if (op.image !== undefined) {
+    imageRef = readImage(ctx.store.home, String(op.image));
+    const sessionsDir = seatPaths(ctx.store.home, role).sessionsDir;
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const dest = path.join(sessionsDir, `from-image-${imageRef.name}-${Date.now()}-${path.basename(imageRef.sessionFile)}`);
+    fs.copyFileSync(imageRef.sessionFile, dest);
+    imageSessionFile = dest;
+  }
   const { pod, run } = await spawnAgent(ctx, {
     role,
     dir,
     model: op.model ? String(op.model) : undefined,
-    agentId: op.agent ? String(op.agent) : undefined,
+    agentId: imageRef?.restore.id ?? (op.agent ? String(op.agent) : undefined),
     rawCmd: op.cmd ? String(op.cmd) : undefined,
     forkRef: op.fork ? resolveForkRef(ctx, String(op.fork)) : undefined,
     posture: op.posture === 'full_bypass' || op.posture === 'floor' ? op.posture : undefined,
     profile: op.profile ? String(op.profile) : null,
+    resumeToken: imageSessionFile,
+    restoreManifest: imageRef?.restore,
+    freshStart: !imageSessionFile && !op.fork,
   });
   return { pod, run };
 }
@@ -371,7 +402,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 // pod. pi (v3.1): HONEST resume — the exact persisted session file is
 // relaunched (--session <file>), never an interactive picker; a missing file
 // is attention_required (recorded in the run meta, never silent; C6). bash: fresh window.
-const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'pi-bridge.js'), codexBridgePath: path.join(import.meta.dirname, 'codex-bridge.js') });
+const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'pi-bridge.js') });
 
 // Resolve the adapter for a stored pod (manifest -> runtime -> adapter) and
 // the minimal binding the signal-contract methods need (role/cwd/seatRoot).
@@ -418,9 +449,16 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   if (!isPi && runtime !== 'bash' && runtime !== 'cmd') {
     throw new OpError(400, `pod ${role}: runtime not supported: ${runtime} (C12b: re-spawn with a pi or bash agent)`);
   }
+  const imageRef = op.image !== undefined ? readImage(ctx.store.home, String(op.image)) : undefined;
+  if (imageRef) {
+    if (!isPi) throw new OpError(400, `image ${imageRef.name} is for pi pods; pod ${role} runtime: ${runtime}`);
+    if (op.fresh === true || op.fresh === 'true') {
+      throw new OpError(400, '--image and --fresh conflict (image is a resume from a known-good checkpoint)');
+    }
+  }
   // pinned resume token wins; otherwise the latest session (honest resume).
   // pi: session file path (the only runtime with a session in C12b).
-  const pinned = isPi ? (cur.resume_token ?? undefined) : undefined;
+  const pinned = isPi && !imageRef ? (cur.resume_token ?? undefined) : undefined;
   const tokenValid = isPi ? validateResumeToken(pinned!) : true;
   if (pinned && !tokenValid) {
     throw new OpError(400, `pinned resume token is invalid: ${pinned} (flock pod resume-token ${role} reset)`);
@@ -437,15 +475,20 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
       resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
     }
   }
+  if (imageRef) {
+    // the operator explicitly chose this checkpoint (over pin/latest/fork)
+    resumeToken = imageRef.sessionFile;
+  }
   const res = await spawnAgent(ctx, {
     role,
     dir: cur.dir,
     model: op.model ? String(op.model) : (cur.model ?? undefined),
-    agentId: cur.agent ?? undefined,
+    agentId: imageRef?.restore.id ?? cur.agent ?? undefined,
+    restoreManifest: imageRef?.restore,
     resumeToken,
     forkRef,
     profile: profile ?? null,
-    freshStart: !resumeToken && !forkRef,
+    freshStart: !resumeToken && !forkRef && !imageRef,
   });
   ctx.emit?.({ type: 'pod_relaunched', role, run: res.run.id });
   let mode: string | null = null;
@@ -457,6 +500,135 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
     /* meta absent */
   }
   return { pod: res.pod, run: res.run, resumed: mode === 'resume', resume: mode };
+}
+
+// ── C13: agent images ────────────────────────────────────────────────────
+// A captured snapshot of a productive agent's resumable state: the pod's
+// manifest (verbatim) + a copy of its session file. Filesystem-canonical:
+// ~/.flock/images/<name>/image.json + session-<name>.jsonl. sqlite is not
+// touched. Deletion is guarded (--force) — the image is evidence.
+
+interface AgentImageMeta {
+  name: string;          // image name (dir name)
+  sourceRole: string;    // the pod the image was saved from
+  agentId: string;       // the pod's stored agent id
+  manifestId: string;    // manifest id inside restore
+  profile: string | null;
+  model: string | null;
+  savedAt: string;       // ISO
+  sessionFile: string;   // ABSOLUTE path of the copied session
+  restore: AgentManifest; // the verbatim manifest
+}
+
+const IMAGE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+function imagesDir(home: string): string {
+  return path.join(home, 'images');
+}
+
+export function validateImageName(name: string): boolean {
+  return IMAGE_NAME_RE.test(name);
+}
+
+export function readImage(home: string, name: string): AgentImageMeta {
+  if (!validateImageName(name)) throw new OpError(400, `invalid image name: ${name}`);
+  const p = path.join(imagesDir(home), name, 'image.json');
+  if (!fs.existsSync(p)) throw new OpError(404, `no image: ${name} (flock agent image ls)`);
+  let meta: AgentImageMeta;
+  try {
+    meta = JSON.parse(fs.readFileSync(p, 'utf8')) as AgentImageMeta;
+  } catch (e) {
+    throw new OpError(500, `corrupt image ${name}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!fs.existsSync(meta.sessionFile)) {
+    throw new OpError(500, `image ${name} is broken: session file missing (${meta.sessionFile})`);
+  }
+  return meta;
+}
+
+export function listImages(home: string): { name: string; agent: string; source: string; savedAt: string }[] {
+  const dir = imagesDir(home);
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return [];
+  }
+  const out: { name: string; agent: string; source: string; savedAt: string }[] = [];
+  for (const name of entries.sort()) {
+    const p = path.join(dir, name, 'image.json');
+    if (!fs.existsSync(p)) continue; // a broken dir: skip in ls (loud on read)
+    let m: AgentImageMeta;
+    try {
+      m = JSON.parse(fs.readFileSync(p, 'utf8')) as AgentImageMeta;
+    } catch {
+      continue; // unreadable image.json — skip (loud on read)
+    }
+    // a session copy that is gone = a broken image: skip it in ls too
+    // (readImage stays loud — ls never lies, it only omits)
+    if (!m.sessionFile || !fs.existsSync(m.sessionFile)) continue;
+    out.push({ name, agent: m.manifestId, source: m.sourceRole, savedAt: m.savedAt });
+  }
+  return out;
+}
+
+async function agentImageSave(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const role = requireRole(op);
+  const name = String(op.as ?? '');
+  if (!validateImageName(name)) throw new OpError(400, `invalid image name: ${name || '(empty)'} (want [a-z0-9._-], max 64)`);
+  const pod = store.getPodByRole(ctx.store, role);
+  if (!pod) throw new OpError(404, `no pod: ${role}`);
+  const rt = podRuntime(pod.agent);
+  if (rt !== 'pi') throw new OpError(400, `image save is for pi pods only (pod ${role} runtime: ${rt})`);
+  // the manifest, verbatim (profiles not applied — the image captures what
+  // the pod has; the profile is recorded for the operator's eyes)
+  const resolved = resolveAgent(pod.agent ?? undefined, null);
+  if (!resolved) throw new OpError(404, `pod ${role}: agent manifest not found (${pod.agent})`);
+  // the session file: run-meta first (exact identity), then the seat scan
+  let session: string | undefined = store.latestSessionFile(ctx.store, role) ?? undefined;
+  if (!session || !fs.existsSync(session)) {
+    const dir = seatPaths(ctx.store.home, role).sessionsDir;
+    try {
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith(`_${role}.jsonl`)).sort();
+      const last = files.length ? path.join(dir, files[files.length - 1]) : undefined;
+      if (last) session = last;
+    } catch {
+      /* no sessions dir */
+    }
+  }
+  if (!session || !fs.existsSync(session)) {
+    throw new OpError(404, `no session file for pod ${role} (the pod has not written a session yet — use flock pod send to trigger one)`);
+  }
+  const outDir = path.join(imagesDir(ctx.store.home), name);
+  fs.mkdirSync(outDir, { recursive: true });
+  const sessionDest = path.join(outDir, `session-${name}.jsonl`);
+  fs.copyFileSync(session, sessionDest);
+  const meta: AgentImageMeta = {
+    name,
+    sourceRole: role,
+    agentId: pod.agent ?? '',
+    manifestId: resolved.manifest.id,
+    profile: pod.profile,
+    model: pod.model,
+    savedAt: new Date().toISOString(),
+    sessionFile: sessionDest,
+    restore: resolved.manifest,
+  };
+  fs.writeFileSync(path.join(outDir, 'image.json'), JSON.stringify(meta, null, 2));
+  return { name, sourceRole: role, sessionFile: sessionDest, dir: outDir };
+}
+
+async function agentImageRm(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '');
+  if (!validateImageName(name)) throw new OpError(400, `invalid image name: ${name || '(empty)'}`);
+  const dir = path.join(imagesDir(ctx.store.home), name);
+  if (!fs.existsSync(dir)) throw new OpError(404, `no image: ${name}`);
+  // guarded deletion: without --force refuse with a hint (evidence protection)
+  if (op.force !== true && op.force !== 'true') {
+    throw new OpError(400, `image ${name} exists — deletion is guarded: confirm with --force (evidence protection)`);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { name, removed: true };
 }
 
 async function podSetResumeToken(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
