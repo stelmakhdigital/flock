@@ -8,7 +8,7 @@ import { createHttp, startPodSocket } from './http.js';
 import { runWatchdogTick } from './watchdog.js';
 import { runArbiterTick, ARBITER_INTERVAL_MS } from './arbiter.js';
 import { runHealthTick } from './health.js';
-import { pmTick, pmNotify } from './pm.js';
+import { notifyPm } from './pm.js';
 import { runRetentionSweep } from './retention.js';
 import { writePodAgentsMd, adapterForPod } from './ops.js';
 import { runEscalationTick } from './escalation.js';
@@ -88,7 +88,7 @@ async function checkRunLiveness(): Promise<void> {
         const crashed = state.startsWith('crashed');
         console.log(`[core] runkeeper: run ${run.id} (pod ${pod.role}) ${state} [${resolved.adapter.runtime}]`);
         ctx.emit?.(crashed ? { type: 'run_crashed', pod: pod.role, run: run.id } : { type: 'run_ended', pod: pod.role, run: run.id, state });
-        if (crashed) void pmNotify(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: ${state}` }).catch(() => {});
+        if (crashed) void notifyPm(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: ${state}` }).catch(() => {});
       }
       continue;
     }
@@ -105,7 +105,7 @@ async function checkRunLiveness(): Promise<void> {
       endRun(store, run.id, 'crashed');
       console.log(`[core] runkeeper: pid ${run.pid} (pod ${pod.role}, run ${run.id}) dead -> crashed`);
       ctx.emit?.({ type: 'run_crashed', pod: pod.role, run: run.id, pid: run.pid });
-      void pmNotify(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: процесс агента (pid ${run.pid}) умер` }).catch(() => {});
+      void notifyPm(ctx, { type: 'pod_crashed', detail: `под ${pod.role}: процесс агента (pid ${run.pid}) умер` }).catch(() => {});
     }
   }
 }
@@ -115,7 +115,6 @@ ticks.register('runkeeper', 5000, () => {
   });
 });
 // pm (goal loop, 5min): sweep the pipeline, wake the pm pod only on change
-ticks.register('pm', 60_000, () => pmTick(ctx));
 // retention (24h): archive old runs, head-trim activity logs, rotate core.log
 ticks.register('retention', 24 * 3600_000, () => {
   runRetentionSweep({ store, home: FLOCK_HOME }).then((r) => {

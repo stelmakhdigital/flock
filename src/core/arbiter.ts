@@ -3,7 +3,7 @@ import * as store from './store.js';
 import * as terminal from './terminal.js';
 import { frameMessage, newNonce } from "./runner-protocol.js";
 import { advanceWorkflow, podRelaunch, type CoreCtx } from './ops.js';
-import { pmNotify } from './pm.js';
+import { notifyPm } from './pm.js';
 import { podRuntime } from './agent.js';
 
 // arbiter — the pipeline engine (stage 1). One tick does three things:
@@ -43,7 +43,7 @@ export async function runArbiterTick(ctx: CoreCtx): Promise<void> {
       await podRelaunch({ role: pod.role }, ctx);
       console.log(`[core] arbiter: woke pod ${pod.role} for queued task ${queued.id}`);
       ctx.emit?.({ type: 'pod_woken', role: pod.role, taskId: queued.id });
-      void pmNotify(ctx, { type: 'pod_woken', detail: `под ${pod.role} разбужен: queued-задача ${queued.id} "${queued.title.slice(0, 60)}"` }).catch(() => {});
+      void notifyPm(ctx, { type: 'pod_woken', detail: `под ${pod.role} разбужен: queued-задача ${queued.id} "${queued.title.slice(0, 60)}"` }).catch(() => {});
     } catch (e) {
       console.warn(`[core] arbiter: wake of ${pod.role} failed: ${e instanceof Error ? e.message : String(e)} (cooldown ${Math.round(WAKE_COOLDOWN_MS / 1000)}s)`);
     }

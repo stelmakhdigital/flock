@@ -103,13 +103,21 @@ export async function runEscalationTick(ctx: CoreCtx): Promise<void> {
     if (row.state === 'open') {
       const pm = store.getPodByRole(ctx.store, 'pm');
       if (pm && pm.state === 'live') {
+        // C8: the pm rung delivers through the generic route (C4/C8):
+        // message_send {to: 'pm'} + poke. The message is durable (inbox);
+        // the ladder's pm-silence timer starts from pm_notified_at.
+        const { notifyPm } = await import('./pm.js');
+        void notifyPm(ctx, {
+          type: 'escalation_reminder',
+          subject: row.subject.slice(0, 40),
+          detail: `эскалация ${row.id} [${row.severity}]: ${row.key} — ${row.subject.slice(0, 160)}`,
+        }).catch(() => {});
         store.setEscalationState(ctx.store, row.id, 'pm_notified', { pmNotifiedAt: store.nowIso(), attempts: row.attempts + 1 });
         ctx.emit?.({ type: 'escalation_pm_notified', id: row.id, key: row.key });
-        // pm already got the trigger via pmNotify; mark the ladder rung so
-        // the pm-silence timer starts now
-        store.setEscalationState(ctx.store, row.id, 'pm_notified', { pmNotifiedAt: row.pm_notified_at ?? store.nowIso(), attempts: row.attempts });
       } else {
-        // no live pm: skip the pm stage, the operator is the next rung
+        // no live pm: skip the pm stage, the operator is the next rung. The
+        // trigger message (if any) already waited in the pm inbox; it will
+        // be delivered on the pm's next wake.
         store.setEscalationState(ctx.store, row.id, 'escalated', { attempts: row.attempts + 1 });
         ctx.emit?.({ type: 'escalation_escalated', id: row.id, key: row.key, reason: 'pm not live' });
         operatorAlert(ctx, row, 'escalated (pm not live)');

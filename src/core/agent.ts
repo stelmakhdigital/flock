@@ -103,7 +103,9 @@ export const BUILTIN_AGENTS: Record<string, AgentManifest> = {
   // is projected into the pod CODEX_HOME config.toml by the codex adapter
   // (in-core responses shim -> vLLM, FLOCK_CODEX_UPSTREAM, default below).
   codex: { id: 'codex', command: 'codex', runtime: 'codex' },
-  // goal-loop lead: wakes on triggers, issues typed intents (whitelist) via the CLI
+  // C8: the pm is a regular pod (no core subsystem) — the coordinator of
+  // the team. Woken by interest events (inbox/poke), decides with the
+  // pod-scoped ops it already holds.
   pm: {
     id: 'pm',
     command: 'pi',

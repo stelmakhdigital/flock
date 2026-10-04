@@ -11,7 +11,7 @@ import { validateCodexSessionToken } from './codex-protocol.js';
 import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type RuntimeAdapter, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
-import { validateIntent, applyIntents, pmDigest, pmNotify } from './pm.js';
+import { validateIntent, applyIntents, pmDigest, notifyPm } from './pm.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -636,7 +636,7 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
     podRole: role,
   });
   ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
-  void pmNotify(ctx, { type: 'task_added', detail: `таск ${id} "${title.slice(0, 80)}" → pod ${role} (очередь)` }).catch(() => {});
+  void notifyPm(ctx, { type: 'task_added', detail: `таск ${id} "${title.slice(0, 80)}" → pod ${role} (очередь)` }).catch(() => {});
   return store.getTask(ctx.store, id);
 }
 
@@ -656,7 +656,7 @@ async function pmNotifyMaybe(ctx: CoreCtx, trigger: string, o: Record<string, un
     if (!task) return;
     if (o.by === 'pm' || o.registeredBy === 'pm') return;
     const reason = o.reason ? ` — ${String(o.reason).slice(0, 120)}` : '';
-    await pmNotify(ctx, { type: trigger, detail: `таск ${task.id} "${task.title.slice(0, 80)}" → ${to}${reason}` });
+    await notifyPm(ctx, { type: trigger, subject: task.id, detail: `таск ${task.id} "${task.title.slice(0, 80)}" → ${to}${reason}` });
   } catch {
     /* pm wake is best-effort; the task op itself already committed */
   }
