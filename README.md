@@ -333,6 +333,27 @@ Pod'ы — plain-dir: рабочая директория пода — прос�
 review-гейты, merge-queue, conflict-резолвер и вся экономика — **убраны из
 core** (C1/C2).
 
+## Topologies: именованные пресеты команд (OpenRIG-топологии)
+
+**Topology** = именованный декларативный пресет поверх team-механизма
+(один файл `src/core/topologies.ts`, reconcile — тот же путь, что у
+`team up`). Гейты «owner→checker» живут НЕ в core, а в guidance ролей
++ существующих ops (`task handoff`/`task done`) — второй контур не
+изобретён.
+
+```sh
+flock topology ls                  # каталог
+flock topology up conveyor [--dir d]   # запустить одной командой
+```
+
+Пресеты: `conveyor` (intake→plan→build→review), `adversarial-review`
+(owner→checker→skeptic), `research-team` (scout→analyst→scribe),
+`secrets-manager` (keeper→auditor). Цепочка — handoff'ом: роль не
+закрывает свой этап, пока не передала таск следующему (review/skeptic
+закрывают, либо возвращают брак назад). `--dir` — общая рабочая
+dиректория для всех под'ов. Под'ы — обычные team-под'ы: `team down`/
+snapshots/restore на них работают.
+
 ## Agent images (C13): чекапойнты сессий агента
 
 **Image** = момент сессии: копия сессионного файла + верbatim-манифест

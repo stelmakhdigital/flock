@@ -38,6 +38,7 @@ const USAGE = `flock — core CLI
   flock pod capture <role> [--lines N]
   flock pod close <role>
   flock team up [pods.yaml]              # team-реконсиляция: spawn недостающих, refresh живых
+  flock topology ls | up <name> [--dir d] # именованные пресеты (conveyor, adversarial-review, ...)
   flock pack ls | pack show <name>       # context packs (filesystem: ~/.flock/packs/)
   flock workspace show                   # декларация workspace (workspace.json, per-profile)
   flock plugins ls | plugins show <src>  # pi-расширения хоста (read-only)
@@ -281,6 +282,29 @@ async function main(): Promise<void> {
         }
       } else {
         console.log('usage: flock team up <name|file> [--restore <snap|latest>] | down <name> | ls');
+      }
+      return;
+    }
+
+    // Topology catalog: named declarative presets over the team path
+    case 'topology': {
+      if (sub === 'ls') {
+        const { listTopologies } = await import('./core/topologies.js');
+        for (const t of listTopologies()) {
+          console.log(`${t.name}  pods: ${t.pods.join(', ')}  — ${t.summary}`);
+        }
+      } else if (sub === 'up') {
+        const name = rest[0];
+        const di = rest.indexOf('--dir');
+        const dir = di >= 0 ? rest[di + 1] : undefined;
+        if (!name) {
+          console.error('usage: flock topology up <name> [--dir d]');
+          console.error('available: ' + (await import('./core/topologies.js')).listTopologies().map((t) => t.name).join(', '));
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'topology_up', name, dir }));
+      } else {
+        console.log('usage: flock topology ls | up <name> [--dir d]');
       }
       return;
     }

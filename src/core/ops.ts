@@ -15,6 +15,7 @@ import { listPacks, readPackMeta, buildPackBundle } from './packs.js';
 import { readWorkspace, resolveWorkspaceRef, workspacePath } from './workspace.js';
 import { piList, pluginShowDetail, type PluginEntry } from './plugins.js';
 import * as fleet from './fleet.js';
+import { topologySpec, renderTopologyYaml } from './topologies.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -147,6 +148,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_relaunch: { group: 'pod', scopes: ['operator', 'pod'], summary: 'new run on the same pod (honest resume, --fork; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_relaunch'); return podRelaunch(o, c); } },
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
   team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
+  topology_up: { group: 'team', scopes: ['operator'], summary: 'launch a named topology preset (conveyor, adversarial-review, research-team, secrets-manager) via the team path', run: (o, c) => topologyUp(o, c) },
   esc_ls: { group: 'team', scopes: ['operator', 'pod'], summary: '5.4c durable escalations (ladder audit)', run: (o, c) => { const activeOnly = o.active === true || o.active === 'true'; return store.listEscalations(c.store, activeOnly); } },
   esc_ack: { group: 'team', scopes: ['operator'], summary: '5.4c acknowledge an escalation (stops operator reminders)', run: (o, c) => { const id = o.id as string | undefined; if (!id) throw new Error('id required'); const row = store.getEscalation(c.store, id); if (!row) throw new Error('escalation not found'); if (!store.ESC_ACTIVE_STATES.includes(row.state as (typeof store.ESC_ACTIVE_STATES)[number]) && row.state !== 'pm_notified') throw new Error(`escalation is ${row.state}`); store.setEscalationState(c.store, id, 'acknowledged', { resolvedReason: 'operator ack' }); c.emit?.({ type: 'escalation_resolved', id, key: row.key, reason: 'operator ack' }); return { ok: true, id, state: 'acknowledged' }; } },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
@@ -1530,6 +1532,15 @@ async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknow
     if (e instanceof TeamParseError) throw new OpError(400, e.message);
     throw e;
   }
+  const results = await reconcileTeam(ctx, spec);
+  ctx.emit?.({ type: 'team_up', file, pods: Object.keys(spec.pods) });
+  return { file, results };
+}
+
+// Shared reconcile: live pods refreshed (guidance re-merged, idempotent),
+// missing/closed pods spawned. Never kills a live pod. Used by both team_up
+// (file) and topology_up (named preset) — one team path, no second contour.
+async function reconcileTeam(ctx: CoreCtx, spec: { pods: Record<string, { agent?: string; model?: string; profile?: string; posture?: 'floor' | 'full_bypass' | string; guidance?: string; dir?: string }> }): Promise<Record<string, unknown>> {
   const results: Record<string, unknown> = {};
   for (const [role, s] of Object.entries(spec.pods)) {
     const existing = store.getPodByRole(ctx.store, role);
@@ -1559,8 +1570,24 @@ async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknow
       results[role] = { action: 'failed', error: e instanceof Error ? e.message : String(e) };
     }
   }
-  ctx.emit?.({ type: 'team_up', file, pods: Object.keys(spec.pods) });
-  return { file, results };
+  return results;
+}
+
+// topology_up: a named preset from the catalog, reconciled through the team
+// path. `dir` (optional) is applied to every pod that does not set its own.
+async function topologyUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '');
+  let spec;
+  try {
+    spec = topologySpec(name);
+  } catch (e) {
+    throw new OpError(400, e instanceof Error ? e.message : String(e));
+  }
+  const dir = op.dir != null ? String(op.dir) : undefined;
+  if (dir) for (const s of Object.values(spec.pods)) if (!s.dir) s.dir = dir;
+  const results = await reconcileTeam(ctx, spec);
+  ctx.emit?.({ type: 'topology_up', name, pods: Object.keys(spec.pods) });
+  return { topology: name, yaml: renderTopologyYaml(name), results };
 }
 
 
