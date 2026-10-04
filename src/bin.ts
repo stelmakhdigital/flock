@@ -39,7 +39,6 @@ const USAGE = `flock — core CLI
   flock pod capture <role> [--lines N]
   flock pod close <role>
   flock team up [pods.yaml]              # team-реконсиляция: spawn недостающих, refresh живых
-  flock usage [role]                     # токены по подам (экономия pipeline)
   flock pm up                          # поднять pm-под (goal loop)
   flock pm down                        # остановить goal loop (close pm-пода)
   flock pm state                       # снимок pipeline для pm
@@ -243,11 +242,6 @@ async function main(): Promise<void> {
       return;
     }
 
-    case 'usage': {
-      const q = rest[0] ? `?role=${encodeURIComponent(rest[0])}` : '';
-      print(await api('GET', `/api/usage${q}`));
-      return;
-    }
 
     case 'pm': {
       if (sub === 'up') {

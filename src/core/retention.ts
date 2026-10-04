@@ -54,9 +54,7 @@ export async function runRetentionSweep(ctx: { store: store.Store; home: string 
       const raw = fs.readFileSync(p.activityPath, 'utf8');
       const lines = raw.split('\n');
       if (lines.length <= R.activityHighWater) continue;
-      // head-trim: keep the TAIL (the recent window); the usage cursor file
-      // holds a byte offset that may now exceed the file -> ingestUsage
-      // resets to 0 on shrink and the dedupe key absorbs the overlap.
+      // head-trim: keep the TAIL (the recent window).
       const kept = lines.slice(-R.activityTrimTo).join('\n') + '\n';
       fs.writeFileSync(p.activityPath, kept);
       trimmedActivity.push(role);

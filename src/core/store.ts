@@ -309,6 +309,13 @@ ALTER TABLE pods DROP COLUMN merge_policy;
 ALTER TABLE workflow_instances DROP COLUMN require_test;
 `,
   },
+  {
+    // C2: economy is out of core — usage_events goes with the usage tick.
+    name: '016_economy_drop',
+    sql: `
+DROP TABLE IF EXISTS usage_events;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -750,65 +757,6 @@ export function listWfStepStates(store: Store, instanceId: string): { step: stri
   return dbOf(store)
     .prepare('SELECT step, attempts, state FROM wf_step_state WHERE instance_id = ? ORDER BY step')
     .all(instanceId) as { step: string; attempts: number; state: string }[];
-}
-
-// ---------- usage (economy) ----------
-
-export interface UsageEvent {
-  role: string;
-  runId: string | null;
-  ts: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  model: string | null;
-}
-
-export function insertUsageEventDeduped(
-  store: Store,
-  e: { role: string; at: string; ts?: string; input: number; output: number; cacheRead?: number; cacheWrite?: number; model?: string | null },
-): void {
-  dbOf(store)
-    .prepare(
-      'INSERT INTO usage_events(role, at, ts, input, output, cache_read, cache_write, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    )
-    .run(e.role, e.at, e.ts ?? e.at, e.input, e.output, e.cacheRead ?? 0, e.cacheWrite ?? 0, e.model ?? null);
-}
-
-export interface UsageSummary {
-  role: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  messages: number;
-  model: string | null;
-  since: string | null;
-}
-
-export function usageSummary(store: Store, opts?: { role?: string; since?: string }): UsageSummary[] {
-  const where: string[] = [];
-  const args: string[] = [];
-  if (opts?.role) {
-    where.push('role = ?');
-    args.push(opts.role);
-  }
-  if (opts?.since) {
-    where.push('ts >= ?');
-    args.push(opts.since);
-  }
-  const sql = `SELECT role, SUM(input) input, SUM(output) output, SUM(cache_read) cacheRead, SUM(cache_write) cacheWrite, COUNT(*) messages,
-    (SELECT model FROM usage_events u2 WHERE u2.role = usage_events.role ${opts?.since ? 'AND u2.ts >= ? ' : ''}ORDER BY u2.ts DESC LIMIT 1) model,
-    MIN(ts) since
-    FROM usage_events ${where.length ? 'WHERE ' + where.join(' AND ') : ''} GROUP BY role ORDER BY input + output DESC`;
-  if (opts?.since) args.push(opts.since);
-  return dbOf(store).prepare(sql).all(...args) as unknown as UsageSummary[];
-}
-
-export function deleteUsageBefore(store: Store, ts: string): number {
-  const r = dbOf(store).prepare('DELETE FROM usage_events WHERE ts < ?').run(ts);
-  return Number(r.changes);
 }
 
 // retention: finished runs older than N days -> runs_archive (archive, not
