@@ -1050,7 +1050,7 @@ async function workflowStart(op: Record<string, unknown>, ctx: CoreCtx): Promise
   if (!wf) throw new OpError(404, `no workflow: ${String(op.name ?? '')}`);
   const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
   const instId = store.newId('wfi');
-  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null, priority: 0 });
+  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null, });
   // 5.4d: start the DAG frontier — every step without deps (a sequential
   // pipeline: only steps[0] is ready at start, as before)
   const instObj = { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null, priority: 0 } as store.WorkflowInstance;

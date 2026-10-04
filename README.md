@@ -1,9 +1,16 @@
 # flock
 
-Множественная агентная автоматизация разработки: **core** (демон, единственная
-власть) + **pod**'ы (агенты в терминалах) + очередь задач.
+Множественная агентная автоматизация разработки: **core** (демон —
+deterministic control plane, без LLM) + **pod**'ы (агенты в терминалах) +
+очередь задач + durable-координация.
 
-Архитектура и глоссарий — в `docs/` (не коммитится в гит по соглашению проекта).
+Философия (OpenRIG-style): core — координационная плоскость. Он хранит
+состояние, доставляет, наблюдает и эскалирует; решения принимает LLM в подах.
+**Git за агентами** (core git не видит, поды — plain-dir), **экономики в core
+нет** (аудит usage остаётся в `activity.jsonl` — для оператора, не для
+решений). Ноль npm-зависимостей сверх `hono` + node builtins.
+
+Архитектура и глоссарий — в `docs/`.
 
 ## Быстрый старт
 
@@ -12,44 +19,224 @@ npm install
 npm run build
 ./bin/flock core up
 ./bin/flock healthz
-./bin/flock pod spawn dev           # tmux-окно flock:flock-dev с pi
+./bin/flock pod spawn dev           # tmux-окно с pi (bridge-рантайм)
 ./bin/flock pod send dev "напиши слово hello"
 ./bin/flock pod capture dev
+./bin/flock task add dev "создай hello.txt"
+./bin/flock events tail             # live-лента событий (SSE)
 ./bin/flock core status
 ./bin/flock core down
 ```
 
-Состояние: `~/.flock/` (flock.db, core.pid, core.log, token).
+Состояние: `~/.flock/` (flock.db, core.pid, core.log, token). Порт =
+7460 + hash(профиля), `FLOCK_PORT` переопределяет.
 
-## Очередь задач (этап 1)
+## Единый путь мутаций
 
-Одна активная задача на pod. Arbiter (тик 10с) самовольно claim'ит
-очередную задачу на свободного pod, доставляет её verified-send'ом и следит,
-что активная задача не осталась без pod.
+Все изменения — через `apply(op)` в core: один writer (node:sqlite), один
+`OP_REGISTRY` (34 ops: `flock ops ls`), один аудит (event-лог +
+`task_transitions` + `runs.meta`). CLI, тики (arbiter/watchdog/escalation),
+pm и MCP `tools/call` — все идут через тот же путь. Под-токены ограничены
+`pod`-scoped ops (свои задачи, свой inbox, свой под).
 
-```sh
-./bin/flock task add dev "создай hello.txt" --body "слово flock внутри"
-./bin/flock task ls [queued|active|done|blocked|cancelled]
-./bin/flock task history <id>     # все переходы: created/claimed/done/...
-./bin/flock task done <id>
-./bin/flock task blocked <id> "почему"
-./bin/flock task needs <id> "что нужно"
-./bin/flock task cancel <id>
+```
+оператор (CLI/HTTP/MCP) ─┐
+тики core (arbiter и др.) ─┼─► apply(op) ─► sqlite (single writer)
+поды (pod-токен, unix-сокет) ─┘        └─► event log + SSE
 ```
 
-Статусы: `queued → active → done|blocked|cancelled|needs` (+ `active → queued`
-при неудачной доставке; `needs → active|done|blocked|cancelled`). Каждый
-переход — строка в `task_transitions`.
+## Координация: hot-potato closure + transactional handoff
 
-Агент отчитывается сам: текст задачи несёт протокол, агент выполняет
-`flock task done|blocked|needs <id>` в своём bash (attribution через
-`FLOCK_POD_ROLE`). Per-pod `AGENTS.md` (пишет core) описывает протокол.
-`needs` = нужен человек/решение — оператор видит в `task ls`, отвечает
-подсказкой, агент (или оператор) закрывает задачу.
+Работа «вечно горяч»: задача никогда не висит без ответственного — она
+закончена, передана или эскалирована.
 
-## Watchdog (W1+W2)
+- **Closure vocabulary** (терминально): `finished | handed-off | blocked |
+  denied | canceled | escalated` (+ `target` для `handed-off`/`escalated`).
+  `tasks.status` (`queued|active|done|blocked|needs|cancelled`) — жизненный
+  цикл, не меняется; `tasks.closed` (JSON) пишется только терминально.
+  `flock task done <id> <reason>` — причина обязательна.
+- **Transactional handoff**: `flock task handoff <id> <to-role>` — одна
+  транзакция: старая закрывается `handed-off (target)`, successor создаётся у
+  получателя. Handoff не теряется. (Кросс-профильный handoff — two-phase,
+  фаза 5 — до релиза.)
 
-Декларативные проверки: кто угодно (CLI/агент в pod) регистрирует job, core
+```sh
+./bin/flock task done <id> finished            # или: blocked|denied|canceled|escalated
+./bin/flock task handoff <id> rev              # transactional: close + successor
+./bin/flock task blocked <id> "что сломалось"   # НЕ терминально: под остаётся ответственным
+./bin/flock task needs <id> "что нужно"
+./bin/flock task unblock <id>                   # явный акт оператора: blocked → queued
+```
+
+`blocked`/`needs` — НЕ терминальные: под всё ещё «держит горячую картошку»,
+а stuck-детекция — на watchdog/лестнице эскалаций (автоматических повторов
+нет — scribe model ниже).
+
+## Inboxes / outboxes: durable-сообщения
+
+Pod'ы общаются durable-записями, а не «надеждой на экран»: `inboxes` —
+mailbox получателя, `outboxes` — sender-side record (local send —
+`pending=0`; cross-profile `pending=1` зарезервировано под fleet-фазу).
+
+```sh
+./bin/flock message send <role> "текст..."   # durable-строка + best-effort poke живому
+./bin/flock message ls [role] [--unclaimed] [--all]
+./bin/flock message claim <id>
+```
+
+- Доставка = **durable inbox-строка** + poke живому под'у (`pod send`).
+  Мёртвый/закрытый под — сообщение остаётся в inbox и дождётся relaunch.
+- Pod-токен видит только свой inbox и не пишет сам себе; оператор — любой
+  или все unclaimed.
+-	pm читает свои inbox-сообщения через `flock pm state`
+  (`unclaimedMessages`).
+
+## Event log + SSE
+
+Каждая успешная мутация — одна строка в append-only `events`
+(actor: `core` / `pod:<role>`, subject, payload). Сбойные ops событий не
+пишут. Это «память системы»: аудит, debug, будущий board.
+
+```sh
+./bin/flock events tail [--since N]        # CLI: SSE → stdout
+curl -N -H "Authorization: Bearer $(cat ~/.flock/token)" "http://127.0.0.1:7460/events?since=0"
+```
+
+WS-фид убран (C5): `GET /events?since=<id>` — SSE (Hono streaming), backlog
+из `events` + live-push.
+
+## Workflow: scribe model + DAG
+
+Определение = именованный набор шагов; instance двигает шаги через обычную
+очередь. **Scribe (C7)**: runtime закрывает и записывает, НЕ гейтит —
+ручек `priority`/`retry`/`timeoutMin` в шагах нет. Failed шаг (blocked/
+cancelled) → сcribe записывает и ставит инстанс в blocked/cancelled;
+повторов нет — оператор решает (`task unblock` / cancel). Stuck-детекция —
+на watchdog.
+
+```json
+[{"id":"dev","role":"dev"},{"id":"rev","role":"rev","deps":["dev"]}]
+```
+
+- **deps** (DAG): шаги стартуют, когда все deps done. Без deps — стартовый
+  фронт. Циклы/self/unknown dep отклоняются на define. Ready-фронт
+  закидывается параллельно; тело таска получает результаты зависимых шагов.
+- **Frozen step task**: остановленный инстанс не принимает поздние смены
+  статуса шага.
+
+```sh
+./bin/flock workflow define pipe --steps-json '[...]'
+./bin/flock workflow start pipe "фича X"
+./bin/flock workflow status <instance_id>   # state + stepState (pending/running/done/blocked)
+```
+
+## Strict honest resume (C6)
+
+Relaunch = честный resume ТОЧНОЙ сессии; silent fresh запрещён.
+
+- `flock pod relaunch <role>` — resume (pi: `--session <file>`, claude:
+  `--resume <uuid>`, codex: `exec resume <thread>`);
+- сессии нет/проба упала → **failed resume fails loudly**: `attention_required`
+  в run meta + hint `flock pod relaunch <role> --fresh`;
+- `--fresh` — явный чистый старт (операторский выбор, не fallback);
+- `--fork [role]` — форк сессии (новый identity, parent не трогается);
+- pre-claim пробы: pi (session-файл + runner-sidecar), claude (transcript),
+  codex (rollout-файл по thread id).
+
+## Runtimes: bridge и terminal-native
+
+Запуск — через **RuntimeAdapter** (launch/ready + `liveness` /
+`sendVerified` / `healthProbe`). Core не знает, какой рантайм под окном;
+новый рантайм = адаптер + manifest, без правок core.
+
+**Bridge-рантаймы** (`bridge-protocol` общий; один JSON-флаг
+`--child-args` = raw passthrough + mapped-оси):
+
+- **pi** (`pi-bridge.js`): `pi --mode rpc`, typed sidecar
+  (ready/streaming/lastPrompt/exited), flockmsg v2 + nonce-ack, session
+  identity = session-файл. Dialog'и расширений без оператора: авто-ответ
+  strictest option (deny) + LOUD mirror + `ext_dialog_auto_denied` в
+  activity (gate-канал = `attach`: рычаг оператора — pane);
+- **codex** (`codex-bridge.js`): `codex exec --json` на ход (TUI не
+  подходит: общий app-server-демон), thread id (UUID v7) = сессия; resume =
+  `exec resume <thread>`, fork = `exec fork <thread>`; in-core
+  responses-шим (`FLOCK_PORT+11`): сливает `developer` → `instructions`
+  для vLLM. `CODEX_HOME=<pod>/.codex`.
+
+**Terminal-native** (delta маленькая: нет моста, сигналы — с панели):
+
+- **claude**: TUI, `CLAUDE_CONFIG_DIR=<pod>/.claude`, сессия = uuid
+  transcript, ack = рост transcript, boot-диалоги авто-отвечаются
+  (маркеры хрупкие — сверять при бампе, claude-protocol.test);
+- **bash**: plain window, без ready-gate и resume.
+
+**Unified `--child-args` (C10)**: manifest-поле `child: {args?, env?}` —
+raw passthrough (args — после mapped-осей, env — поверх flock-managed):
+
+```json
+{ "id": "cheap-dev", "imports": ["pi"], "thinking": "low",
+  "child": { "env": { "MY_VAR": "1" } } }
+```
+
+Мерж манифестов: скаляры ext-wins (profile > imports > base), массивы
+concat, `mcp` по имени сервера.
+
+```sh
+./bin/flock agents ls                      # id, runtime, source, profiles, thinking
+./bin/flock agents show <id> [--profile P] # resolved manifest
+./bin/flock pod spawn dev --agent pi --profile careful
+./bin/flock pod spawn cxdemo --agent codex --model qwen3.8-27b-fp8
+./bin/flock pod spawn ctest --agent claude
+```
+
+Изоляция (все bridge-рантаймы): per-pod конфиг (`PI_CODING_AGENT_DIR` /
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), `--no-context-files` +
+`--append-system-prompt <pod>/AGENTS.md` (home-AGENTS.md в под не
+попадает), per-pod sandbox-trust из manifest `trustLevel`.
+
+## pm — обычный под (C8)
+
+pm — не подсистема core, а обычный pod (manifest `pm`), который будится
+inbox-сообщениями/poke и решает **обычными pod-ops**. У core нет pm-тика
+и pm-sweep; special-case `pmNotify` убран — delivery = `message_send
+{to:'pm'}` + poke.
+
+```sh
+./bin/flock pm up        # spawn/relaunch pm-пода
+./bin/flock pm state     # снимок pipeline: tasks, openTasks(+closed), waitingOnClosed,
+                         #   pods(+activity busy/idle/not-ready), liveRuns, unclaimedMessages
+./bin/flock pm down
+```
+
+`flock pm intent '<json>'` — legacy-алиас (whitelist, тот же `apply`);
+pm-протокол: inbox-событие → `flock pm state` → решения твоими ops.
+Hang-worthy события (pod_crashed, task_blocked, task_needs) открывают
+эскалацию ДО доставки.
+
+## Durable-лестница эскалаций (5.4c)
+
+Hang-worthy триггер первым делом пишется в `escalations` (BDD-строка,
+переживает рестарт), а потом доставляется. Tick 30s водит лестницу:
+
+```
+open → pm_notified   (pm жив: доставлено + pm-silence-таймер)
+open → escalated     (pm не жив: сразу оператору)
+pm_notified → escalated (pm молчит > FLOCK_ESC_PM_TIMEOUT_S, default 300s)
+escalated → health-алерт (kind=ladder) + re-reminder каждые
+             FLOCK_ESC_REMINDER_S (default 3600s) до ack/resolve
+```
+
+Авто-закрытие: tick перечитывает исходное условие → `resolved`. Дедуп: один
+активный ряд на key.
+
+```sh
+./bin/flock esc ls [--all]     # аудит «почему провисло»
+./bin/flock esc ack <id>
+```
+
+## Watchdog
+
+Декларативные проверки: кто угодно (CLI/агент) регистрирует job, core
 оценивает по расписанию (tick 1с) и будит нужный pod.
 
 ```sh
@@ -57,563 +244,92 @@ npm run build
 ./bin/flock watchdog add --policy marker --text "CI:OK" --target dev --repeat
 ./bin/flock watchdog add --policy stall  --idle 120 --target dev --wake-interval 300
 ./bin/flock watchdog add --policy file --path ~/build/out.txt --target dev
-./bin/flock watchdog ls
-./bin/flock watchdog history <job_id>
-./bin/flock watchdog cancel <job_id>
 ```
 
-Политики: `marker` (текст в capture pod), `timer` (разбудить через N сек),
-`stall` (экран не меняется N сек), `file` (файл появился/исчез).
-Quiet-period (`--wake-interval`, дефолт 30с/60с для stall), timeout
-(`--timeout`), история доставок.
+Политики: `marker` (текст в capture), `timer`, `stall` (экран не меняется),
+`file` (появился/исчез). Доставка — verified-send (paste → верификация по
+capture → ретраи).
 
-Доставка надёжная: paste + Enter → **верификация по capture** (белспейс-
-независимая) → ретраи при неуверке. Ввод во время занятого pod не теряется
-(pi TUI его очередь), поэтому отправка не блокирует и не таймаутит.
+## Health (gate/idle)
 
-Auto-registration: core кладёт `flock` в `~/.flock/bin` (на PATH в окне pod),
-поэтому агент сам ставит слежку — job атрибутируется его pod'у
-(`FLOCK_POD_ROLE`).
-
-Архитектура — docs/04-watchdog.md.
-
-## Workflow / runkeeper / адаптеры / multi-flock (этап 2.5)
-
-**Workflow** — именованный последовательный пайплайн шагов; запуск
-(instance) двигает шаги через обычную очередь задач, результат шага
-передаётся в тело следующего.
+Built-in health-чеки поверх typed-сигналов адаптера: **gate** (dialog
+ждёт человека: у pi — `ext_dialog_auto_denied`, канал `attach`; у claude —
+permission-промпт) и **idle** (агент на паузе с active-задачей: nudge →
+`task needs`). Лестница: alert → nudge/realert → эскалация.
 
 ```sh
-./bin/flock workflow define demo --steps "intake:pm,build:dev,review:rev"
-./bin/flock workflow start demo "payload для всех шагов"
-./bin/flock workflow ls
-./bin/flock workflow status <instance_id>
+./bin/flock health ls
+curl -H "Authorization: Bearer $(cat ~/.flock/token)" http://127.0.0.1:7460/api/health
+# → alerts, activeEscalations, opts
 ```
 
-Шаг done → следующий сам ставится в очередь; blocked/под-лоуст →
-instance останавливается. DAG/зависимости/retry — при первом реальном случае.
+## MCP: `flock mcp serve` (C9)
 
-**Runkeeper** (тик 5с) — pid агента умер → run `crashed` за один тик
-(«окно живо, агент мёртв»: постоянный pane переживает runner, поэтому
-одного pid-проверки недостаточно).
-
-**Агент-адаптеры** — manifest-driven: один generic-реализатор + декларация
-`{id, command, runtime?, modelFlag?, args?, env?, guidance?, firstPrompt?,
-imports?, profiles?}`. Встроенные: `pi`, `bash`, `claude`, `codex`, `pm`;
-свой рантайм = `<FLOCK_HOME>/agents/<id>.json` (не код). `imports` —
-наследование фрагментов манифестов (merge: скаляры — потомок, args —
-конкатенация, env/guidance — по ключу/id); `profiles` — per-spawn override
-(`--profile <name>`), при смене профиля stale managed-blocks чистятся:
+Zero-dep stdio JSON-RPC server (MCP): `tools/list` = весь `OP_REGISTRY`
+(`inputSchema: {type:"object"}`, description из summary), `tools/call` —
+HTTP-запрос в `/api/ops` running core (один writer, token-аутентификация,
+реальная валидация — в op-хендлерах).
 
 ```sh
-./bin/flock pod spawn dev --agent pi --model <provider/id>
-./bin/flock pod spawn stub --agent bash
-./bin/flock pod spawn mate --agent teammate --profile quiet
+./bin/flock mcp serve    # stdio; подключить в MCP-клиент как stdio-сервер
 ```
 
-**Multi-flock (profiles)** — несколько изолированных инстансов core:
+## Team up
 
-```sh
-./bin/flock -p team2 core up        # свой home ~/.flock/team2, порт, сессия flock-team2
-./bin/flock -p team2 pod spawn dev
-./bin/flock -p team2 task add dev "..."
-```
-
-Порт = 7461 + hash(name) (переопределить `FLOCK_PORT`), tmux-сессия
-`flock-<name>`, БД/token/log — свои. Инстансы не пересекаются.
-
-## flock-rpc runner + изоляция пода (этап 3)
-
-Под с агентом `pi` живёт не голым TUI, а через **runner**: процесс в окне
-запускает `pi --mode rpc`, держит с ним typed JSONL-канал. Всё, что раньше
-гадлось по экрану, теперь — события:
-
-- **готовность и exit**: spawn ждёт typed ready (sidecar), смерть агента —
-  `crashed(signal SIGKILL)` / `crashed(code N)` в runkeeper'е;
-- **доставка с подтверждением**: `pod send` идёт `flockmsg <base64>`
-  (одна строка для любого текста), ack — из sidecar, не с экрана;
-- **relaunch с памятью (честный resume)**: `flock pod relaunch <role>`
-  перезапускает ТОЧНЫЙ persisted session-файл (pi: `--session <file>`,
-  claude: `--resume <uuid>`); файла нет → relaunch падает с recovery `attention_required` (C6: failed resume fails loudly; чистый старт — явный `flock pod relaunch <role> --fresh`) с записью в meta,
-  никогда silent fresh; `--fork [role]` — форк сессии (pi: `--fork <ref>`,
-  claude: `--resume <uuid> --fork-session`); `flock pod resume-token <role>
-  <file|uuid|reset>` — зафиксировать сессию для resume (иначе — последняя);
-- **постоянный pane**: окно пода — постоянный shell,
-  relaunch = typed stop старого runner'а (C-c → sidecar `exited`) + новая
-  команда в то же окно; скроллбек живёт через агентов, pane_pid неизменен;
-  runkeeper детектит нетипизированную смерть: `runner gone (pane at shell)`;
-- **здоровье подов** (этап 4.1): built-in health-чеки поверх typed-сигналов —
-  **gate** (dialog ждёт человека: `flock pod answer <role> <n|текст>`) и
-  **idle** (агент на паузе с active-задачей: nudge → `task needs`);
-  `flock health ls` / `/api/health`, алерты в `health_alerts`;
-- **goal loop / pm** (этап 4.2): `flock pm up` — LLM-lead под, который на
-  триггерах (task add/done/needs/blocked/cancel, pod crash, 5min sweep)
-  читает pipeline и решает через typed intents (whitelist: task_*, pod_*,
-  workflow_start) — единый `apply`, audit в session pm; sweep будит pm
-  только при изменениях (тихий pipeline = 0 LLM-стоимости);
-- **изоляция**: per-pod конфиг pi (`PI_CODING_AGENT_DIR`/`SESSION_DIR`,
-  симлинки моделей/auth), `--no-context-files` + `--append-system-prompt
-  <pod>/AGENTS.md` — home-AGENTS.md (и родительские context-файлы) в под
-  не попадают; per-pod sandbox-trust (уровень из manifest `trustLevel`);
-- **CLI в песочнице**: per-pod unix-сокет `<pod>/core.sock` + снапшот CLI
-  в `<pod>/.flock-cli/` — агент в bwrap-песочнице завершает задачи
-  `flock task done` без сети и без видимого home.
-
-```sh
-./bin/flock pod spawn dev                  # runner + pi (ready-gate)
-./bin/flock pod send dev "..."              # flockmsg + sidecar-ack
-./bin/flock pod relaunch dev                # честный resume: точный session-файл
-./bin/flock pod spawn dev2 --fork dev       # форк сессии dev в новую
-```
-
-Анатомия: чистый модуль `runner-protocol` (фрейминг, env-allowlist, билдеры,
-trust/resume/fork-решения; hermetic-тест `npm test`) +
-`runner.js` (child pi, зеркало в панель, sidecar, activity.jsonl).
-
-## RuntimeAdapter + honest resume (этап 3.1)
-
-Запуск рантайма — через 5-методный **RuntimeAdapter**:
-`listInstalled / project / deliverStartup / launchHarness / checkReady`.
-Адаптеры: **pi** (RPC-мост, typed session identity), **claude** (Claude Code
-TUI, transcript-сессии), **codex** (exec-мост, thread-сессии), **bash**
-(plain window). Новый рантайм = адаптер + manifest (`runtime` в JSON).
-
-- **launch posture**: `pod spawn --posture full_bypass` форсирует полный
-  bypass (pi: trust+approve; claude: `--permission-mode bypassPermissions`,
-  подтверждение диалога — автоматом); `floor` уважает конфиг.
-  `permissionMode` в manifest — нативная ось claude (`--permission-mode`);
-  pi отклоняет (у pi своя ось — trust-уровни);
-- **startup-контекст**: manifest `guidance[]` — managed blocks в
-  `<pod>/AGENTS.md` (идемпотентный merge, до запуска; claude — `CLAUDE.md`);
-  `firstPrompt` — первый промпт после ready (только fresh);
-- **checkReady**: live-готовность в `/api/pods` (`ready.reason`);
-  sidecar «ready» при панели на shell = stale (`stale_ready`);
-  claude: prompt-курсор + нет открытого диалога (boot-диалоги — theme/API
-  key/уведомления/folder trust/MCP/bypass-приёмка — отвечаются автоматически);
-- **listInstalled**: нет бинарного рантайма — чистая ошибка на spawn.
-
-## Claude-под (этап 3.3)
-
-- **Изоляция**: `CLAUDE_CONFIG_DIR=<pod>/.claude` (конфиг+сессии+transcripts
-  в поде), onboarding-состояние pre-seed (fresh-конфиг иначе упирается в
-  connectivity-check на api.anthropic.com и умирает; partial-файл от
-  оброненного запуска — merge, не skip);
-- **Сессия = uuid transcript-файла** (`<pod>/.claude/projects/<slug>/<uuid>.jsonl`);
-  relaunch = честный `--resume <uuid>`; `--fork` = `--resume <uuid>
-  --fork-session` (fork-файл появляется после первого хода, parent не
-  трогается);
-- **Доставка**: raw paste + Enter, ack = рост transcript-файла (типизированный
-  сигнал, не скрапинг); relaunch — typed-stop (C-c) в тот же persistent pane;
-- **Runkeeper**: pane вернулась на shell = `crashed(claude exited, pane at shell)`;
-- **Built-in `claude`**: vLLM через Anthropic-совместимый эндпоинт
-  (`ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` в env manifest),
-  `--effort medium` (локальная модель не принимает high).
-
-```sh
-./bin/flock pod spawn ctest --agent claude          # TUI-под (ready-gate)
-./bin/flock pod spawn ctest --agent claude --posture full_bypass
-./bin/flock pod relaunch ctest --fork               # форк своей сессии
-```
-
-## Codex-под (этап 5.5)
-
-- **Почему не TUI**: codex TUI — клиент общего app-server демона
-  (C-c = «отключиться», работа продолжается в демоне; trust-персистентность
-  ломается при рестарте демона — всё live-наблюдено). Поэтому pod работает
-  через **exec-мост** (`codex-bridge.js`, аналог pi-runner): `codex exec --json`
-  на ход, сессия продолжается через `exec resume <thread>` / `exec fork <thread>`.
-- **Изоляция**: `CODEX_HOME=<pod>/.codex`; `config.toml` проецируется
-  адаптером (approval `never`, sandbox `danger-full-access`, provider →
-  in-core **responses-шим**).
-- **Шим** (`FLOCK_PORT+11`, 127.0.0.1, в core): codex шлёт системный промпт
-  как `developer`-сообщение в `input`, а vLLM этот role не принимает
-  (`Unexpected message role.`) — шим сливает developer в `instructions` и
-  проксирует остальное как есть (streaming включительно).
-  Upstream: `FLOCK_CODEX_UPSTREAM` (default `http://192.168.1.114:8000`).
-- **Сессия = thread id (UUID v7)** — создаётся на ПЕРВОМ ходе (sidecar
-  `sessionId`); relaunch (pm-intent) = честный `exec resume <thread>`;
-  operator-relaunch / `--fork` = `exec fork <thread>` (fork-правило: новый
-  thread, parent не трогается; mост отказывает, если codex вернул parent).
-  Тread'а нет → ошибка на первом ходе (честно в панели).
-- **Сигналы — те же, что у pi**: sidecar (ready/streaming/lastPrompt/exited),
-  flockmsg v2 + nonce-ack, foreground-guard в runkeeper; usage-события из
-  `turn.completed` уходят в общий usage-пайплайн.
-- **Built-in `codex`**: модель — `--model` или bare id из models.json.
-
-```sh
-./bin/flock pod spawn cxdemo --agent codex --model qwen3.8-27b-fp8
-./bin/flock pod send cxdemo "..."            # ack = sidecar nonce
-./bin/flock pod relaunch cxdemo              # форк своего thread (память сохраняется)
-```
-
-## Runtime-agnostic signal contract
-
-Core больше не знает, какой рантайм под окном. Три утечки (runkeeper-ветка
-`podRuntime==='claude'`, podSend-ветки pi/claude, health «только pi») закрыты
-единым контрактом: core задаёт любому рантайму три вопроса, адаптер отвечает
-своими сигналами:
-
-- **`liveness(binding, run) → {alive, reason?}`** — «жив ли агент этого
-  run?». reason попадает в `runs.exit_state` (форма прежняя: `clean` /
-  `crashed(...)`; core считает `crashed…` крахом + pm-уведомление). pi:
-  typed sidecar exit (launchId-scoped) + foreground-guard; claude:
-  foreground-guard (pane на shell = TUI умер); codex: те же typed sidecar +
-  foreground-guard (мост — foreground панели). Метода нет → общий pid-check
-  (bash/cmd).
-- **`sendVerified(binding, text) → {ok, attempts, ack, detail?}`** —
-  «доставь и докажи». pi: flockmsg v2 + ack по sidecar nonce; claude: raw
-  paste + рост transcript; codex: flockmsg v2 + ack по sidecar nonce
-  (ack при enqueue в мост). Метода нет → legacy visual probe.
-- **`healthProbe(binding) → {ready, busy, lastActivityAt?, gate?}`** —
-  «что агент делает?». pi: sidecar ready/streaming/lastPrompt.at + gate из
-  activity log (`channel: 'answer'`); claude: склейн панели + mtime
-  transcript + `detectClaudeGate` (permission-промпт; idle-footer — НЕ
-  gate; `channel: 'attach'` — отвечать tmux attach, а не `flock pod
-  answer`); codex: только sidecar (у `codex exec` нет интерактивных
-  диалогов — approval never, gate всегда отсутствует).
-  Метода нет → health для пода пропускается.
-
-Правило «gate жив только для текущего run» (`gate.at >= run.started_at`)
-осталось политикой CORE поверх пробы; лестницы gate/idle (alert →
-nudge/realert → task needs) не менялись. `pmDigest.pods[].ready` заменён на
-`activity: 'busy'|'idle'|'not-ready'|null` (null = нет пробы — bash/cmd).
-
-Новый рантайм = один адаптер, отвечающий на эти же вопросы (+ launch/
-ready-часть контракта), без правок core. claude-гейт детерминирован по
-подсказке футера: `id = claude:<hint>` (стабилен для health_alerts.ref).
-
-## Агенты и профили (T2)
-
-`~/.flock/agents/<id>.json` — декларативный манифест: `imports` (цепочка
-базовых манифестов), `guidance` (блок, который агент видит в AGENTS.md),
-`profiles` (именованные override-наборы) и pi-оси первой руки:
-
-- **thinking**: `off|minimal|low|medium|high|xhigh|max` (закрытый набор,
-  `resolveAgent` проверяет — ошибка перечисляет допустимые);
-- **tools / excludeTools**: allow/deny-списки (pi: `--tools`, `--exclude-tools`);
-- **skills / noSkills**: пути/имена скиллов (`--skill`, `--no-skills`);
-- **extensions / noExtensions**: builtin-имена или пути (`--extension`);
-- **mcp**: мапа pod-серверов `{имя: {command, args, env} | {url, headers}}` —
-  пишется в `<PI_CODING_AGENT_DIR>/mcp.json` при каждом запуске (и удаляется,
-  если манифест без mcp — переключение профиля не оставляет чужие серверы);
-- **systemPrompt / appendSystemPrompt / noContextFiles**.
-
-Мерж как у всего остального: скаляры ext-wins (profile > imports > base),
-массивы concat (как args), `mcp` — по имени сервера (запись ext с тем же
-именем заменяет сервер целиком). Пустые массивы после мержа выкидываются
-(`tools: []` не может стать флагом «разрешено ничего»).
-
-**CLI**:
-
-```sh
-flock agents ls                        # id, runtime, source, profiles, thinking
-flock agents show <id> [--profile P]   # resolved manifest (как при spawn)
-flock agents new <id> [--from pi]      # каркас {id, imports:[pi], profiles:{}} (не перезаписывает)
-```
-
-Каркасный манифест может НЕ иметь `command` — он наследуется по цепочке
-imports (`pi` даёт `command: pi` + `runner: flock-rpc` + runner-окружение).
-
-**Подключение**: `flock pod spawn <role> --agent <id> [--profile P]` —
-ось thinking/tools/skills/mcp попадает в pi-флаги через runner
-(один JSON-флаг `--pi-config` в runner-команде, парсер выбрасывает
-неизвестные ключи). Мерж-политика (squash/never) и `testCmd` — тоже
-манифестные оси (S1/S2).
-
-```sh
-# пример: под на базе pi, но с дешёвым thinking и без edit
-cat > ~/.flock/agents/cheap-dev.json <<'EOF'
-{
-  "id": "cheap-dev",
-  "imports": ["pi"],
-  "thinking": "low",
-  "excludeTools": ["edit"],
-  "mcp": { "time": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-time"] } },
-  "profiles": { "careful": { "thinking": "xhigh", "tools": ["bash"] } }
-}
-EOF
-flock pod spawn dev2 --agent cheap-dev --profile careful
-flock agents show cheap-dev --profile careful    # проверка того, что resolved
-```
-
-Регрессия (тест): манифест без новых осей собирает байт-идентичную
-runner-команду и pi-argv, что до T1 (флага `--pi-config` просто нет).
-
-## Worktree + S0 merge (этап 5.1)
-
-Под с `--repo` живёт в git-worktree `flock/<role>` — изолированная ветка,
-собственные коммиты, без загрязнения основного checkout:
-
-- **spawn**: `flock pod spawn dev --repo /path/to/repo [--base main]` —
-  worktree прицепляется к `~/.flock/pods/<role>/work`; база по умолчанию =
-  текущая ветка репо (не detached);
-- **S0 auto-merge**: при `task done` ядро делает **fast-forward merge**,
-  если ветка чистая (только tracked-изменения — инфраструктура пода
-  untracked по дизайну), `ahead > 0`, `behind = 0` и база проверена в
-  HEAD репо. Всё остальное — `merge skipped (reason)` в transition
-  (ветка остаётся кандидатом на ручной merge);
-- **арбитр**: закрытый worktree-под с unmerged-коммитами → таск re-queue
-  (не blocked) — коммиты не теряются;
-- **relaunch** сохраняет worktree-биндинг (восстанавливается из `.git`
-  файла, если поля стерты); `pod close --purge` — удалить checkout
-  (ветка остаётся);
-- worktree-поды: sandbox off (git и есть trust boundary), bash-guard
-  autonomous (рутинный git — работа; жёсткий floor на `rm -rf` и т.п.
-  остаётся).
-
-```sh
-./bin/flock pod spawn dev --repo /path/to/repo --base main
-./bin/flock pod merge-status dev                  # ahead/behind/dirty/head
-./bin/flock pod close dev --purge                 # worktree удалить, ветку оставить
-```
-
-## Team up (этап 5.1)
-
-`flock team up [pods.yaml]` — декларативный состав команды, reconcile:
-недостающих spawn, живым пере-merge guidance (managed block `team:<role>`
-в AGENTS.md), никого не убивает. Идемпотентен — можно запускать на каждом
-запуске как "раскладка":
+`flock team up [pods.yaml]` — декларативный состав: reconcile (недостающих
+spawn, живым — refresh managed guidance в AGENTS.md), никого не убивает,
+идемпотентен.
 
 ```yaml
 pods:
   dev:
     agent: pi
     model: cat-vllm/qwen3.8-27b-fp8
-    repo: /path/to/repo
-    base: main
     guidance: |
-      Пиши на русском. Коммить с prefix dev:
+      Пиши на русском.
   rev:
     agent: pi
-    repo: /path/to/repo
-    guidance: |
-      Ревью: только замечания, без правок.
 ```
 
-## Экономика + retention (этап 5.2)
+Pod'ы — plain-dir: рабочая директория пода — просто каталог; git,
+ветки, коммиты — за агентами (свой workflow, свои коммиты). Merge-гейты,
+review-гейты, merge-queue, conflict-резолвер и вся экономика — **убраны из
+core** (C1/C2).
 
-- **Usage**: pi-runner пишет `usage`-события (input/output/cache токены,
-  модель) на каждый assistant-сообщение в `activity.jsonl`; ядро (тик 60с)
-  агрегирует в `usage_events` (per-seat byte-cursor переживает рестарты
-  core, dedupe key, self-heal после head-trim). `flock usage [role]`,
-  `/api/usage[?role=&since=]` (токены по подам — экономия pipeline);
-- **Retention** (тик 24ч, env-настраивается): runs старше 14 дней →
-  `runs_archive` (архив, не delete — audit trail сохраняется),
-  `activity.jsonl` head-trim 20k→5k строк, `core.log` rotate >10MB.
+## Multi-flock (profiles)
+
+Несколько изолированных core-инстансов:
 
 ```sh
-./bin/flock usage            # токены по всем подам
-./bin/flock usage dev        # один под
+./bin/flock -p team2 core up      # свой home ~/.flock/team2, порт, tmux flock-team2
+./bin/flock -p team2 pod spawn dev
 ```
 
-## Merge-гейт S1+S2 (этап 5.4b)
+БД/token/log/sessions — свои, инстансы не пересекаются. (Кросс-профильная
+координация — fleet-фаза.)
 
-Worktree-под при `task done` проходит **merge-гейт** — merge решает гейт,
-а не самооценка агента:
+## Retention
 
-- **S1 — merge policy** (`--merge ff|squash|never` при spawn, `merge:` в team
-  file, `merge` в agent-манифесте; default `ff` = S0):
-  - `ff` — S0: fast-forward только, все отклонения — skip с причиной;
-  - `squash` — **dry-run `git merge-tree base branch` ДО merge**: конфликт →
-    таск `blocked (merge conflict)` + CONFLICT-суммарий в result (ноль
-    полу-состояний); чисто → один коммит `flock(<task-id>): <title>` на base
-    (wip-история агента в main не попадает). После squash **ветка
-    передвигается на squash-коммит** (иначе следующий merge ловит add/add
-    конфликт на уже-смерженных файлах);
-  - `never` — ветка всегда остаётся ручным merge-кандидатом;
-  - защита оператора: base-репо с незакоммиченными изменениями → merge
-    отклоняется (squash чистится через `reset --hard`, только после pre-check
-    чистоты);
-- **S2 — quality gate**: workflow с `--require-test` (или `requireTest` в
-  `--steps-json`-спеке/flag при start) — перед merge core запускает `testCmd`
-  из agent-манифеста **в worktree**: green → merge, red/timeout → таск
-  `blocked (quality gate: tests failed)` + лог (tail 4KB) в `run.meta`
-  (`kind: quality_gate`). **Fail-closed (5.4c)**: требуется гейт, но `testCmd`
-  не задан в манифесте → merge НЕ идёт: таск
-  `blocked (quality gate unconfigured)` + громкий health-алерт + durable
-  эскалация (не только transition-note). Оператор чинит манифест и
-  `flock task unblock`. (pre-check чистоты base-репо перед `reset --hard`
-  при squash-конфликте покрыт отдельным тестом — gitops.test.ts)  заметкой о дыре в конфиге (не молча).
+Тик 24h (env-настраивается): runs старше N дней (default 14) →
+`runs_archive` (архив, не delete), `activity.jsonl` head-trim, `core.log`
+rotate. Usage-аудит: bridge'и пишут `usage`-события в `activity.jsonl`
+(аудит оператора, не решений core).
 
-```sh
-# squash-под + workflow с тестовым гейтом
-./bin/flock pod spawn dev --agent pi --repo ~/Code/myrepo --base main --merge squash
-./bin/flock workflow define ship --steps "dev:dev,rev:rev" --require-test
-./bin/flock workflow start ship "фича X"          # red gate -> blocked (tests failed)
-```
+## Pod-scoped авторизация
 
-Agent-манифесты: `merge` и `testCmd` поля (например `~/.flock/agents/pi.json`:
-`"testCmd": "npm test"`). Таймаут гейта: `FLOCK_TEST_TIMEOUT_S` (default 600).
+Один токен core, scope зависит от канала: unix-сокет пода
+(`<pod>/core.sock`) видит только `pod`-scoped ops (свои задачи, свой
+inbox, свой под); operator-only ops через сокет пода → 403. Узкие места
+(own-pod/own-task) проверяются в op.
 
-## Review-гейт S3 (этап 5.4b)
+## Принципы
 
-Workflow `build:dev → review:rev` — **merge откладывается до verdict'а**:
-
-- `review: <role>` у шага = «ревьюет worktree-под `role`». При enqueue core
-  кладёт в body таска **`git diff base...branch` (≤4KB) + чек-лист** (свежий
-  контекст ревьюера видит изменения, а не самоописание автора);
-- build-шаг при `done` не мерджит: `merge deferred (step review follows)`;
-- вердикт ревью через тот же протокол: `task done` (approve) / `task blocked
-  '<почему>'` (reject) — reject блокирует инстанс, merge не происходит;
-- approve (последний шаг) → **deferred merge** того же merge-гейта S1+S2
-  (squash/ff + quality gate); конфликт или red-гейт на этом этапе блокирует
-  **инстанс** (`workflow_blocked`), а не ре-квезит агента — работа сделана,
-  упала интеграция;
-- frozen step task: остановленный инстанс (blocked/cancelled/done) не
-  принимает поздние смены статуса шага (задача и инстанс не разъезжаются).
-
-```sh
-./bin/flock workflow define ship --steps-json '[{"id":"build","role":"dev"},{"id":"review","role":"rev","review":"dev"}]'
-./bin/flock workflow start ship "фича X"
-```
-
-## Merge queue S4 (этап 5.4b)
-
-Интегратор — **сам core** (он владеет base-репо; отдельный LLM-интегратор
-здесь не экономит — merge это детерминированные git-операции). С ≥2
-параллельными worktree-подами мутации на общем base-репо сериализуются:
-
-- **FIFO-queue** (merge-queue.ts): только мутирующая часть merge
-  (`ffMerge`/`squashMerge`) идёт под serial-лок; read-only часть (status,
-  merge-tree dry-run, прогон тестов quality-гейта) остаётся параллельной —
-  10-минутные тесты пода A не держат чистый ff-мердж пода B;
-- **re-verify at claim time** (аналог claim/verify арбитра): критическая
-  секция исполняет git против ТЕКУЩЕГО состояния base — если base сдвинулся,
-  пока merge ждал в очереди, ff падает чисто (skipped с причиной), а squash
-  переделывает 3-way против свежего base и чистится при конфликте;
-- observability: события `merge_queued`/`merge_done` (role, policy, queue)
-  и `mergeQueue` (глубина) в `GET /api/health`.
-
-```sh
-curl -H "Authorization: Bearer $(cat ~/.flock/token)" http://127.0.0.1:7460/api/health
-# -> {"alerts":[...],"opts":{...},"mergeQueue":0}
-```
-
-## Conflict-резолвер S5 (этап 5.4b, opt-in)
-
-**Включается болью, а не по умолчанию**: `FLOCK_RESOLVER_AGENT=pi` при
-запуске core (без env резолвер выключен). При `blocked (merge conflict)`
-(S1) core разворачивает цепочку:
-
-1. **resolver-под** `resolver-<role>`: LLM-агент (manifest из env) со своей
-   worktree на ветке `flock/<role>-resolve` (форк от конфликтующей ветки —
-   саму ветку занять нельзя: она checked out в worktree оригинала),
-   `merge: never` (резолвер никогда не мерджит сам);
-2. таск резолвера: **конфликт-информация из dry-run + инструкция** —
-   `git merge <base>`, разрешить конфликты **соблюдительно** (сохранить и
-   работу ветки, и изменения base), `flock task done/blocked`;
-3. по `done` резолвера core (tick 30s): ff-применяет fork на ветку
-   оригинала (worktree должна быть чистой, ff-only) → **перезапускает тот
-   же merge-гейт S1+S2** → успех: origin-таск `done` (reason: `S5 resolver:
-   conflict resolved in N attempt(s)`), цепочка `resolved`;
-4. **жесткий лимит попыток**: `FLOCK_RESOLVER_MAX_ATTEMPTS` (default 2) —
-   исчерпан → цепочка `exhausted`, таск остаётся `blocked` у оператора.
-   Нечего жечь деньги в бесконечном цикте.
-
-```sh
-FLOCK_RESOLVER_AGENT=pi FLOCK_RESOLVER_MAX_ATTEMPTS=2 ./bin/flock core up
-./bin/flock resolver ls        # цепочки: running | resolved | exhausted | failed
-```
-
-Семантика разрешения: если резолв полностью абсорбирован в base (например,
-резолвер честно взял версию base — работа ветки была дублем), merge-гейт
-видит `no diff vs base` → это **успешное** разрешение (origin-таск `done`),
-a не ошибка.
-
-## Durable-лестница эскалации (этап 5.4c)
-
-pm-триггеры были fire-and-forget: pm умер → триггер потерян до 5-мин
-sweep, аудита «почему провисло» нет. Теперь каждый hang-worthy триггер
-(pod_crashed / task_blocked / task_needs / quality-gate) первым делом
-пишется в `escalations` (миграция 013) — BDD-строка, переживающая
-рестарт, а потом доставляется. Tick 30s (всегда включён) водит лестницу:
-
-```
-open → pm_notified   (pm жив: триггер доставлен + pm-silence-таймер запущен)
-open → escalated     (pm не жив: сразу к оператору — ничто не теряется)
-pm_notified → escalated (pm молчит > FLOCK_ESC_PM_TIMEOUT_S, default 300s)
-escalated → health-алерт (kind=ladder) + core.log, re-reminder каждые
-             FLOCK_ESC_REMINDER_S (default 3600s) до ack/resolve
-```
-
-**Автоматическое закрытие**: tick перечитывает исходное условие (таск
-ушёл из blocked/needs, run пода снова жив, инстанс ушёл из blocked) →
-`resolved` с причиной. Дедуп: один активный ряд на key (повторный
-краш того же пода обновляет audit-note, а не множит ряды).
-
-```sh
-./bin/flock esc ls [--all]     # активные (или все) эскалации — аудит «почему провисло»
-./bin/flock esc ack <id>       # оператор: принял, напоминания прекращаются
-```
-
-`/api/health` теперь включает `activeEscalations` (id/key/state/kind/subject).
-
-## Worktree GC в retention-свип (этап 5.4c)
-
-Закрытые worktree-поды не копят checkout'ы и ветки: 24h sweep удаляет
-worktree закрытого пода (ветка сохраняет коммиты, re-spawn idempotently
-переподключается) и ветку с `ahead=0` (полностью смержена). **Ветка с
-ahead>0 (UNMERGED) сохраняется** — это merge-кандидат (arbiter re-queue
-полагается на него). Плюс `git worktree prune` по всем известным репо.
-Отчёт: `gcWorktrees`/`gcBranches`/`gcKept` в core.log.
-
-## Замечание по claude-адаптеру
-
-claude — единственный «не-typed» адаптер: boot-диалоги по клавишам и
-TUI-маркерам, ack по транскрипту. Маркеры — хрупкая поверхность: при
-бампе версии claude сверяйте маркеры (claude-protocol.ts) с новым TUI —
-hermetic-тест claude-protocol фиксирует текущие ожидания.
-
-Шаги workflow (JSON через `--steps-json`). C7 (scribe model): в шагах нет
-ручек priority/retry/timeoutMin — runtime закрывает и записывает, НЕ гейтит;
-stuck-детекция — на watchdog (лестница эскалаций), retry — явный акт оператора
-(`flock task unblock`):
-
-```json
-[
-  {"id":"dev","role":"dev"},
-  {"id":"rev","role":"rev","deps":["dev"]}
-]
-```
-
-- **deps** (5.4d, DAG): ids шагов, которые должны быть done, прежде чем шаг
-  стартует. Без deps — шаг на стартовом фронте. Последовательный пайплайн —
-  вырожденный случай (шаг N зависит от N-1). Валидация на define: unknown
-  dep, self-dep и **циклы** отклоняются (400). Движок: при done шага ready
-  set = pending-шаги со всеми done-зависимостями → закидываются **параллельно**
-  (арбитер сам распределяет по подам); тело таска получает результаты
-  зависимых шагов. Состояние шага — `wf_step_state.state`
-  (pending/running/done/blocked), видно в `flock workflow status`.
-  Задержка: если ready пуст, но есть running — ждём (не deadlock); deadlock
-  (валидацией невозможен) блокирует инстанс.
-- **Scribe-поведение**: done шага → одна транзакция закрывает шаг и
-  проецирует все шаги, чьи deps теперь satisfied (DAG-фронт). Failed
-  шаг (blocked/cancelled) → сcribe записывает и ставит инстанс в
-  blocked/cancelled; автo-pовторов нет — оператор решает (unblock / cancel).
-
-```sh
-./bin/flock workflow define pipe --steps-json '[{"id":"dev","role":"dev"},{"id":"rev","role":"rev"}]'
-./bin/flock workflow start pipe "фича X"
-./bin/flock workflow status <instance_id>   # state + stepState
-./bin/flock workflow rm <name>              # удалить определение (инстансы живут)
-```
-
-## Pod-scoped авторизация (этап 5.3)
-
-Один токен core, но **scope зависит от сокета**: запросы, пришедшие на
-unix-сокет пода (`<pod>/core.sock`), видят только ops со scope `pod`
-(чтение + свои задачи: add/report/unblock/merge-status/capture/close
-своего пода). Operator-only ops (spawn/relaunch/watchdog/…) через сокет
-пода → 403. Операторский CLI (main-порт) не ограничен. Узкое место
-(own-pod/own-task) проверяется в самом op, не в middleware.
-
-```sh
-# live-проверка (нужен live dev-под):
-node dist/core/pod-scope-check.js
-```
-
-## Этап 0 (готово)
-
-core: HTTP+SSE (Hono, bearer), node:sqlite с миграциями, единый путь мутаций
-`apply(op)`, tick-реестр с /healthz-доказательствами, tmux-транспорт
-(paste через load-buffer/paste-buffer), daemonize, рестарт-безопасность.
+- **Core без LLM**: тики = watchdog/scheduler; решения — в подах.
+- **Single writer**: все мутации через `apply` в один процесс; MCP и
+  поды — клиенты.
+- **Honest state**: failed resume = failed (не silent fresh); handoff —
+  transactional; сообщения — durable; события — append-only.
+- **Ноль новых npm-зависимостей**: SSE — Hono streaming, MCP — JSON-RPC
+  руками, всё остальное — node builtins.
+- Тюнинг — `FLOCK_*` env (`FLOCK_PORT`, `FLOCK_ESC_*`, `FLOCK_HEALTH_*`,
+  `FLOCK_RETENTION_*`, `FLOCK_CODEX_UPSTREAM`, …).

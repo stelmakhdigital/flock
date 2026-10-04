@@ -941,10 +941,10 @@ export function deleteWorkflow(store: Store, id: string): void {
   dbOf(store).prepare('DELETE FROM workflows WHERE id = ?').run(id);
 }
 
-export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null; priority?: number }): void {
+export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null }): void {
   dbOf(store)
     .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at, priority) VALUES (?, ?, ?, 'running', ?, ?)")
-    .run(i.id, i.workflowId, i.payload, nowIso(), i.priority ?? 0);
+    .run(i.id, i.workflowId, i.payload, nowIso(), 0);
 }
 
 export function getWorkflowInstance(store: Store, id: string): WorkflowInstance | null {
@@ -987,21 +987,6 @@ export function wfStepStateMap(store: Store, instanceId: string): Record<string,
   const m: Record<string, string> = {};
   for (const r of rows) m[r.step] = r.state;
   return m;
-}
-
-export function wfStepAttempts(store: Store, instanceId: string, step: string): number {
-  const r = dbOf(store)
-    .prepare('SELECT attempts FROM wf_step_state WHERE instance_id = ? AND step = ?')
-    .get(instanceId, step) as { attempts: number } | undefined;
-  return r?.attempts ?? 0;
-}
-
-export function bumpWfStepAttempts(store: Store, instanceId: string, step: string): number {
-  const next = wfStepAttempts(store, instanceId, step) + 1;
-  dbOf(store)
-    .prepare('INSERT INTO wf_step_state(instance_id, step, attempts) VALUES (?, ?, ?) ON CONFLICT(instance_id, step) DO UPDATE SET attempts = ?')
-    .run(instanceId, step, next, next);
-  return next;
 }
 
 export function listWfStepStates(store: Store, instanceId: string): { step: string; attempts: number; state: string }[] {

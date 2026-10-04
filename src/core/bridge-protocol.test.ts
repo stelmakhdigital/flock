@@ -197,4 +197,4 @@ assert.ok(wlc.endsWith('node /d/runner.js --x'));
 assert.strictEqual(strictestOption(['Allow all', 'Deny']), 'Deny');
 assert.strictEqual(strictestOption([]), null);
 
-console.log('runner-protocol: all checks passed');
+console.log('bridge-protocol: all checks passed');
