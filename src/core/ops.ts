@@ -14,6 +14,7 @@ import { validateIntent, applyIntents, pmDigest, notifyPm } from './pm.js';
 import { listPacks, readPackMeta, buildPackBundle } from './packs.js';
 import { readWorkspace, resolveWorkspaceRef, workspacePath } from './workspace.js';
 import { piList, pluginShowDetail, type PluginEntry } from './plugins.js';
+import * as fleet from './fleet.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -92,6 +93,11 @@ function opPayload(o: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(o)) {
     if (k === 'type') continue;
+    // secrets never ride the event log (the token is the fleet credential)
+    if (k === 'token' || k === 'authorization' || k === 'password') {
+      out[k] = '<redacted>';
+      continue;
+    }
     if (typeof v === 'string') out[k] = v.length > 300 ? v.slice(0, 300) + '…' : v;
     else if (v !== null && typeof v === 'object') out[k] = JSON.stringify(v).slice(0, 300);
     else out[k] = v;
@@ -130,6 +136,11 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   agent_image_save: { group: 'pod', scopes: ['operator'], summary: 'save an agent image (manifest + session copy) from a live pi pod', run: (o, c) => agentImageSave(o, c) },
   agent_image_ls: { group: 'pod', scopes: ['operator', 'pod'], summary: 'list agent images', run: (_o, c) => listImages(c.store.home) },
   agent_image_rm: { group: 'pod', scopes: ['operator'], summary: 'delete an agent image (guarded: --force required)', run: (o, c) => agentImageRm(o, c) },
+  // -- fleet (C15: cross-profile coordination) --------------------------------
+  fleet_add: { group: 'fleet', scopes: ['operator'], summary: 'add a fleet profile (another core) to ~/.flock/fleet.json', run: (o, c) => fleetAdd(o, c) },
+  fleet_ls: { group: 'fleet', scopes: ['operator', 'pod'], summary: 'list fleet profiles (remote /healthz) + pending cross-profile work', run: (o, c) => fleetLs(o, c) },
+  fleet_rm: { group: 'fleet', scopes: ['operator'], summary: 'remove a fleet profile', run: (o, c) => fleetRm(o, c) },
+  fleet_handoff_accept: { group: 'fleet', scopes: ['operator'], summary: 'remote side of a two-phase cross-profile handoff (idempotent successor creation)', run: (o, c) => fleetHandoffAccept(o, c) },
   // -- watchdog --------------------------------------------------------------
   watchdog_register: { group: 'watchdog', scopes: ['operator'], summary: 'register a watchdog check (agent-registered)', run: (o, c) => watchdogRegister(o, c) },
   watchdog_cancel: { group: 'watchdog', scopes: ['operator'], summary: 'cancel a watchdog job', run: (o, c) => watchdogCancel(o, c) },
@@ -974,6 +985,83 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   return store.getTask(ctx.store, id);
 }
 
+// fleet_handoff_accept: the REMOTE side of a two-phase cross-profile
+// handoff (C15). Creates the successor task with the PRE-DETERMINED id
+// (fixed by the sender in phase 1) — idempotent: a retry with an existing
+// id returns the task as-is (the remote never duplicates the successor).
+// The sender's local close is 'committed' only after this call succeeds,
+// so the pending window is exactly 'local closed, remote not yet created'.
+async function fleetHandoffAccept(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const id = String(op.id ?? '');
+  if (!/^[a-z0-9_-]{1,64}$/.test(id)) throw new OpError(400, 'bad id');
+  const pod = String(op.pod ?? '').trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(pod)) throw new OpError(400, 'bad pod');
+  const targetPod = store.getPodByRole(ctx.store, pod);
+  if (!targetPod) throw new OpError(404, `no pod: ${pod} (spawn it first — the handoff stays pending until then)`);
+  const existing = store.getTask(ctx.store, id);
+  if (existing) return { ok: true, task: existing, created: false };
+  const title = String(op.title ?? '(handoff)').trim() || '(handoff)';
+  const from = String(op.from ?? 'operator');
+  store.insertTask(ctx.store, {
+    id,
+    title,
+    body: op.body ? String(op.body) : null,
+    podRole: pod,
+    priority: op.priority !== undefined ? Number(op.priority) : 0,
+  });
+  ctx.emit?.({ type: 'fleet_handoff_accepted', id, pod, from });
+  return { ok: true, task: store.getTask(ctx.store, id), created: true };
+}
+
+// ---------- fleet (C15) ----------
+
+async function fleetAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '').trim();
+  const url = String(op.url ?? '').trim();
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(name)) throw new OpError(400, `bad profile name: ${name}`);
+  if (!/^https?:\/\/.+$/.test(url)) throw new OpError(400, `bad url: ${url} (expected http://host:port)`);
+  if (name === 'local') throw new OpError(400, '"local" is reserved (it is this profile — address pods by bare role)');
+  const cfg = fleet.loadFleet(ctx.store.home);
+  cfg.profiles = cfg.profiles.filter((p) => p.name !== name);
+  cfg.profiles.push({ name, url, token: op.token ? String(op.token) : undefined });
+  fleet.saveFleet(ctx.store.home, cfg);
+  ctx.emit?.({ type: 'fleet_profile_added', name, url });
+  return { ok: true, profile: { name, url } };
+}
+
+async function fleetRm(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '').trim();
+  const cfg = fleet.loadFleet(ctx.store.home);
+  const before = cfg.profiles.length;
+  cfg.profiles = cfg.profiles.filter((p) => p.name !== name);
+  if (cfg.profiles.length === before) throw new OpError(404, `no fleet profile: ${name}`);
+  fleet.saveFleet(ctx.store.home, cfg);
+  ctx.emit?.({ type: 'fleet_profile_removed', name });
+  return { ok: true, removed: name };
+}
+
+async function fleetLs(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const cfg = fleet.loadFleet(ctx.store.home);
+  const profiles = await Promise.all(
+    cfg.profiles.map(async (p) => {
+      const h = await fleet.remoteHealth(p);
+      return { name: p.name, url: p.url, healthy: h.ok, detail: h.detail };
+    }),
+  );
+  const handoffs = store.listPendingOutboundHandoffs(ctx.store).map((h) => ({
+    id: h.id,
+    to: `${h.to_profile}/${h.to_role}`,
+    attempts: h.attempts,
+    last_error: h.last_error,
+    status: h.status,
+  }));
+  const messages = store
+    .listPendingOutboxMessages(ctx.store)
+    .filter((m) => m.to.includes('/'))
+    .map((m) => ({ outboxId: m.id, to: m.to, attempts: m.attempts, from: m.from_ }));
+  return { profiles, pending: { handoffs, messages } };
+}
+
 async function taskHistory(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const id = String(op.id ?? '');
   const task = store.getTask(ctx.store, id);
@@ -1104,6 +1192,67 @@ async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
   if (ctx.caller?.kind === 'pod' && ctx.caller.role !== task.pod_role) {
     throw new OpError(403, `pod token ${ctx.caller.role}: task ${id} belongs to pod ${task.pod_role}`);
   }
+  // C15: cross-profile handoff — two-phase (honest, not atomic).
+  // ponytail: an atomic cross-DB handoff is impossible under the single-
+  // writer invariant (two cores = two writers). The ceiling is an EVENTUAL
+  // handoff with an explicit pending state; true atomicity = a shared
+  // store (a different architecture, not now).
+  //   phase 1 (local, committed): the task closes 'handed-off (outbound,
+  //     pending)' + the outbound_handoffs row (one transaction).
+  //   phase 2 (remote): fleet_handoff_accept on the remote core (idempotent:
+  //     the successor's task id is fixed by us, created exactly once).
+  //     Success -> 'committed'; failure -> 'pending', the fleet tick
+  //     (60s) retries, N attempts -> attention_required + escalation.
+  let addr: fleet.Address;
+  try {
+    addr = fleet.parseAddress(to);
+  } catch (e) {
+    throw new OpError(400, e instanceof Error ? e.message : String(e));
+  }
+  if (addr.profile) {
+    if (addr.profile === 'local') throw new OpError(400, 'use the bare role for the local profile');
+    if (ctx.caller?.kind === 'pod') {
+      throw new OpError(403, `pod tokens cannot hand off to other profiles: ${to}`);
+    }
+    const by = op.registeredBy ? String(op.registeredBy) : 'cli';
+    const handoffId = store.newId('t'); // = the remote successor task id
+    const body = [task.body, `Передано (handoff) из таска ${id} (pod ${task.pod_role}) — продолжай с места остановки.`].filter(Boolean).join('\n') || null;
+    store.insertOutboundHandoff(ctx.store, id, {
+      id: handoffId,
+      from_role: task.pod_role,
+      to_profile: addr.profile,
+      to_role: addr.role,
+      title: task.title,
+      body,
+      priority: task.priority,
+      reason: `handoff out->${to}`,
+      closedJson: JSON.stringify({ reason: 'handed-off', target: to, at: new Date().toISOString(), by }),
+    });
+    const res = await fleet.remoteApply(ctx.store.home, addr.profile, {
+      type: 'fleet_handoff_accept',
+      id: handoffId,
+      title: task.title,
+      body,
+      pod: addr.role,
+      priority: task.priority,
+      from: task.pod_role,
+    });
+    if (res.ok) {
+      store.commitOutboundHandoff(ctx.store, handoffId, handoffId);
+      ctx.emit?.({ type: 'task_handoff', taskId: id, from: task.pod_role, to, newTaskId: handoffId, crossProfile: true, status: 'committed' });
+      return { closed: store.getTask(ctx.store, id), next: { id: handoffId, pod: `${addr.profile}/${addr.role}` }, status: 'committed' };
+    }
+    // honest: the local close is committed, the remote creation is pending.
+    ctx.emit?.({ type: 'task_handoff', taskId: id, from: task.pod_role, to, newTaskId: handoffId, crossProfile: true, status: 'pending', error: res.error });
+    return {
+      closed: store.getTask(ctx.store, id),
+      next: { id: handoffId, pod: `${addr.profile}/${addr.role}` },
+      status: 'pending',
+      error: res.error,
+      note: 'remote creation pending — the fleet tick retries (60s); `flock fleet ls` shows the queue',
+    };
+  }
+
   if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad target role: ${to}`);
   const targetPod = store.getPodByRole(ctx.store, to);
   if (!targetPod) throw new OpError(404, `no pod: ${to} (spawn it first)`);
@@ -1123,14 +1272,52 @@ async function taskHandoff(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
 // record (survives restarts); the pane poke is a best-effort wake-up through
 // the same verified transport as pod_send (a dead target keeps the message
 // in its inbox — it is never lost).
+//
+// C15: cross-profile addressing <profile>/<role> — the message goes over
+// HTTP to the remote core (which does the ordinary local path: inbox row +
+// poke). Locally we keep ONLY the outbox row (the delivery ledger):
+// pending=1 until the remote acks; the fleet tick retries while pending.
 async function messageSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const to = String(op.to ?? '').trim();
   const text = String(op.text ?? '').trim();
-  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad target role: ${to}`);
   if (!text) throw new OpError(400, 'text required');
+  const from = ctx.caller?.kind === 'pod' ? ctx.caller.role : (op.from !== undefined ? String(op.from) : 'operator');
+
+  // C15: cross-profile (the core-to-core fleet call passes `from` so the
+  // remote inbox row shows the true sender)
+  let addr: fleet.Address;
+  try {
+    addr = fleet.parseAddress(to);
+  } catch (e) {
+    throw new OpError(400, e instanceof Error ? e.message : String(e));
+  }
+  if (addr.profile) {
+    if (addr.profile === 'local') throw new OpError(400, 'use the bare role for the local profile');
+    if (ctx.caller?.kind === 'pod') {
+      // pod tokens address only their own profile (no fleet from pods)
+      throw new OpError(403, `pod tokens cannot address other profiles: ${to}`);
+    }
+    const outboxId = store.insertOutboxMessage(ctx.store, { from, to, text, pending: 1 });
+    const res = await fleet.remoteApply(ctx.store.home, addr.profile, {
+      type: 'message_send',
+      to: addr.role,
+      from,
+      text,
+    });
+    if (res.ok) {
+      store.markOutboxForwarded(ctx.store, outboxId);
+      ctx.emit?.({ type: 'fleet_message_delivered', outboxId, to, attempts: 1 });
+      return { ok: true, outboxId, to, delivered: true, remote: res.result };
+    }
+    // durable: the row stays pending; the fleet tick (60s) retries. The
+    // operator gets an honest answer, not a fake success.
+    ctx.emit?.({ type: 'fleet_message_pending', outboxId, to, error: res.error });
+    return { ok: true, outboxId, to, delivered: false, pending: true, error: res.error, note: 'will be retried by the fleet tick (60s)' };
+  }
+
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(to)) throw new OpError(400, `bad target role: ${to}`);
   const targetPod = store.getPodByRole(ctx.store, to);
   if (!targetPod) throw new OpError(404, `no pod: ${to} (spawn it first)`);
-  const from = ctx.caller?.kind === 'pod' ? ctx.caller.role : 'operator';
   // pod token: can only address other pods (own inbox is pointless)
   if (ctx.caller?.kind === 'pod' && to === ctx.caller.role) {
     throw new OpError(400, `cannot message your own pod: ${to} (read your inbox with message_list)`);

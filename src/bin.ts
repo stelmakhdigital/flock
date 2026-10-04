@@ -285,6 +285,33 @@ async function main(): Promise<void> {
       return;
     }
 
+    // C15: fleet — cross-profile coordination (profiles = other cores)
+    case 'fleet': {
+      if (sub === 'add') {
+        const name = rest[0];
+        const url = rest[1];
+        const ti = rest.indexOf('--token');
+        const token = ti >= 0 ? rest[ti + 1] : undefined;
+        if (!name || !url) {
+          console.error('usage: flock fleet add <name> <url> [--token <operator-token>]');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'fleet_add', name, url, token }));
+      } else if (sub === 'ls') {
+        print(await api('POST', '/api/ops', { type: 'fleet_ls' }));
+      } else if (sub === 'rm') {
+        const name = rest[0];
+        if (!name) {
+          console.error('usage: flock fleet rm <name>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'fleet_rm', name }));
+      } else {
+        console.log('usage: flock fleet add <name> <url> [--token] | ls | rm <name>');
+      }
+      return;
+    }
+
     // C12: content layer — packs / workspace / plugins (read-only surface)
     case 'pack': {
       if (sub === 'ls') {

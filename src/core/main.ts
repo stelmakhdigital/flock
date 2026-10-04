@@ -12,6 +12,7 @@ import { notifyPm } from './pm.js';
 import { runRetentionSweep } from './retention.js';
 import { writePodAgentsMd, adapterForPod } from './ops.js';
 import { runEscalationTick } from './escalation.js';
+import { runFleetTick } from './fleet-tick.js';
 import type { RunLike } from './runtime-adapter.js';
 import type { CoreCtx } from './ops.js';
 
@@ -128,6 +129,14 @@ ticks.register('retention', 24 * 3600_000, () => {
 ticks.register('escalation', 30_000, () => {
   runEscalationTick(ctx).catch((e) => {
     console.warn('[core] escalation tick failed:', e instanceof Error ? e.message : e);
+  });
+});
+// fleet (C15, 60s): retry pending cross-profile work — two-phase handoffs
+// (phase 2: remote successor creation) and cross-profile outbox messages.
+// Watchdog semantics: the tick only repeats, never decides new work.
+ticks.register('fleet', 60_000, () => {
+  runFleetTick(ctx).catch((e) => {
+    console.warn('[core] fleet tick failed:', e instanceof Error ? e.message : e);
   });
 });
 // watchdog: declarative checks registered by agents/CLI (1s tick)

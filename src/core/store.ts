@@ -371,6 +371,30 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE INDEX IF NOT EXISTS events_at_idx ON events(at);
 `,
   },
+  {
+    // C15: fleet — cross-profile coordination. outbound_handoffs: the
+    // two-phase cross-core task handoff (local close is COMMITTED only
+    // after the remote creates the successor; pending rows are retried by
+    // the fleet tick until N attempts -> attention_required). Outbox
+    // messages gain attempts (retry budget for cross-profile delivery).
+    name: '020_fleet',
+    sql: `CREATE TABLE IF NOT EXISTS outbound_handoffs(
+  id TEXT PRIMARY KEY,
+  at TEXT NOT NULL,
+  from_role TEXT NOT NULL,
+  to_profile TEXT NOT NULL,
+  to_role TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT,
+  priority INTEGER NOT NULL DEFAULT 50,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS outbound_handoffs_pending_idx ON outbound_handoffs(status, id);
+ALTER TABLE outboxes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -854,6 +878,7 @@ export interface OutboxMessage {
   to: string;
   text: string;
   pending: number;
+  attempts: number;
 }
 
 export function insertInboxMessage(
@@ -872,6 +897,16 @@ export function insertInboxMessage(
     db.exec('ROLLBACK');
     throw e;
   }
+}
+
+// C15: sender-side record only (cross-profile: the message's inbox row is
+// created on the REMOTE core — locally we keep only the outbox row, the
+// delivery ledger the fleet tick retries while pending=1).
+export function insertOutboxMessage(store: Store, m: { from: string; to: string; text: string; pending?: number }): number {
+  const r = dbOf(store)
+    .prepare('INSERT INTO outboxes(at, from_, "to", text, pending) VALUES (?, ?, ?, ?, ?)')
+    .run(nowIso(), m.from, m.to, m.text, m.pending ? 1 : 0);
+  return Number(r.lastInsertRowid);
 }
 
 export function listInboxMessages(store: Store, to: string, unclaimedOnly = false, limit = 50): InboxMessage[] {
@@ -894,12 +929,101 @@ export function getInboxMessage(store: Store, id: number): InboxMessage | null {
 
 export function listPendingOutboxMessages(store: Store, limit = 100): OutboxMessage[] {
   return dbOf(store)
-    .prepare('SELECT id, at, from_ AS from_, "to" AS to, text, pending FROM outboxes WHERE pending = 1 ORDER BY id ASC LIMIT ?')
+    .prepare('SELECT id, at, from_ AS from_, "to" AS "to", text, pending, attempts FROM outboxes WHERE pending = 1 ORDER BY id ASC LIMIT ?')
     .all(limit) as unknown as OutboxMessage[];
 }
 
 export function markOutboxForwarded(store: Store, id: number): void {
   dbOf(store).prepare('UPDATE outboxes SET pending = 0 WHERE id = ?').run(id);
+}
+
+export function bumpOutboxAttempt(store: Store, id: number, lastError: string): void {
+  dbOf(store)
+    .prepare('UPDATE outboxes SET attempts = attempts + 1, text = ? || ? WHERE id = ?')
+    .run(id, `\n[delivery error @${nowIso()}: ${lastError.slice(0, 160)}]`, id);
+}
+
+// ---------- fleet: two-phase cross-profile task handoff (C15) ----------
+//
+// ponytail: an atomic cross-DB handoff is impossible under the single-
+// writer invariant (two cores = two writers = two DBs). The ceiling here
+// is an EVENTUAL handoff with an explicit pending state; true atomicity
+// would mean a shared store — a different architecture, not now.
+//
+// Phase 1 (local, committed immediately): the task closes as
+// 'handed-off (outbound, pending)' and the outbound_handoffs row is
+// written in one transaction. The remote has NOT been contacted yet.
+// Phase 2 (remote): HTTP apply() creates the successor task at the target
+// profile. Success -> local commit: status 'committed' (the handoff is
+// confirmed). Failure -> stays 'pending'; the fleet tick retries (60s,
+// N attempts) until it is attention_required + escalated.
+
+export interface OutboundHandoff {
+  id: string;
+  at: string;
+  from_role: string;
+  to_profile: string;
+  to_role: string;
+  title: string;
+  body: string | null;
+  priority: number;
+  attempts: number;
+  last_error: string | null;
+  status: 'pending' | 'committed' | 'attention_required';
+}
+
+export function insertOutboundHandoff(
+  store: Store,
+  taskId: string,
+  h: {
+    id: string;
+    from_role: string;
+    to_profile: string;
+    to_role: string;
+    title: string;
+    body: string | null;
+    priority: number;
+    reason: string;
+    closedJson: string;
+  },
+): void {
+  const db = dbOf(store);
+  db.exec('BEGIN');
+  try {
+    db.prepare('UPDATE tasks SET status = ?, closed = ?, finished_at = ? WHERE id = ?')
+      .run('done', h.closedJson, nowIso(), taskId);
+    db.prepare('INSERT INTO task_transitions(task_id, from_status, to_status, reason, closed, ts) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(taskId, 'done', 'done', h.reason, h.closedJson, nowIso());
+    db.prepare('INSERT INTO outbound_handoffs(id, at, from_role, to_profile, to_role, title, body, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(h.id, nowIso(), h.from_role, h.to_profile, h.to_role, h.title, h.body, h.priority);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
+
+export function listPendingOutboundHandoffs(store: Store, limit = 100): OutboundHandoff[] {
+  return dbOf(store)
+    .prepare('SELECT * FROM outbound_handoffs WHERE status = ? ORDER BY id ASC LIMIT ?')
+    .all('pending', limit) as unknown as OutboundHandoff[];
+}
+
+export function getOutboundHandoff(store: Store, id: string): OutboundHandoff | null {
+  const r = dbOf(store).prepare('SELECT * FROM outbound_handoffs WHERE id = ?').get(id) as OutboundHandoff | undefined;
+  return r ?? null;
+}
+
+export function commitOutboundHandoff(store: Store, id: string, remoteTaskId: string): void {
+  dbOf(store)
+    .prepare("UPDATE outbound_handoffs SET status = 'committed', last_error = ? WHERE id = ? AND status = 'pending'")
+    .run(remoteTaskId, id);
+}
+
+export function failOutboundHandoffAttempt(store: Store, id: string, lastError: string, attention: boolean): void {
+  dbOf(store)
+    .prepare("UPDATE outbound_handoffs SET attempts = attempts + 1, last_error = ?, status = ? WHERE id = ?")
+    .run(lastError.slice(0, 300), attention ? 'attention_required' : 'pending', id);
 }
 
 // ---------- workflows (multi-step pipelines over the task queue) ----------
