@@ -27,8 +27,7 @@ const USAGE = `flock — core CLI
   flock core up | down | restart | status
   flock healthz
   flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--posture floor|full_bypass] [--cmd c]
-      [--repo <git-path>] [--base <branch>] [--merge ff|squash|never]   # worktree-под: свой checkout + ветка flock/<role>
-      --merge: политика M-merge'а при task done (S1): ff (default) | squash (1 коммит flock(<task>): на base) | never (всегда вручную)
+      plain-dir: под получает рабочую директорию; git за агентами (core git не видит)
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
       pi-под: runner-мост (RPC), своя изоляция конфига, сессия = role (память при relaunch)
   flock pod relaunch <role> [--model M] [--fork [role]] [--profile P]   # --fork (без аргумента) = форк своей сессии
@@ -38,8 +37,7 @@ const USAGE = `flock — core CLI
   flock pod send <role> <text...>
   flock pod answer <role> <n|текст>   # ответ оператором на dialog (gate) в pi-поде
   flock pod capture <role> [--lines N]
-  flock pod merge-status <role>               # worktree: ahead/behind/dirty к base
-  flock pod close <role> [--purge]            # --purge: удалить worktree (ветка остаётся)
+  flock pod close <role>
   flock team up [pods.yaml]              # team-реконсиляция: spawn недостающих, refresh живых
   flock usage [role]                     # токены по подам (экономия pipeline)
   flock pm up                          # поднять pm-под (goal loop)
@@ -71,7 +69,7 @@ const USAGE = `flock — core CLI
   flock workflow define <name> --steps "id1:role1,id2:role2"
   flock workflow rm <name>
   flock workflow define <name> --steps-json '[{"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2}]'
-  flock workflow start <name> [--priority N] [--require-test|--no-require-test] [payload...]
+  flock workflow start <name> [--priority N] [payload...]
   flock workflow ls
   flock workflow status <instance_id>
   flock task add <role> "title" [--body ...] [--priority N]
@@ -192,9 +190,6 @@ async function main(): Promise<void> {
           fork: flag(flags, '--fork'),
           posture: flag(flags, '--posture'),
           profile: flag(flags, '--profile'),
-          repo: flag(flags, '--repo'),
-          base: flag(flags, '--base'),
-          merge: flag(flags, '--merge'),
         }));
       } else if (action === 'relaunch') {
         const flags = rest.slice(1);
@@ -214,9 +209,7 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'pod_capture', role, lines: numFlag(flags, '--lines', 200) }));
       } else if (action === 'close') {
         const flags = rest.slice(1);
-        print(await api('POST', '/api/ops', { type: 'pod_close', role, purge: flags.includes('--purge') }));
-      } else if (action === 'merge-status') {
-        print(await api('POST', '/api/ops', { type: 'pod_merge_status', role }));
+        print(await api('POST', '/api/ops', { type: 'pod_close', role }));
       } else {
         console.log(USAGE);
       }
@@ -228,15 +221,6 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'team_up', file: rest[0] }));
       } else {
         console.log(USAGE);
-      }
-      return;
-    }
-
-    case 'resolver': {
-      if (sub === 'ls') {
-        print(await api('POST', '/api/ops', { type: 'resolver_ls' }));
-      } else {
-        console.log('usage: flock resolver ls');
       }
       return;
     }
@@ -510,7 +494,6 @@ async function main(): Promise<void> {
           type: 'workflow_define',
           name,
           steps,
-          requireTest: args.includes('--require-test'),
         }));
       } else if (action === 'start') {
         const priority = flag(args, '--priority');
@@ -520,7 +503,6 @@ async function main(): Promise<void> {
             type: 'workflow_start',
             name: args[0],
             priority: priority != null ? Number(priority) : undefined,
-            requireTest: args.includes('--require-test') ? true : args.includes('--no-require-test') ? false : undefined,
             payload: payloadArgs.join(' ') || undefined,
           }),
         );

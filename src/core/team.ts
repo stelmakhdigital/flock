@@ -6,8 +6,6 @@
 //       agent: pi            # agent id (builtin or ~/.flock/agents/<id>.json)
 //       model: cat-vllm/...
 //       profile: quiet       # manifest profile
-//       repo: /path/to/repo  # worktree pod (--repo)
-//       base: main           # worktree base branch
 //       posture: floor       # launch posture (pi)
 //       guidance: |          # extra AGENTS.md block (managed, id `team:<role>`)
 //         line one
@@ -21,10 +19,7 @@ export interface TeamPodSpec {
   agent?: string;
   model?: string;
   profile?: string;
-  repo?: string;
-  base?: string;
   posture?: 'floor' | 'full_bypass';
-  merge?: 'ff' | 'squash' | 'never'; // 5.4b S1: worktree merge policy
   guidance?: string;
 }
 
@@ -100,10 +95,9 @@ export function parseTeamYaml(src: string): TeamSpec {
         continue;
       }
       if (value === '') err(`empty value for ${role}.${key} (use a block '|' for multi-line)`);
-      const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'repo', 'base', 'posture', 'merge'];
+      const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'posture'];
       if (!allowed.includes(key as keyof TeamPodSpec)) err(`unknown field ${role}.${key} (allowed: ${allowed.join(', ')}, guidance)`);
       if (key === 'posture' && value !== 'floor' && value !== 'full_bypass') err(`${role}.posture: want floor|full_bypass`);
-      if (key === 'merge' && !['ff', 'squash', 'never'].includes(value)) err(`${role}.merge: want ff|squash|never`);
       (pod as Record<string, unknown>)[key] = value;
       continue;
     }
@@ -138,11 +132,10 @@ export function parseTeamYaml(src: string): TeamSpec {
           guidanceLines = [];
         } else pod.guidance = value;
       } else {
-        const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'repo', 'base', 'posture', 'merge'];
+        const allowed: (keyof TeamPodSpec)[] = ['agent', 'model', 'profile', 'posture'];
         if (!allowed.includes(key as keyof TeamPodSpec)) err(`unknown field ${role}.${key}`);
         if (value === '') err(`empty value for ${role}.${key}`);
         if (key === 'posture' && value !== 'floor' && value !== 'full_bypass') err(`${role}.posture: want floor|full_bypass`);
-        if (key === 'merge' && !['ff', 'squash', 'never'].includes(value)) err(`${role}.merge: want ff|squash|never`);
         (pod as Record<string, unknown>)[key] = value;
       }
     }

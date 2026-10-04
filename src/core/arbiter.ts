@@ -1,7 +1,6 @@
 import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
-import * as gitops from './gitops.js';
 import { frameMessage, newNonce } from "./runner-protocol.js";
 import { advanceWorkflow, checkWorkflowTimeouts, podRelaunch, type CoreCtx } from './ops.js';
 import { pmNotify } from './pm.js';
@@ -63,23 +62,6 @@ export async function runArbiterTick(ctx: CoreCtx): Promise<void> {
   for (const task of store.listTasks(ctx.store, 'active')) {
     const pod = byRole.get(task.pod_role);
     if (!pod || pod.state !== 'live' || !pod.terminal_target) {
-      // worktree pod: a closed pod must NOT burn its merge candidate —
-      // re-queue the task, the wake step relaunches the pod and the agent
-      // re-reports (honest retry, not a lost branch)
-      if (pod?.repo && pod.state === 'closed') {
-        try {
-          const st = pod.branch && pod.repo_base && pod.dir
-            ? await gitops.worktreeStatus(pod.repo, pod.dir, pod.branch, pod.repo_base)
-            : null;
-          if (st && st.ahead > 0) {
-            store.setTaskStatus(ctx.store, task.id, 'queued', { reason: `pod closed, ${st.ahead} commit(s) unmerged — re-queue (wake will resume)` });
-            ctx.emit?.({ type: 'task_requeued', taskId: task.id, pod: task.pod_role, reason: 'pod closed, unmerged commits' });
-            continue;
-          }
-        } catch {
-          // fall through to blocked on git errors
-        }
-      }
       try {
         store.setTaskStatus(ctx.store, task.id, 'blocked', { reason: 'pod lost (not live)', result: 'pod lost (not live)' });
         ctx.emit?.({ type: 'task_blocked', taskId: task.id, pod: task.pod_role, reason: 'pod lost' });

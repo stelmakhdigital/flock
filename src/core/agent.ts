@@ -60,14 +60,6 @@ export interface AgentManifest {
   imports?: string[];
   // v3.3: named override sets; picked with --profile at spawn/relaunch.
   profiles?: Record<string, Partial<AgentManifest>>;
-  // 5.4b S1: worktree merge policy for this agent's pods (default 'ff' =
-  // S0 behavior). squash = one flock(<task>): commit on base; never = the
-  // branch stays a manual merge candidate.
-  merge?: 'ff' | 'squash' | 'never';
-  // 5.4b S2: quality gate command, run in the worktree before merge when
-  // the workflow requires the gate (requireTest). Green -> merge, red ->
-  // the task is blocked (tests failed).
-  testCmd?: string;
   // pi-specific first-class axes (mapped to pi CLI flags by the pi
   // adapter/runner; ignored by other runtimes — ponytail: claude/codex may
   // map some later, e.g. thinking -> --effort).

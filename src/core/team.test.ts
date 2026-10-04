@@ -16,10 +16,7 @@ pods:
   rev:
     agent: claude
     profile: loud
-    repo: /home/x/repo
-    base: main
     posture: full_bypass
-    merge: squash
     guidance: one-liner guidance
   bashpod:
     agent: bash
@@ -30,10 +27,7 @@ pods:
   assert.strictEqual(spec.pods.dev.guidance, 'Будь краток.\nКоммить свою работу.');
   assert.strictEqual(spec.pods.rev.agent, 'claude');
   assert.strictEqual(spec.pods.rev.profile, 'loud');
-  assert.strictEqual(spec.pods.rev.repo, '/home/x/repo');
-  assert.strictEqual(spec.pods.rev.base, 'main');
   assert.strictEqual(spec.pods.rev.posture, 'full_bypass');
-  assert.strictEqual(spec.pods.rev.merge, 'squash');
   assert.strictEqual(spec.pods.rev.guidance, 'one-liner guidance');
   assert.deepStrictEqual(spec.pods.bashpod, { agent: 'bash' });
 }
@@ -60,7 +54,6 @@ expectFail('pods:\n  Dev:\n    agent: pi\n', /bad pod role/);
 expectFail('pods:\n  dev:\n    agent\n', /bad field/);
 expectFail('pods:\n  dev:\n    unknown_key: x\n', /unknown field/);
 expectFail('pods:\n  dev:\n    posture: high\n', /posture/);
-expectFail('pods:\n  dev:\n    merge: rebase\n', /merge/);
 expectFail('pods:\n  dev:\n    model:\n', /empty value/);
 expectFail('pods:\n', /no pods declared/);
 expectFail('pods:\n  dev\n', /role line must end/);

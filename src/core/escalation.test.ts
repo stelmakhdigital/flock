@@ -1,7 +1,7 @@
 // 5.4c durable escalation ladder — hermetic: the trigger that was
 // fire-and-forget is now a BDD row that survives a pm-less core, walks
 // open -> escalated -> operator alert, auto-resolves when healed, and is
-// acknowledged by the operator. Plus: worktree GC keeps UNMERGED branches.
+// acknowledged by the operator.
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
@@ -10,12 +10,6 @@ import os from 'node:os';
 import * as store from './store.js';
 import { openEscalation, runEscalationTick, escOptsFromEnv } from './escalation.js';
 import { runRetentionSweep } from './retention.js';
-import { worktreeAttach } from './gitops.js';
-import { execFile as execFileCb } from 'node:child_process';
-import { promisify } from 'node:util';
-const execFile = promisify(execFileCb);
-const git = (dir: string, ...args: string[]) =>
-  execFile('git', ['-C', dir, ...args], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } }).then((r) => (r.stdout as string).trim());
 import type { CoreCtx } from './ops.js';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-esc-'));
@@ -94,46 +88,4 @@ assert.strictEqual(store.getEscalation(storeDb, r6.id)!.state, 'escalated', 'pm 
 
 storeDb.db.close();
 fs.rmSync(home, { recursive: true, force: true });
-
-// ---- worktree GC: unmerged branches are KEPT, merged worktrees cleaned ----
-const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-gc-'));
-const repo = path.join(home2, 'repo');
-fs.mkdirSync(repo, { recursive: true });
-await git(repo, 'init', '-q', '-b', 'main');
-await git(repo, 'config', 'user.email', 't@t');
-await git(repo, 'config', 'user.name', 't');
-fs.writeFileSync(path.join(repo, 'base.txt'), 'base');
-await git(repo, 'add', '.');
-await git(repo, 'commit', '-q', '-m', 'base');
-const storeDb2 = store.openStore(home2);
-const ctx2 = { store: storeDb2, ticks: { register: () => {} }, startedAt: store.nowIso() } as unknown as CoreCtx;
-// pod A: closed, UNMERGED commit on its branch -> branch must be KEPT
-store.openPod(storeDb2, { id: 'p_gca', role: 'gca', dir: path.join(home2, 'pods', 'gca'), terminalTarget: 'none', model: null, agent: 'bash', mergePolicy: 'squash' });
-store.setPodState(storeDb2, 'gca', 'closed');
-store.setPodRepo(storeDb2, 'gca', repo, 'main', `flock/gca`);
-await worktreeAttach(repo, path.join(home2, 'pods', 'gca', 'work'), 'flock/gca', 'main');
-fs.writeFileSync(path.join(home2, 'pods', 'gca', 'work', 'work.txt'), 'unmerged work');
-await git(path.join(home2, 'pods', 'gca', 'work'), 'add', '.');
-await git(path.join(home2, 'pods', 'gca', 'work'), 'commit', '-q', '-m', 'unmerged');
-// pod B: closed, MERGED (ahead=0) -> branch deleted, worktree gone
-store.openPod(storeDb2, { id: 'p_gcb', role: 'gcb', dir: path.join(home2, 'pods', 'gcb'), terminalTarget: 'none', model: null, agent: 'bash', mergePolicy: 'squash' });
-store.setPodState(storeDb2, 'gcb', 'closed');
-store.setPodRepo(storeDb2, 'gcb', repo, 'main', `flock/gcb`);
-await worktreeAttach(repo, path.join(home2, 'pods', 'gcb', 'work'), 'flock/gcb', 'main');
-
-const report = await runRetentionSweep({ store: storeDb2, home: home2 });
-assert.ok(report.gcWorktrees.includes('gcb'), 'closed-pod worktree removed (re-spawn re-attaches)');
-assert.ok(!fs.existsSync(path.join(home2, 'pods', 'gcb', 'work')), 'worktree gone from disk');
-assert.ok(!fs.existsSync(path.join(home2, 'pods', 'gca', 'work')), 'unmerged pod worktree also removed (branch keeps the work)');
-assert.ok(report.gcBranches.some((b) => b.includes('gcb')), 'merged branch (ahead=0) deleted');
-assert.ok(report.gcKept.some((k) => k.includes('gca') && k.includes('ahead=1')), 'UNMERGED branch kept with reason');
-// the work is intact on the kept branch
-const showOut = await git(repo, 'show', 'flock/gca:work.txt');
-assert.match(showOut, /unmerged work/);
-// re-spawn re-attaches idempotently (the design promise)
-await worktreeAttach(repo, path.join(home2, 'pods', 'gca', 'work'), 'flock/gca', 'main');
-assert.ok(fs.existsSync(path.join(home2, 'pods', 'gca', 'work', 'work.txt')), 're-attach restores the checkout');
-
-storeDb2.db.close();
-fs.rmSync(home2, { recursive: true, force: true });
-console.log('escalation+gc.test.ts: passed');
+console.log('escalation.test.ts: passed');

@@ -7,7 +7,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
 import { seatPaths } from './runner-protocol.js';
-import { gitRaw, worktreeRemove } from './gitops.js';
 
 const env = (k: string, dflt: number): number => {
   const v = Number(process.env[k]);
@@ -32,10 +31,6 @@ export interface RetentionReport {
   archivedRuns: number;
   trimmedActivity: string[]; // roles
   coreLogRotated: boolean;
-  // worktree GC (5.4c): closed pods' worktrees + dead branches
-  gcWorktrees: string[]; // roles whose worktree was removed
-  gcBranches: string[]; // branches deleted (merged, ahead=0)
-  gcKept: string[]; // closed-pod branches kept (UNMERGED work — merge candidates)
 }
 
 export async function runRetentionSweep(ctx: { store: store.Store; home: string }): Promise<RetentionReport> {
@@ -86,66 +81,6 @@ export async function runRetentionSweep(ctx: { store: store.Store; home: string 
     /* no log yet */
   }
 
-  return {
-    archivedRuns, trimmedActivity, coreLogRotated,
-    ...(await gcWorktreesAndBranches(ctx)),
-  };
+  return { archivedRuns, trimmedActivity, coreLogRotated };
 }
 
-// ---- worktree GC (5.4c) --------------------------------------------------------
-// Closed worktree pods leak checkouts and branches: `pod close --purge` is
-// explicit, but auto-GC belongs here. Rules (work is never lost):
-//  - worktree on disk of a CLOSED pod -> worktreeRemove (the branch keeps
-//    the commits; re-spawn re-attaches the checkout idempotently)
-//  - closed-pod branch with ahead=0 (fully merged) -> branch deleted
-//  - closed-pod branch with ahead>0 (UNMERGED) -> KEPT: it is a merge
-//    candidate (the arbiter re-queue path depends on it)
-//  - git worktree prune on every known repo (stale git metadata)
-async function gcWorktreesAndBranches(ctx: { store: store.Store; home: string }): Promise<{
-  gcWorktrees: string[];
-  gcBranches: string[];
-  gcKept: string[];
-}> {
-  const gcWorktrees: string[] = [];
-  const gcBranches: string[] = [];
-  const gcKept: string[] = [];
-  const repos = new Set<string>();
-  for (const pod of store.listPods(ctx.store)) {
-    if (!pod.repo || !pod.branch) continue;
-    repos.add(pod.repo);
-    if (pod.state !== 'closed') continue; // live pods are never touched
-    // 1) the checkout
-    const wtPath = path.join(ctx.home, 'pods', pod.role, 'work');
-    if (fs.existsSync(wtPath)) {
-      try {
-        await worktreeRemove(pod.repo, wtPath);
-        gcWorktrees.push(pod.role);
-      } catch (e) {
-        console.warn(`[retention] worktree remove failed ${pod.role}:`, e instanceof Error ? e.message : e);
-      }
-    }
-    // 2) the branch: delete only when fully merged (ahead=0)
-    const baseRef = pod.repo_base ?? 'main';
-    try {
-      const r = await gitRaw(pod.repo, 'rev-list', '--left-right', '--count', `${baseRef}...${pod.branch}`);
-      if (r.code !== 0) continue; // branch already gone
-      const ahead = Number(r.stdout.trim().split('\t')[1] ?? 0);
-      if (ahead === 0) {
-        const del = await gitRaw(pod.repo, 'branch', '-D', pod.branch);
-        if (del.code === 0) gcBranches.push(`${pod.role} (${pod.branch})`);
-        else gcKept.push(`${pod.role} (${pod.branch} kept: delete failed: ${del.stderr.slice(0, 60)})`);
-      } else {
-        gcKept.push(`${pod.role} (${pod.branch}, ahead=${ahead} — unmerged candidate)`);
-      }
-    } catch (e) {
-      console.warn(`[retention] branch gc failed ${pod.role}:`, e instanceof Error ? e.message : e);
-    }
-  }
-  // 3) stale git metadata
-  for (const repo of repos) {
-    try {
-      await gitRaw(repo, 'worktree', 'prune');
-    } catch { /* repo gone */ }
-  }
-  return { gcWorktrees, gcBranches, gcKept };
-}

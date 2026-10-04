@@ -10,7 +10,6 @@ import { resolveAgent, manifestRuntime } from './agent.js';
 import { getAdapter, type AdapterEnv } from './runtime-adapter.js';
 import { apply, listOps, OpError, type CoreCtx } from './ops.js';
 import { listAlerts, healthOptsFromEnv } from './health.js';
-import { mergeQueueSize } from './merge-queue.js';
 import { pmDigest } from './pm.js';
 
 const safeJson = (s: string): unknown => {
@@ -114,7 +113,7 @@ export function createHttp(ctx: CoreCtx) {
   app.get('/api/health', (c) => {
     const alerts = listAlerts(ctx);
     const escs = store.listEscalations(ctx.store, true);
-    return c.json({ alerts, opts: healthOptsFromEnv(), mergeQueue: mergeQueueSize(), activeEscalations: escs.map((e) => ({ id: e.id, key: e.key, state: e.state, kind: e.kind, subject: e.subject, created_at: e.created_at })) });
+    return c.json({ alerts, opts: healthOptsFromEnv(), activeEscalations: escs.map((e) => ({ id: e.id, key: e.key, state: e.state, kind: e.kind, subject: e.subject, created_at: e.created_at })) });
   });
 
   app.get('/api/ops', (c) => {

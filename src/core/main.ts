@@ -11,7 +11,7 @@ import { runHealthTick } from './health.js';
 import { pmTick, pmNotify } from './pm.js';
 import { ingestUsage } from './usage.js';
 import { runRetentionSweep } from './retention.js';
-import { writePodAgentsMd, tickConflictResolvers, adapterForPod } from './ops.js';
+import { writePodAgentsMd, adapterForPod } from './ops.js';
 import { runEscalationTick } from './escalation.js';
 import { startCodexShim } from './codex-shim.js';
 import { codexShimPort } from './codex-protocol.js';
@@ -129,22 +129,13 @@ ticks.register('usage', 60_000, () => {
 // retention (24h): archive old runs, head-trim activity logs, rotate core.log
 ticks.register('retention', 24 * 3600_000, () => {
   runRetentionSweep({ store, home: FLOCK_HOME }).then((r) => {
-    if (r.archivedRuns || r.trimmedActivity.length || r.coreLogRotated || r.gcWorktrees.length || r.gcBranches.length) {
-      console.log(`[core] retention: runs=${r.archivedRuns} activity=${r.trimmedActivity.join(',') || '-'} log=${r.coreLogRotated ? 'rotated' : '-'} gc-wt=${r.gcWorktrees.join(',') || '-'} gc-br=${r.gcBranches.join(',') || '-'} gc-kept=${r.gcKept.join('; ') || '-'}`);
+    if (r.archivedRuns || r.trimmedActivity.length || r.coreLogRotated) {
+      console.log(`[core] retention: runs=${r.archivedRuns} activity=${r.trimmedActivity.join(',') || '-'} log=${r.coreLogRotated ? 'rotated' : '-'}`);
     }
   }).catch((e) => {
     console.warn('[core] retention tick failed:', e instanceof Error ? e.message : e);
   });
 });
-// S5 conflict resolver (30s): advance running resolution chains — apply the
-// resolved fork to the origin branch, re-run the merge gate, retry/exhaust
-if (process.env.FLOCK_RESOLVER_AGENT) {
-  ticks.register('resolver', 30_000, () => {
-    tickConflictResolvers(ctx).catch((e) => {
-      console.warn('[core] resolver tick failed:', e instanceof Error ? e.message : e);
-    });
-  });
-}
 // 5.4c durable escalation ladder (30s): walk open -> pm_notified -> escalated,
 // auto-resolve when the condition heals. Always on: durability is the point.
 ticks.register('escalation', 30_000, () => {

@@ -15,10 +15,6 @@ export interface Pod {
   state: string; // live | idle | closed
   resume_token: string | null; // pinned session file (honest resume override)
   profile: string | null; // manifest profile applied at spawn (survives relaunch)
-  repo: string | null; // base git repo for a worktree pod
-  repo_base: string | null; // base branch the worktree branch ff-merges into
-  branch: string | null; // worktree branch (flock/<role>)
-  merge_policy: string | null; // 5.4b S1: ff (default) | squash | never
   created_at: string;
 }
 
@@ -300,6 +296,19 @@ CREATE INDEX IF NOT EXISTS idx_esc_key_state ON escalations(key, state);
     name: '014_wf_step_state',
     sql: `ALTER TABLE wf_step_state ADD COLUMN state TEXT NOT NULL DEFAULT 'pending';`,
   },
+  {
+    // C1: git is owned by the agents — core drops worktree/merge machinery.
+    // DROP COLUMN needs sqlite >= 3.35 (node:sqlite ships 3.46).
+    name: '015_git_drop',
+    sql: `
+DROP TABLE IF EXISTS conflict_resolutions;
+ALTER TABLE pods DROP COLUMN repo;
+ALTER TABLE pods DROP COLUMN repo_base;
+ALTER TABLE pods DROP COLUMN branch;
+ALTER TABLE pods DROP COLUMN merge_policy;
+ALTER TABLE workflow_instances DROP COLUMN require_test;
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -345,20 +354,18 @@ function dbOf(store: Store): DatabaseSync {
 
 export function openPod(
   store: Store,
-  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null; repo?: string | null; repoBase?: string | null; branch?: string | null; mergePolicy?: string | null },
+  p: { id: string; role: string; dir: string; terminalTarget: string; model: string | null; agent?: string | null; profile?: string | null },
 ): void {
   dbOf(store)
     .prepare(
-      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile, repo, repo_base, branch, merge_policy)
-       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO pods(id, role, dir, terminal_target, model, state, created_at, agent, profile)
+       VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?)
        ON CONFLICT(role) DO UPDATE SET
          dir = excluded.dir,
          terminal_target = excluded.terminal_target, model = excluded.model,
-         agent = excluded.agent, profile = excluded.profile, state = 'live',
-         repo = excluded.repo, repo_base = excluded.repo_base, branch = excluded.branch,
-         merge_policy = excluded.merge_policy`,
+         agent = excluded.agent, profile = excluded.profile, state = 'live'`,
     )
-    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null, p.repo ?? null, p.repoBase ?? null, p.branch ?? null, p.mergePolicy ?? null);
+    .run(p.id, p.role, p.dir, p.terminalTarget, p.model, nowIso(), p.agent ?? null, p.profile ?? null);
 }
 
 export function getPodByRole(store: Store, role: string): Pod | null {
@@ -376,12 +383,6 @@ export function setPodProfile(store: Store, role: string, profile: string | null
   dbOf(store)
     .prepare('UPDATE pods SET profile = ? WHERE role = ?')
     .run(profile, role);
-}
-
-export function setPodRepo(store: Store, role: string, repo: string | null, repoBase: string | null, branch: string | null): void {
-  dbOf(store)
-    .prepare('UPDATE pods SET repo = ?, repo_base = ?, branch = ? WHERE role = ?')
-    .run(repo, repoBase, branch, role);
 }
 
 export function listPods(store: Store): Pod[] {
@@ -661,7 +662,6 @@ export interface WorkflowInstance {
   created_at: string;
   finished_at: string | null;
   priority: number;
-  require_test: number; // 5.4b S2: quality gate (test) required before merge
 }
 
 export function insertWorkflow(store: Store, w: { id: string; name: string; spec: string }): void {
@@ -683,10 +683,10 @@ export function deleteWorkflow(store: Store, id: string): void {
   dbOf(store).prepare('DELETE FROM workflows WHERE id = ?').run(id);
 }
 
-export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null; priority?: number; requireTest?: boolean }): void {
+export function insertWorkflowInstance(store: Store, i: { id: string; workflowId: string; payload: string | null; priority?: number }): void {
   dbOf(store)
-    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at, priority, require_test) VALUES (?, ?, ?, 'running', ?, ?, ?)")
-    .run(i.id, i.workflowId, i.payload, nowIso(), i.priority ?? 0, i.requireTest ? 1 : 0);
+    .prepare("INSERT INTO workflow_instances(id, workflow_id, payload, state, created_at, priority) VALUES (?, ?, ?, 'running', ?, ?)")
+    .run(i.id, i.workflowId, i.payload, nowIso(), i.priority ?? 0);
 }
 
 export function getWorkflowInstance(store: Store, id: string): WorkflowInstance | null {
@@ -813,57 +813,6 @@ export function deleteUsageBefore(store: Store, ts: string): number {
 
 // retention: finished runs older than N days -> runs_archive (archive, not
 // delete: the meta carries launch/resume/usage history the operator audits)
-export interface ConflictResolution {
-  id: string;
-  origin_task_id: string;
-  origin_role: string;
-  resolver_role: string;
-  resolver_task_id: string | null;
-  attempts: number;
-  apply_attempts: number;
-  status: string; // running | resolved | failed | exhausted
-  created_at: string;
-  updated_at: string;
-}
-
-export function insertConflictResolution(
-  store: Store,
-  r: { id: string; originTaskId: string; originRole: string; resolverRole: string; resolverTaskId: string | null; attempts?: number },
-): void {
-  dbOf(store)
-    .prepare(
-      `INSERT INTO conflict_resolutions(id, origin_task_id, origin_role, resolver_role, resolver_task_id, attempts, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)`,
-    )
-    .run(r.id, r.originTaskId, r.originRole, r.resolverRole, r.resolverTaskId ?? null, r.attempts ?? 1, nowIso(), nowIso());
-}
-
-export function getConflictResolutionByTask(store: Store, originTaskId: string): ConflictResolution | null {
-  const r = dbOf(store).prepare('SELECT * FROM conflict_resolutions WHERE origin_task_id = ?').get(originTaskId) as ConflictResolution | undefined;
-  return r ?? null;
-}
-
-export function listConflictResolutions(store: Store, status?: string): ConflictResolution[] {
-  return status
-    ? (dbOf(store).prepare('SELECT * FROM conflict_resolutions WHERE status = ? ORDER BY created_at').all(status) as unknown as ConflictResolution[])
-    : (dbOf(store).prepare('SELECT * FROM conflict_resolutions ORDER BY created_at').all() as unknown as ConflictResolution[]);
-}
-
-export function setConflictResolution(
-  store: Store,
-  id: string,
-  patch: { status?: string; resolverTaskId?: string | null; attempts?: number; applyAttempts?: number },
-): void {
-  const sets: string[] = ['updated_at = ?'];
-  const vals: (string | number | null)[] = [nowIso()];
-  if (patch.status !== undefined) { sets.push('status = ?'); vals.push(patch.status); }
-  if (patch.resolverTaskId !== undefined) { sets.push('resolver_task_id = ?'); vals.push(patch.resolverTaskId); }
-  if (patch.attempts !== undefined) { sets.push('attempts = ?'); vals.push(patch.attempts); }
-  if (patch.applyAttempts !== undefined) { sets.push('apply_attempts = ?'); vals.push(patch.applyAttempts); }
-  vals.push(id);
-  dbOf(store).prepare(`UPDATE conflict_resolutions SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
-}
-
 export interface Escalation {
   id: string;
   key: string;
