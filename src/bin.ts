@@ -243,9 +243,44 @@ async function main(): Promise<void> {
 
     case 'team': {
       if (sub === 'up') {
-        print(await api('POST', '/api/ops', { type: 'team_up', file: rest[0] }));
+        // named team (no /) or a file path (legacy) — the op resolves both.
+        // --restore <snap|latest>: restore mode (resume from a snapshot,
+        // per-node honest outcomes); without it — plain reconcile.
+        const name = rest[0];
+        const ri = rest.indexOf('--restore');
+        const ref = ri >= 0 ? rest[ri + 1] : undefined;
+        if (!name) {
+          console.error('usage: flock team up <name|file> [--restore <snap|latest>]');
+          return;
+        }
+        if (ref) {
+          print(await api('POST', '/api/ops', { type: 'team_restore', name, restore: ref }));
+        } else {
+          print(await api('POST', '/api/ops', { type: 'team_up', file: name }));
+        }
+      } else if (sub === 'down') {
+        const name = rest[0];
+        if (!name) {
+          console.error('usage: flock team down <name>');
+          return;
+        }
+        print(await api('POST', '/api/ops', { type: 'team_down', name }));
+      } else if (sub === 'ls') {
+        // local read: teams + their latest snapshots (no core round-trip)
+        const { listTeams, listSnapshots } = await import('./core/team-snap.js');
+        const home = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+        const teams = listTeams(home);
+        if (!teams.length) {
+          console.log('(no teams — create ~/.flock/teams/<name>.yaml)');
+          return;
+        }
+        for (const t of teams) {
+          const snaps = listSnapshots(home, t.name);
+          const last = snaps.length ? snaps[snaps.length - 1] : null;
+          console.log(`${t.name}  pods: ${t.pods.join(', ') || '(empty)'}  last snapshot: ${last ? `${last.id} (${last.savedAt})` : '—'}`);
+        }
       } else {
-        console.log(USAGE);
+        console.log('usage: flock team up <name|file> [--restore <snap|latest>] | down <name> | ls');
       }
       return;
     }

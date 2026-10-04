@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
 import { parseTeamYaml, TeamParseError } from './team.js';
+import { listTeams, listSnapshots, readSnapshot, readTeamSpec, saveSnapshot, validateTeamName, type SnapshotPod } from './team-snap.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest, type ResolvedAgent } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
@@ -123,6 +124,8 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
   pod_capture: { group: 'pod', scopes: ['operator'], summary: 'capture pod pane text', run: (o, c) => podCapture(o, c) },
   pod_close: { group: 'pod', scopes: ['operator', 'pod'], summary: 'close a pod (kill window, state=closed)', run: (o, c) => podClose(o, c) },
+  team_down: { group: 'team', scopes: ['operator'], summary: 'close all live pods of a named team + auto-snapshot (C14)', run: (o, c) => teamDown(o, c) },
+  team_restore: { group: 'team', scopes: ['operator'], summary: 'restore a named team from a snapshot (C14, honest per-node outcomes)', run: (o, c) => teamRestore(o, c) },
   // -- agent images (C13) ----------------------------------------------------
   agent_image_save: { group: 'pod', scopes: ['operator'], summary: 'save an agent image (manifest + session copy) from a live pi pod', run: (o, c) => agentImageSave(o, c) },
   agent_image_ls: { group: 'pod', scopes: ['operator', 'pod'], summary: 'list agent images', run: (_o, c) => listImages(c.store.home) },
@@ -391,9 +394,11 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
     forkRef: op.fork ? resolveForkRef(ctx, String(op.fork)) : undefined,
     posture: op.posture === 'full_bypass' || op.posture === 'floor' ? op.posture : undefined,
     profile: op.profile ? String(op.profile) : null,
-    resumeToken: imageSessionFile,
+    // resume token: C13 image copy wins; C14 snapshot restore passes
+    // op.resumeToken (the seat copy of the snapshot's session)
+    resumeToken: imageSessionFile ?? (op.resumeToken ? String(op.resumeToken) : undefined),
     restoreManifest: imageRef?.restore,
-    freshStart: !imageSessionFile && !op.fork,
+    freshStart: !imageSessionFile && !op.fork && !op.resumeToken,
   });
   return { pod, run };
 }
@@ -649,6 +654,123 @@ async function podSetResumeToken(op: Record<string, unknown>, ctx: CoreCtx): Pro
 
 // --fork <role|path>: role -> that pod's current session file (session-id is
 // in the filename); path is used as-is.
+// ── C14: team down / restore ──────────────────────────────────────────────
+// Honest vocabulary: a per-node outcome, never a smoothed failure.
+type NodeOutcome =
+  | 'resumed' | 'rebuilt' | 'fresh' | 'fresh-primed'
+  | 'awaiting-decision' | 'failed' | 'attention_required' | 'operator_recovered';
+
+// team down: close all LIVE pods of the named team + auto-snapshot.
+// A pod with a foreign runtime (non-pi) is NOT snapshotted — the honest
+// note goes to the report (the prompt: "team down их не включает").
+async function teamDown(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '');
+  if (!validateTeamName(name)) throw new OpError(400, `invalid team name: ${name || '(empty)'}`);
+  const { spec, file: teamFile } = readTeamSpec(ctx.store.home, name);
+  const pods: SnapshotPod[] = [];
+  const skipped: { role: string; reason: string }[] = [];
+  const closed: Record<string, unknown> = {};
+  for (const [role, s] of Object.entries(spec.pods)) {
+    const pod = store.getPodByRole(ctx.store, role);
+    const rt = pod ? podRuntime(pod.agent) : (s.agent === 'bash' ? 'bash' : 'pi');
+    if (rt !== 'pi') {
+      skipped.push({ role, reason: `runtime not snapshot-able: ${rt} (pi only in C14)` });
+      continue;
+    }
+    // the session file: run-meta (exact identity) -> seat scan
+    let session: string | null = null;
+    if (pod) {
+      session = store.latestSessionFile(ctx.store, role);
+      if (!session || !fs.existsSync(session)) {
+        const dir = seatPaths(ctx.store.home, role).sessionsDir;
+        try {
+          const files = fs.readdirSync(dir).filter((f) => f.endsWith(`_${role}.jsonl`)).sort();
+          session = files.length ? path.join(dir, files[files.length - 1]) : null;
+        } catch {
+          session = null;
+        }
+      }
+    }
+    const manifest = s.agent ? (resolveAgent(s.agent, null)?.manifest ?? null) : null;
+    pods.push({
+      role,
+      agent: pod?.agent ?? s.agent ?? null,
+      manifestId: manifest?.id ?? (s.agent ?? null),
+      profile: pod?.profile ?? s.profile ?? null,
+      model: pod?.model ?? s.model ?? null,
+      dir: pod?.dir ?? (s.dir ? (s.dir.startsWith('ws:') ? resolveWorkspaceRef(ctx.store.home, s.dir) : s.dir) : path.join(ctx.store.home, 'pods', role)),
+      sessionFile: session,
+      sessionCopy: null, // filled by saveSnapshot
+      restorable: !!session,
+    });
+    // close the live pod (the snapshot copy was just made — order matters:
+    // copy BEFORE close, the seat may be cleaned later)
+    if (pod && pod.state === 'live') {
+      try {
+        await apply({ type: 'pod_close', role }, ctx);
+        closed[role] = 'closed';
+      } catch (e) {
+        closed[role] = `close failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+  }
+  const snap = saveSnapshot(ctx.store.home, name, { teamFile, pods, skipped });
+  ctx.emit?.({ type: 'team_down', team: name, snapshot: snap.id, pods: pods.length, skipped: skipped.length });
+  return { team: name, snapshot: snap.id, savedAt: snap.savedAt, closed, skipped };
+}
+
+// team restore: spawn the team's pods from a snapshot, per-node honest.
+// Rules (the prompt): refuse restore over a node that is already live or
+// restoring; missing REQUIRED (session for a restore-able node) = hard
+// failure for THAT node only; restore-safe replay (guidance) is idempotent.
+async function teamRestore(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const name = String(op.name ?? '');
+  if (!validateTeamName(name)) throw new OpError(400, `invalid team name: ${name || '(empty)'}`);
+  const ref = String(op.restore ?? 'latest');
+  const { snap, dir: snapDir } = readSnapshot(ctx.store.home, name, ref);
+  const results: Record<string, { outcome: NodeOutcome; detail?: string }> = {};
+  for (const p of snap.pods) {
+    const existing = store.getPodByRole(ctx.store, p.role);
+    // refuse-over-live: a node that is live or restoring is NOT overwritten
+    if (existing && (existing.state === 'live' || existing.state === 'restoring')) {
+      results[p.role] = { outcome: 'awaiting-decision', detail: `pod ${p.role} is ${existing.state} — close it first (flock pod close ${p.role}) to restore from ${snap.id}` };
+      continue;
+    }
+    try {
+      // the restore session: the snapshot copy (not the live seat file —
+      // the snapshot is the checkpoint, the seat may have moved on)
+      const sessionCopy = p.sessionCopy && fs.existsSync(p.sessionCopy) ? p.sessionCopy : null;
+      if (!sessionCopy) {
+        // required for a restorable node: hard failure for THIS node
+        results[p.role] = { outcome: 'failed', detail: `no session in snapshot ${snap.id} for ${p.role} (required for restore)` };
+        continue;
+      }
+      // copy into the NEW pod's seat (seat isolation, same as images)
+      const sessionsDir = seatPaths(ctx.store.home, p.role).sessionsDir;
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      const dest = path.join(sessionsDir, `from-snapshot-${snap.name}-${snap.id}-${path.basename(sessionCopy)}`);
+      fs.copyFileSync(sessionCopy, dest);
+      const res = (await apply({
+        type: 'pod_spawn',
+        role: p.role,
+        agent: p.manifestId ?? undefined,
+        model: p.model ?? undefined,
+        profile: p.profile ?? undefined,
+        dir: p.dir,
+        resumeToken: dest, // C14: resume from the snapshot's session copy
+      }, ctx)) as { run?: { id: string } };
+      results[p.role] = { outcome: 'resumed', detail: `run ${res?.run?.id} (session from snapshot ${snap.id})` };
+    } catch (e) {
+      // per-node isolation: one broken node does not sink the team
+      const msg = e instanceof Error ? e.message : String(e);
+      const attention = /attention_required|failed resume/i.test(msg);
+      results[p.role] = { outcome: attention ? 'attention_required' : 'failed', detail: msg };
+    }
+  }
+  ctx.emit?.({ type: 'team_restore', team: name, snapshot: snap.id, results });
+  return { team: name, snapshot: snap.id, results };
+}
+
 function resolveForkRef(ctx: CoreCtx, ref: string): string {
   if (ref.includes('/') || ref.includes('\\')) return ref;
   const pod = store.getPodByRole(ctx.store, ref);
@@ -1070,7 +1192,14 @@ async function messageClaim(op: Record<string, unknown>, ctx: CoreCtx): Promise<
 // pods are spawned. Never kills a live pod — a team file change takes effect
 // on relaunch/close, which the operator does deliberately.
 async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
-  const file = path.resolve(String(op.file ?? 'pods.yaml'));
+  // C14: a team NAME resolves to ~/.flock/teams/<name>.yaml; a path works
+  // as before (the legacy `team up <file>` keeps working).
+  const raw = String(op.file ?? 'pods.yaml');
+  let file = path.resolve(raw);
+  if (!raw.includes('/') && !fs.existsSync(file)) {
+    const { file: named } = readTeamSpec(ctx.store.home, raw);
+    file = named;
+  }
   let src: string;
   try {
     src = fs.readFileSync(file, 'utf8');
