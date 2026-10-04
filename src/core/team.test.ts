@@ -14,7 +14,7 @@ pods:
       Будь краток.
       Коммить свою работу.
   rev:
-    agent: claude
+    agent: bash
     profile: loud
     posture: full_bypass
     guidance: one-liner guidance
@@ -25,7 +25,7 @@ pods:
   assert.strictEqual(spec.pods.dev.agent, 'pi');
   assert.strictEqual(spec.pods.dev.model, 'cat-vllm/qwen3.8-27b-fp8');
   assert.strictEqual(spec.pods.dev.guidance, 'Будь краток.\nКоммить свою работу.');
-  assert.strictEqual(spec.pods.rev.agent, 'claude');
+  assert.strictEqual(spec.pods.rev.agent, 'bash');
   assert.strictEqual(spec.pods.rev.profile, 'loud');
   assert.strictEqual(spec.pods.rev.posture, 'full_bypass');
   assert.strictEqual(spec.pods.rev.guidance, 'one-liner guidance');

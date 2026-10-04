@@ -6,8 +6,6 @@ import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
 import { seatPaths, validateResumeToken } from './bridge-protocol.js';
-import { claudeConfigDir, claudeProjectsDir, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
-import { validateCodexSessionToken } from './codex-protocol.js';
 import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type RuntimeAdapter, type StartupFile } from './runtime-adapter.js';
 import { WATCHDOG_POLICIES, validateSpec, terminateJob, type PolicyName } from './watchdog.js';
 import { listAlerts } from './health.js';
@@ -211,6 +209,12 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (!r) throw new OpError(400, `unknown agent: ${agentId} (want ${Object.keys(loadAgents()).join(' | ')})`);
     const manifest = r.manifest;
     agentStored = r.id;
+    const rt = manifestRuntime(manifest);
+    // C12b: only pi + bash have adapters — a removed/unknown runtime is a
+    // clean error, not a crash (revert = cherry-pick, see commit C12b).
+    if (rt !== 'pi' && rt !== 'bash' && rt !== 'cmd') {
+      throw new OpError(400, `agent ${agentId}: runtime not supported: ${rt} (C12b: builtins are pi + bash; a new runtime = one RuntimeAdapter + manifest)`);
+    }
     const adapter = getAdapter(manifest, adapterEnv(ctx));
     if (!adapter) throw new OpError(400, `agent ${agentId}: no runtime adapter (manifest needs a supported "runtime")`);
 
@@ -219,11 +223,6 @@ async function spawnAgent(ctx: CoreCtx, o: {
     // channel (form a) — merged over the flock-managed vars in the bridge
     if (manifest.child?.env) Object.assign(childEnv, manifest.child.env);
     if (adapter.runtime === 'pi' && !model) model = firstUserModel();
-    if ((adapter.runtime === 'claude' || adapter.runtime === 'codex') && !model) {
-      // pi config uses provider/model syntax; claude/codex want the bare model id
-      const fm = firstUserModel();
-      model = fm ? (fm.split('/').pop() ?? fm) : fm;
-    }
     const binding: PodBinding = {
       role: o.role,
       cwd: o.dir,
@@ -414,13 +413,15 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   const resolved = resolveAgent(cur.agent ?? undefined, null, profile);
   const runtime = resolved ? manifestRuntime(resolved.manifest) : 'cmd';
   const isPi = runtime === 'pi';
-  const isClaude = runtime === 'claude';
-  const isCodex = runtime === 'codex';
+  // C12b: claude/codex are gone — a pod stored on a removed runtime is a
+  // clean refusal, not a crash (re-spawn it with a supported agent).
+  if (!isPi && runtime !== 'bash' && runtime !== 'cmd') {
+    throw new OpError(400, `pod ${role}: runtime not supported: ${runtime} (C12b: re-spawn with a pi or bash agent)`);
+  }
   // pinned resume token wins; otherwise the latest session (honest resume).
-  // Token shape is per-runtime: pi = session file path, claude = transcript
-  // uuid, codex = thread id (UUID v7).
-  const pinned = isPi || isClaude || isCodex ? (cur.resume_token ?? undefined) : undefined;
-  const tokenValid = isPi ? validateResumeToken(pinned!) : isCodex ? validateCodexSessionToken(pinned!) : validateClaudeSessionToken(pinned!);
+  // pi: session file path (the only runtime with a session in C12b).
+  const pinned = isPi ? (cur.resume_token ?? undefined) : undefined;
+  const tokenValid = isPi ? validateResumeToken(pinned!) : true;
   if (pinned && !tokenValid) {
     throw new OpError(400, `pinned resume token is invalid: ${pinned} (flock pod resume-token ${role} reset)`);
   }
@@ -434,9 +435,6 @@ export async function podRelaunch(op: Record<string, unknown>, ctx: CoreCtx): Pr
   if (!fresh) {
     if (isPi) {
       resumeToken = forkRef ? undefined : pinned ?? store.latestSessionFile(ctx.store, role) ?? undefined;
-    } else if (isClaude || isCodex) {
-      const adapter = getAdapter(resolved!.manifest, adapterEnv(ctx));
-      resumeToken = forkRef ? undefined : pinned ?? (await adapter?.latestSessionToken?.({ role, cwd: cur.dir, seatRoot: path.join(ctx.store.home, 'pods', role) })) ?? undefined;
     }
   }
   const res = await spawnAgent(ctx, {
@@ -466,9 +464,10 @@ async function podSetResumeToken(op: Record<string, unknown>, ctx: CoreCtx): Pro
   const pod = store.getPodByRole(ctx.store, role);
   if (!pod) throw new OpError(404, `no pod: ${role}`);
   const rt = podRuntime(pod.agent);
+  if (rt !== 'pi') throw new OpError(400, `pod ${role}: resume token is for pi pods only (runtime: ${rt})`);
   const raw = op.token === undefined || op.token === '' || op.token === 'reset' ? null : String(op.token);
   if (raw !== null) {
-    const valid = rt === 'codex' ? validateCodexSessionToken(raw) : validateResumeToken(raw);
+    const valid = validateResumeToken(raw);
     if (!valid) throw new OpError(400, `invalid resume token: ${raw}`);
   }
   store.setPodResumeToken(ctx.store, role, raw);
@@ -482,17 +481,8 @@ function resolveForkRef(ctx: CoreCtx, ref: string): string {
   if (ref.includes('/') || ref.includes('\\')) return ref;
   const pod = store.getPodByRole(ctx.store, ref);
   if (!pod) throw new OpError(404, `no pod to fork from: ${ref}`);
-  if (podRuntime(pod.agent) === 'claude') {
-    const s = latestClaudeSession(claudeProjectsDir(claudeConfigDir(pod.dir), pod.dir));
-    if (!s) throw new OpError(404, `no session for pod ${ref} (no transcript yet)`);
-    return s.token;
-  }
-  if (podRuntime(pod.agent) === 'codex') {
-    // the fork ref is a codex thread id (UUID — no slashes, so it reaches
-    // here only as a role ref): the pod's current thread from the sidecar
-    const st = terminal.readRunnerState(ctx.store.home, ref);
-    if (!st?.sessionId) throw new OpError(404, `no session for pod ${ref} (no codex thread yet)`);
-    return st.sessionId;
+  if (podRuntime(pod.agent) !== 'pi') {
+    throw new OpError(400, `pod ${ref}: fork is for pi pods only (runtime: ${podRuntime(pod.agent)})`);
   }
   const dir = seatPaths(ctx.store.home, ref).sessionsDir;
   let files: string[] = [];
@@ -512,8 +502,7 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
   const pod = requireLivePod(ctx, role);
   const resolved = adapterForPod(pod, ctx);
   // Verified delivery through the runtime's own typed signal (pi: sidecar
-  // nonce-ack; claude: transcript growth). The core does not know which one
-  // it is — the adapter answers.
+  // nonce-ack). The core does not know which one it is — the adapter answers.
   if (resolved?.adapter.sendVerified) {
     const r = await resolved.adapter.sendVerified(resolved.binding, text);
     if (!r.ok) throw new OpError(504, r.detail ?? 'delivery not verified (check the pod pane)');

@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import type { CoreCtx } from './ops.js';
 import { apply, adapterForPod } from './ops.js';
 import * as store from './store.js';
-import { capture, sendKey, winTarget } from './terminal.js';
+import { readRunnerState } from './terminal.js';
 import { podRuntime } from './agent.js';
 import type { RuntimeAdapter } from './runtime-adapter.js';
 
@@ -132,9 +132,8 @@ export function listAlerts(ctx: CoreCtx): AlertRow[] {
 export async function runHealthTick(ctx: CoreCtx): Promise<void> {
   const opts = healthOptsFromEnv();
   const nowMs = Date.now();
-  // Runtime-agnostic: ANY pod whose adapter can probe is checked (pi and
-  // claude answer the same questions with their own signals; bash/cmd have
-  // no probe -> skipped, as before).
+  // Runtime-agnostic: ANY pod whose adapter can probe is checked (bash/cmd
+  // have no probe -> skipped, as before).
   for (const pod of store.listPods(ctx.store)) {
     if (pod.state !== 'live') continue;
     const resolved = adapterForPod(pod, ctx);
@@ -145,31 +144,6 @@ export async function runHealthTick(ctx: CoreCtx): Promise<void> {
       console.error(`[core] health: ${pod.role}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  // claude pods have no /answer channel (raw TUI pane): in-session
-  // notification dialogs ("Enter to continue") would stall the pod forever.
-  // Boot/permission dialogs are launch-time only and are answered by the
-  // ready-wait loop - the sweeper only dismisses the known notification.
-  for (const pod of store.listPods(ctx.store)) {
-    if (pod.state !== 'live' || podRuntime(pod.agent) !== 'claude') continue;
-    try {
-      sweepClaudeDialog(ctx, pod.role);
-    } catch {
-      /* pane gone mid-sweep; the runkeeper owns crash detection */
-    }
-  }
-}
-
-function sweepClaudeDialog(ctx: CoreCtx, role: string): void {
-  const target = winTarget(role);
-  capture(target, 40)
-    .then((out) => {
-      if (out.includes('Enter to continue')) {
-        console.log(`[core] health: claude pod ${role}: dismissing in-session notification`);
-        return sendKey(target, 'Enter');
-      }
-      return undefined;
-    })
-    .catch(() => {});
 }
 
 async function checkPod(ctx: CoreCtx, pod: store.Pod, adapter: RuntimeAdapter, opts: HealthOpts, nowMs: number): Promise<void> {
@@ -208,7 +182,7 @@ async function checkPod(ctx: CoreCtx, pod: store.Pod, adapter: RuntimeAdapter, o
           kind: 'gate',
           ref: gate.id,
           state: 'open',
-          note: `dialog waiting: ${title} — ${gate.channel === 'answer' ? `ответ: flock pod answer ${role} <n|текст>` : `смотреть: tmux attach -t ${winTarget(role)}`}`,
+          note: `dialog waiting: ${title} — ${gate.channel === 'answer' ? `ответ: flock pod answer ${role} <n|текст>` : `смотреть: tmux attach -t ${role}`}`,
         });
       }
       // escalation: park an active task in needs so it is not lost in the queue
@@ -231,8 +205,8 @@ async function checkPod(ctx: CoreCtx, pod: store.Pod, adapter: RuntimeAdapter, o
 
   // --- idle: at rest while a claimed task is still active ----------------------
   // Runtime-agnostic over the probe: ready + !busy + lastActivity older than
-  // idleMin (pi: sidecar ready/streaming/lastPrompt.at; claude: pane scrape +
-  // transcript mtime). The ladder (watching -> nudging -> needs) is unchanged.
+  // idleMin (pi: sidecar ready/streaming/lastPrompt.at). The ladder
+  // (watching -> nudging -> needs) is unchanged.
   const activeTasks = store.listTasks(ctx.store, 'active').filter((t) => t.pod_role === role);
   if (!probe || !probe.ready || activeTasks.length === 0) {
     for (const a of listAlerts(ctx).filter((a) => a.pod_role === role && a.kind === 'idle')) {

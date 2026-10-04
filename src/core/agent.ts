@@ -1,11 +1,12 @@
 // Agent adapters: ONE generic implementation + declarative manifests.
-// Adding a runtime (claude, codex, ...) = a JSON manifest in <FLOCK_HOME>/agents/,
+// Adding a runtime = a JSON manifest in <FLOCK_HOME>/agents/ (C12b: builtins are pi +
+// bash only; claude/codex were dropped and return via cherry-pick) —
 // not new code: a RuntimeAdapter per runtime + a manifest describing it.
 //
 // Manifest = the "interface" a new agent implements:
 //   {
 //     id: string,
-//     command: string,            // base command (e.g. "pi", "claude")
+//     command: string,            // base command (e.g. "pi")
 //     modelFlag?: string,         // flag that takes a model id (pi: "--model")
 //     args?: string[],            // fixed extra args
 //     env?: Record<string,string> // extra window env (config isolation etc.)
@@ -61,7 +62,7 @@ export interface AgentManifest {
   // v3.3: named override sets; picked with --profile at spawn/relaunch.
   profiles?: Record<string, Partial<AgentManifest>>;
   // pi-specific first-class axes (mapped to pi CLI flags by the pi
-  // adapter/runner; ignored by other runtimes — ponytail: claude/codex may
+  // adapter/runner; ignored by other runtimes — ponytail: a future runtime may
   // map some later, e.g. thinking -> --effort).
   thinking?: ThinkingLevel;
   tools?: string[]; // allowlist of tool names
@@ -84,7 +85,7 @@ export interface AgentManifest {
   packs?: string[];
   // C10: UNIFIED child-args (form a). RAW passthrough into the child
   // process's argv/env — the bridge is dumb about it (appends args last,
-  // merges env). Runtime-agnostic: pi, codex, any bridge runtime. The
+  // merges env). Runtime-agnostic: pi, any bridge runtime. The
   // mapped axes above (thinking/tools/...) stay the manifest DICTIONARY;
   // the flag mapping lives in the runtime implementation (pi-bridge).
   child?: { args?: string[]; env?: Record<string, string> };
@@ -95,25 +96,6 @@ import { PM_PROTOCOL } from './pm-protocol.js';
 export const BUILTIN_AGENTS: Record<string, AgentManifest> = {
   pi: { id: 'pi', command: 'pi', modelFlag: '--model', runner: 'flock-rpc', trust: 'approve', trustLevel: 'dev' },
   bash: { id: 'bash', command: 'bash' },
-  // claude-code TUI: per-pod config home (<pod>/.claude, the adapter sets
-  // CLAUDE_CONFIG_DIR), auth via env (local Anthropic-compatible endpoint).
-  // Override with a custom manifest for other providers/models.
-  claude: {
-    id: 'claude',
-    command: 'claude',
-    runtime: 'claude',
-    modelFlag: '--model',
-    env: {
-      ANTHROPIC_BASE_URL: 'http://192.168.1.114:8000',
-      ANTHROPIC_API_KEY: 'flock-local',
-    },
-    // the local model accepts xhigh/medium/low effort; "high" -> 500
-    args: ['--effort', 'medium'],
-  },
-  // codex-cli: pane-hosted exec bridge (codex-bridge.js); the model provider
-  // is projected into the pod CODEX_HOME config.toml by the codex adapter
-  // (in-core responses shim -> vLLM, FLOCK_CODEX_UPSTREAM, default below).
-  codex: { id: 'codex', command: 'codex', runtime: 'codex' },
   // C8: the pm is a regular pod (no core subsystem) — the coordinator of
   // the team. Woken by interest events (inbox/poke), decides with the
   // pod-scoped ops it already holds.
@@ -157,7 +139,7 @@ export function loadAgents(): Record<string, AgentManifest> {
 }
 
 export interface ResolvedAgent {
-  id: string; // 'pi' | 'bash' | <manifest> | 'cmd' (raw --cmd)
+  id: string; // 'pi' | 'bash' | <manifest id> | 'cmd' (raw --cmd)
   cmd: string;
   env: Record<string, string>;
   manifest: AgentManifest;

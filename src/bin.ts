@@ -428,7 +428,7 @@ async function main(): Promise<void> {
       const { writeFileSync, existsSync, mkdirSync } = await import('node:fs');
       const agents = loadAgents();
       if (!sub || sub === 'ls') {
-        const builtin = new Set(['pi', 'bash', 'claude', 'pm']);
+        const builtin = new Set(['pi', 'bash', 'pm']);
         const rows = Object.values(agents).map((m) => ({
           id: m.id,
           runtime: manifestRuntime(m),

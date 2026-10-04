@@ -134,14 +134,12 @@ cancelled) → сcribe записывает и ставит инстанс в bl
 
 Relaunch = честный resume ТОЧНОЙ сессии; silent fresh запрещён.
 
-- `flock pod relaunch <role>` — resume (pi: `--session <file>`, claude:
-  `--resume <uuid>`, codex: `exec resume <thread>`);
+- `flock pod relaunch <role>` — resume (pi: `--session <file>`);
 - сессии нет/проба упала → **failed resume fails loudly**: `attention_required`
   в run meta + hint `flock pod relaunch <role> --fresh`;
 - `--fresh` — явный чистый старт (операторский выбор, не fallback);
 - `--fork [role]` — форк сессии (новый identity, parent не трогается);
-- pre-claim пробы: pi (session-файл + runner-sidecar), claude (transcript),
-  codex (rollout-файл по thread id).
+- pre-claim пробы: pi (session-файл + runner-sidecar).
 
 ## Runtimes: bridge и terminal-native
 
@@ -157,18 +155,16 @@ Relaunch = честный resume ТОЧНОЙ сессии; silent fresh зап�
   identity = session-файл. Dialog'и расширений без оператора: авто-ответ
   strictest option (deny) + LOUD mirror + `ext_dialog_auto_denied` в
   activity (gate-канал = `attach`: рычаг оператора — pane);
-- **codex** (`codex-bridge.js`): `codex exec --json` на ход (TUI не
-  подходит: общий app-server-демон), thread id (UUID v7) = сессия; resume =
-  `exec resume <thread>`, fork = `exec fork <thread>`; in-core
-  responses-шим (`FLOCK_PORT+11`): сливает `developer` → `instructions`
-  для vLLM. `CODEX_HOME=<pod>/.codex`.
 
 **Terminal-native** (delta маленькая: нет моста, сигналы — с панели):
 
-- **claude**: TUI, `CLAUDE_CONFIG_DIR=<pod>/.claude`, сессия = uuid
-  transcript, ack = рост transcript, boot-диалоги авто-отвечаются
-  (маркеры хрупкие — сверять при бампе, claude-protocol.test);
 - **bash**: plain window, без ready-gate и resume.
+
+C12b: claude- и codex-адаптеры убраны (commit C12b, возврат =
+cherry-pick) — манифест с удалённым рантаймом получает чистую ошибку
+`runtime not supported`. Контракт (RuntimeAdapter + bridge-protocol) —
+точка расширения: новый рантайм = один адаптер + manifest, ноль строк в
+core.
 
 **Unified `--child-args` (C10)**: manifest-поле `child: {args?, env?}` —
 raw passthrough (args — после mapped-осей, env — поверх flock-managed):
@@ -185,14 +181,12 @@ concat, `mcp` по имени сервера.
 ./bin/flock agents ls                      # id, runtime, source, profiles, thinking
 ./bin/flock agents show <id> [--profile P] # resolved manifest
 ./bin/flock pod spawn dev --agent pi --profile careful
-./bin/flock pod spawn cxdemo --agent codex --model qwen3.8-27b-fp8
-./bin/flock pod spawn ctest --agent claude
 ```
 
-Изоляция (все bridge-рантаймы): per-pod конфиг (`PI_CODING_AGENT_DIR` /
-`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), `--no-context-files` +
-`--append-system-prompt <pod>/AGENTS.md` (home-AGENTS.md в под не
-попадает), per-pod sandbox-trust из manifest `trustLevel`.
+Изоляция (bridge-рантаймы): per-pod конфиг (`PI_CODING_AGENT_DIR`),
+`--no-context-files` + `--append-system-prompt <pod>/AGENTS.md`
+(home-AGENTS.md в под не попадает), per-pod sandbox-trust из manifest
+`trustLevel`.
 
 ## pm — обычный под (C8)
 
@@ -253,8 +247,8 @@ capture → ретраи).
 ## Health (gate/idle)
 
 Built-in health-чеки поверх typed-сигналов адаптера: **gate** (dialog
-ждёт человека: у pi — `ext_dialog_auto_denied`, канал `attach`; у claude —
-permission-промпт) и **idle** (агент на паузе с active-задачей: nudge →
+ждёт человека: у pi — `ext_dialog_auto_denied`, канал `attach`) и **idle**
+(агент на паузе с active-задачей: nudge →
 `task needs`). Лестница: alert → nudge/realert → эскалация.
 
 ```sh

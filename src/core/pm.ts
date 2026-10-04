@@ -79,7 +79,7 @@ export async function pmDigest(ctx: CoreCtx): Promise<Record<string, unknown>> {
     .filter((t) => t.status === 'queued' && !liveRoles.has(t.pod_role))
     .map((t) => ({ id: t.id, title: t.title.slice(0, 80), pod: t.pod_role }));
   // Runtime-agnostic pod activity: the adapter's healthProbe answers for any
-  // runtime (pi: sidecar ready/streaming; claude: pane scrape; codex: sidecar).
+  // runtime (pi: sidecar ready/streaming).
   const pods = await Promise.all(
     store.listPods(s).map(async (p) => {
       const resolved = p.state === 'live' ? adapterForPod(p, ctx) : null;

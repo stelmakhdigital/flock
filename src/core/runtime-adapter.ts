@@ -38,30 +38,7 @@ import {
   type RunnerState,
   type ActivityLine,
 } from './bridge-protocol.js';
-import {
-  CLAUDE_BOOT_DIALOGS,
-  CLAUDE_FIXED_ENV,
-  buildClaudeArgs,
-  claudeConfigDir,
-  claudePaneBusy,
-  claudePaneReady,
-  claudeProjectsDir,
-  claudeTranscriptFp,
-  detectClaudeGate,
-  latestClaudeSession,
-  seedClaudeConfig,
-  validateClaudeSessionToken,
-  waitForTranscriptGrowth,
-} from './claude-protocol.js';
-import {
-  buildCodexBridgeCommand,
-  buildCodexConfig,
-  codexHome,
-  codexRolloutForThread,
-  codexShimPort,
-  CODEX_BRIDGE_READY_MARKER,
-  validateCodexSessionToken,
-} from './codex-protocol.js';
+
 import {
   AgentManifest,
   installPodCli,
@@ -77,8 +54,7 @@ const execFileP = promisify(execFile);
 export interface AdapterEnv {
   home: string; // FLOCK_HOME
   token: string;
-  runnerPath: string; // dist/core/runner.js
-  codexBridgePath?: string; // dist/core/codex-bridge.js (defaults to this file's dir)
+  runnerPath: string; // dist/core/pi-bridge.js
 }
 
 // The pod's launch coordinates. tmux target is
@@ -137,8 +113,9 @@ export type LaunchResult =
       trust?: 'approve' | 'no-approve'; // applied resource trust (observability)
       sessionFile?: string; // pi: typed session identity
       sessionId?: string;
-      resumeToken?: string; // pi: the session file to persist for relaunch; codex: the thread id
-      resumeType?: 'pi_session_file' | 'claude_session_uuid' | 'codex_thread_id';
+      resumeToken?: string; // pi: the session file to persist for relaunch
+      // (generic slot: a future runtime may carry a different token shape)
+      resumeType?: 'pi_session_file';
     }
   | { ok: false; error: string; recovery?: 'attention_required'; evidence?: string };
 
@@ -219,10 +196,6 @@ export interface RuntimeAdapter {
     opts: { launchId: string; resumeToken?: string; forkSource?: ForkSource },
   ): Promise<LaunchResult>;
   checkReady(binding: PodBinding): Promise<ReadyResult>;
-  // The session token of the pod's last run (honest-relaunch default). pi uses
-  // run-meta (store.latestSessionFile) and does not implement this; claude
-  // scans its per-pod transcripts.
-  latestSessionToken?(binding: PodBinding): Promise<string | null>;
   // ── the three questions (see the contract above) ──
   liveness?(binding: PodBinding, run: RunLike): Promise<LivenessResult>;
   sendVerified?(binding: PodBinding, text: string): Promise<SendVerifiedResult>;
@@ -583,492 +556,6 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
 }
 
 
-// ── Claude Code runtime (interactive TUI, persistent pane) ─────────────────
-// A claude pod runs the claude-code TUI as the persistent pane's foreground.
-// No RPC bridge: delivery = raw paste, typed signals = the per-pod config
-// dir transcripts (<config>/projects/<slug>/<uuid>.jsonl grow on every turn:
-// delivery ack + session identity). Liveness = pane foreground (the
-// runkeeper foreground guard; there is no sidecar in this runtime).
-// First-launch dialogs (theme/API key/security/folder trust) are answered
-// deterministically by the ready-wait loop (observed live, per config dir +
-// per cwd, one-time).
-export class ClaudeRuntimeAdapter implements RuntimeAdapter {
-  readonly runtime = 'claude';
-  constructor(
-    private m: AgentManifest,
-    private env: AdapterEnv,
-  ) {}
-
-  // transcripts are keyed by the CWD slug, config lives in the seat
-  projectsDir(configDir: string, cwd: string): string {
-    return claudeProjectsDir(configDir, cwd);
-  }
-
-  async listInstalled(): Promise<{ installed: boolean; version?: string; detail?: string }> {
-    try {
-      const { stdout } = await execFileP(this.m.command, ['--version'], { timeout: 5000 });
-      return { installed: true, version: stdout.trim().split('\n')[0] };
-    } catch (e) {
-      return { installed: false, detail: `${this.m.command} --version failed: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
-
-  project(binding: PodBinding): void {
-    // Per-pod config home = full config+sessions isolation (and it avoids a
-    // root-owned ~/.claude). Auth is env-based (manifest env: ANTHROPIC_*).
-    // Pre-seed onboarding state: a fresh config hard-fails the first-launch
-    // api.anthropic.com connectivity check (observed live).
-    const cfg = claudeConfigDir(binding.seatRoot ?? binding.cwd);
-    fs.mkdirSync(cfg, { recursive: true });
-    seedClaudeConfig(cfg, this.m.env?.ANTHROPIC_API_KEY);
-    installPodCli(binding.cwd, this.env.token);
-  }
-
-  async deliverStartup(
-    files: StartupFile[],
-    binding: PodBinding,
-    phase: 'pre_launch' | 'post_ready',
-  ): Promise<StartupResult> {
-    const delivered: string[] = [];
-    const failed: { path: string; error: string }[] = [];
-    for (const f of files) {
-      try {
-        if (phase === 'pre_launch' && f.deliveryHint === 'guidance_merge') {
-          // Claude reads CLAUDE.md (not AGENTS.md); it must land BEFORE launch.
-          mergeManagedBlock(path.join(binding.cwd, 'CLAUDE.md'), f.path, f.content);
-          delivered.push(f.path);
-        } else if (phase === 'post_ready' && f.deliveryHint === 'send_text') {
-          // Raw paste + Enter into the TUI input.
-          await terminal.send(terminal.winTarget(binding.role), f.content, { raw: true, attempts: 1 });
-          delivered.push(f.path);
-        }
-      } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
-        if (f.required) failed.push({ path: f.path, error });
-      }
-    }
-    return { delivered: delivered.length, failed };
-  }
-
-  // The session token of the last run on this pod (newest transcript).
-  async latestSessionToken(binding: PodBinding): Promise<string | null> {
-    return latestClaudeSession(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd))?.token ?? null;
-  }
-
-  async launchHarness(
-    binding: PodBinding,
-    opts: { launchId: string; resumeToken?: string; forkSource?: ForkSource },
-  ): Promise<LaunchResult> {
-    // claude tokens are transcript uuids (resumeToken and forkSource share the
-    // same shape; fork just adds --fork-session)
-    const mode: 'fresh' | 'resume' | 'fork' = opts.forkSource ? 'fork' : opts.resumeToken ? 'resume' : 'fresh';
-    const token = mode === 'fresh' ? undefined : (mode === 'resume' ? opts.resumeToken : opts.forkSource!.value);
-    if (mode !== 'fresh' && (!token || !validateClaudeSessionToken(token))) {
-      return { ok: false, error: `invalid claude session token: ${token ?? '(empty)'}`, recovery: 'attention_required' };
-    }
-    if (mode !== 'fresh' && !fs.existsSync(path.join(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd), `${token}.jsonl`))) {
-      // C6 strict honest resume: a missing transcript is attention_required
-      // (the operator chooses --fresh) — never a silent fresh start.
-      return { ok: false, error: `resume: transcript not found: ${token}`, recovery: 'attention_required' };
-    }
-    // permission axis (claude-native): manifest permissionMode, binding
-    // override, full_bypass forces bypassPermissions
-    let pm = this.m.permissionMode;
-    if (binding.permissionMode) pm = binding.permissionMode;
-    if (binding.launchPosture === 'full_bypass') pm = 'bypassPermissions';
-
-    const args = [...(this.m.args ?? []), ...buildClaudeArgs({
-      model: binding.model,
-      resumeToken: token,
-      fork: mode === 'fork',
-      permissionMode: pm,
-    })];
-    const cmd = [this.m.command, ...args].map(shellQuote).join(' ');
-
-    // PERSISTENT PANE (same invariant as pi): typed-stop the old foreground,
-    // launch into the same window; on failure keep the window.
-    if (await terminal.windowExists(binding.role)) {
-      await this.stopClaude(binding.role);
-      await terminal.sleep(400);
-    }
-    if (!(await terminal.windowExists(binding.role))) {
-      await terminal.spawnPod({ role: binding.role, dir: binding.cwd });
-    }
-    const cfg = claudeConfigDir(binding.seatRoot ?? binding.cwd);
-    const extraEnv = { ...CLAUDE_FIXED_ENV, CLAUDE_CONFIG_DIR: cfg, ...(this.m.env ?? {}) };
-    await terminal.launchInWindow(binding.role, cmd, binding.cwd, extraEnv);
-
-    const target = terminal.winTarget(binding.role);
-    const ready = await this.waitForClaudeReady(target, 60000);
-    if (!ready) {
-      const evidence = (await terminal.capture(target, 40).catch(() => '')).slice(-800);
-      return { ok: false, error: 'claude did not reach the prompt in 60s', recovery: 'attention_required', evidence: evidence || undefined };
-    }
-    const panePid = await terminal.panePid(target).catch(() => null);
-    if (mode === 'fork') {
-      // Unlike pi (new session file appears at fork time), claude's fork
-      // transcript materialises on the FIRST TURN - so there is no
-      // synchronous identity check here. The "fork never stays on the parent"
-      // rule is guaranteed by the runtime: --resume X --fork-session creates a
-      // new session id and never writes into X's transcript. Nothing to do.
-    }
-    return { ok: true, mode, target, pid: panePid, resumeToken: mode === 'fresh' ? undefined : token, resumeType: 'claude_session_uuid' };
-  }
-
-  // Ready-wait: poll the pane, answer the one-time boot dialogs (each once),
-  // done at the idle prompt with no open confirmation AND the foreground is
-  // the TUI (a dead launch falls back to the shell, whose prompt can look
-  // similar under some themes).
-  private async waitForClaudeReady(target: string, timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    const answered = new Set<number>();
-    const ready = async (): Promise<boolean> => {
-      const out = await terminal.capture(target, 60).catch(() => '');
-      const cmd = await terminal.paneCommand(target).catch(() => '');
-      return claudePaneReady(out) && !!cmd && !terminal.SHELL_COMMANDS.has(cmd);
-    };
-    while (Date.now() < deadline) {
-      const out = await terminal.capture(target, 60).catch(() => '');
-      for (let i = 0; i < CLAUDE_BOOT_DIALOGS.length; i++) {
-        const d = CLAUDE_BOOT_DIALOGS[i];
-        if (!answered.has(i) && out.includes(d.marker)) {
-          for (const k of d.keys) await terminal.sendKey(target, k);
-          answered.add(i);
-          await terminal.sleep(400);
-          break;
-        }
-      }
-      if (await ready()) return true;
-      await terminal.sleep(500);
-    }
-    return ready();
-  }
-
-  // Typed stop for the claude TUI: C-c interrupts a running turn / clears the
-  // input; an idle prompt needs /exit (observed: a single C-c does not exit).
-  private async stopClaude(role: string): Promise<void> {
-    const target = terminal.winTarget(role);
-    const cmd0 = await terminal.paneCommand(target).catch(() => '');
-    if (!cmd0 || terminal.SHELL_COMMANDS.has(cmd0)) return;
-    await terminal.sendKey(target, 'C-c');
-    await terminal.sleep(400);
-    let c = await terminal.paneCommand(target).catch(() => '');
-    if (c && !terminal.SHELL_COMMANDS.has(c)) {
-      await terminal.send(target, '/exit', { raw: true, attempts: 1 });
-      const deadline = Date.now() + 8000;
-      while (Date.now() < deadline) {
-        await terminal.sleep(250);
-        c = await terminal.paneCommand(target).catch(() => '');
-        if (!c || terminal.SHELL_COMMANDS.has(c)) return;
-      }
-    }
-    // last resort: SIGKILL the pane's children (the shell stays — it IS the pane)
-    const pid = await terminal.panePid(target);
-    if (pid) {
-      try {
-        await execFileP('pkill', ['-9', '-P', String(pid)], { timeout: 3000 });
-      } catch {
-        /* the launch paste will surface the failure */
-      }
-    }
-  }
-
-  // ── the three questions (claude answers with pane + transcript signals) ──
-  // (1) liveness — foreground guard: the TUI exited -> the pane is back at the
-  //     shell. (A missing/unknown foreground is NOT a crash here — the generic
-  //     pid check catches a dead window.)
-  async liveness(binding: PodBinding, _run: RunLike): Promise<LivenessResult> {
-    const fg = await terminal.paneCommand(terminal.winTarget(binding.role)).catch(() => '');
-    if (fg && terminal.SHELL_COMMANDS.has(fg)) {
-      return { alive: false, reason: 'crashed(claude exited, pane at shell)' };
-    }
-    return { alive: true };
-  }
-
-  // (2) sendVerified — raw paste + Enter; ack = the per-pod transcript GROWS
-  //     (a user entry lands within seconds, independent of turn duration).
-  async sendVerified(binding: PodBinding, text: string): Promise<SendVerifiedResult> {
-    const projectsDir = claudeProjectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd);
-    const before = claudeTranscriptFp(projectsDir);
-    const res = await terminal.send(terminal.winTarget(binding.role), text, { raw: true });
-    const { grown } = await waitForTranscriptGrowth(projectsDir, before, 30000);
-    if (!grown) return { ok: false, attempts: res.attempts, detail: 'claude transcript did not grow after send (check the pod pane)' };
-    return { ok: true, attempts: res.attempts, ack: 'transcript' };
-  }
-
-  // (3) healthProbe — pane scrape: ready = idle prompt, busy = in-turn marker,
-  //     lastActivityAt = newest transcript mtime, gate = an open permission
-  //     prompt (detectClaudeGate: the idle footer is NOT a gate; channel
-  //     'attach' — there is no /answer channel for the TUI). at = now: the
-  //     pane is a LIVE scrape, so the core's "gate is live only for the
-  //     current run" rule sees a fresh timestamp, not a stale one.
-  async healthProbe(binding: PodBinding): Promise<HealthProbe | null> {
-    const target = terminal.winTarget(binding.role);
-    const out = await terminal.capture(target, 60).catch(() => '');
-    const gate = detectClaudeGate(out);
-    const gated = gate ? { ...gate, at: new Date().toISOString() } : undefined;
-    const last = latestClaudeSession(this.projectsDir(claudeConfigDir(binding.seatRoot ?? binding.cwd), binding.cwd));
-    let lastActivityAt: string | undefined;
-    if (last) {
-      try {
-        lastActivityAt = new Date(fs.statSync(last.file).mtimeMs).toISOString();
-      } catch {
-        lastActivityAt = undefined;
-      }
-    }
-    return {
-      ready: claudePaneReady(out),
-      busy: claudePaneBusy(out),
-      lastActivityAt,
-      gate: gated,
-    };
-  }
-
-  async checkReady(binding: PodBinding): Promise<ReadyResult> {
-    const target = terminal.winTarget(binding.role);
-    const alive = await terminal.paneAlive(binding.role).catch(() => false);
-    if (!alive) return { ready: false, reason: 'window gone', code: 'window_gone' };
-    const cmd = await terminal.paneCommand(target).catch(() => '');
-    if (!cmd || terminal.SHELL_COMMANDS.has(cmd)) return { ready: false, reason: 'stale: pane is at the shell', code: 'stale_ready' };
-    const out = await terminal.capture(target, 40).catch(() => '');
-    if (claudePaneBusy(out)) return { ready: true, reason: 'working (in turn)' };
-    if (claudePaneReady(out)) return { ready: true, reason: 'at prompt' };
-    return { ready: false, reason: 'no prompt marker (boot dialog?)', code: 'awaiting_runtime' };
-  }
-}
-
-// ── Codex runtime (pane-hosted exec bridge, persistent pane) ───────────────
-// A codex pod runs the codex BRIDGE (dist/core/codex-bridge.js) as the
-// persistent pane's foreground; the bridge spawns `codex exec --json` per
-// turn and continues the thread via `exec resume <id>` / `exec fork <id>`.
-// Typed signals are exactly the pi ones (sidecar + foreground guard +
-// flockmsg nonce ack) — the TUI/daemon surface is deliberately unused
-// (observed live: C-c = "disconnect", work continues in a shared daemon;
-// trust persistence breaks across daemon restarts). Session identity = the
-// codex thread id (UUID v7), created on the FIRST turn: resume/fork tokens
-// are verified by the bridge, a missing thread surfaces on the first turn
-// (honest error in the pane, ponytail: no pre-flight existence probe).
-export class CodexRuntimeAdapter implements RuntimeAdapter {
-  readonly runtime = 'codex';
-  constructor(
-    private m: AgentManifest,
-    private env: AdapterEnv,
-  ) {}
-
-  async listInstalled(): Promise<{ installed: boolean; version?: string; detail?: string }> {
-    try {
-      const { stdout } = await execFileP(this.m.command, ['--version'], { timeout: 5000 });
-      return { installed: true, version: stdout.trim().split('\n')[0] };
-    } catch (e) {
-      return { installed: false, detail: `${this.m.command} --version failed: ${e instanceof Error ? e.message : String(e)}` };
-    }
-  }
-
-  // Per-pod CODEX_HOME (config.toml -> the in-core shim) + in-pod CLI snapshot.
-  project(binding: PodBinding): void {
-    const seat = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);
-    const home = codexHome(seat);
-    fs.mkdirSync(home, { recursive: true });
-    fs.writeFileSync(path.join(home, 'config.toml'), buildCodexConfig({ model: binding.model, shimPort: codexShimPort() }));
-    installPodCli(binding.cwd, this.env.token);
-  }
-
-  async deliverStartup(
-    files: StartupFile[],
-    binding: PodBinding,
-    phase: 'pre_launch' | 'post_ready',
-  ): Promise<StartupResult> {
-    const delivered: string[] = [];
-    const failed: { path: string; error: string }[] = [];
-    for (const f of files) {
-      try {
-        if (phase === 'pre_launch' && f.deliveryHint === 'guidance_merge') {
-          // Codex reads AGENTS.md natively; it must land BEFORE the first turn.
-          mergeManagedBlock(path.join(binding.cwd, 'AGENTS.md'), f.path, f.content);
-          delivered.push(f.path);
-        } else if (phase === 'post_ready' && f.deliveryHint === 'send_text') {
-          // One prompt through the typed delivery path (frame + raw paste;
-          // the bridge parses flockmsg frames).
-          await terminal.send(terminal.winTarget(binding.role), frameMessage(f.content), { raw: true, attempts: 1 });
-          delivered.push(f.path);
-        }
-      } catch (e) {
-        const error = e instanceof Error ? e.message : String(e);
-        if (f.required) failed.push({ path: f.path, error });
-      }
-    }
-    return { delivered: delivered.length, failed };
-  }
-
-  // The session token of the last run on this pod: the bridge sidecar's
-  // sessionId (the current codex thread, created on the first turn).
-  async latestSessionToken(binding: PodBinding): Promise<string | null> {
-    const st = terminal.readRunnerState(this.env.home, binding.role);
-    return st?.sessionId ?? null;
-  }
-
-  // C6 probe: does a rollout for this thread exist under $CODEX_HOME/sessions
-  // (recursive — the date-partitioned layout)?
-  probeSession(binding: PodBinding, threadId: string): { ok: true } | { ok: false; detail: string } {
-    const seat = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);
-    const sessions = path.join(codexHome(seat), 'sessions');
-    if (!fs.existsSync(sessions)) return { ok: false, detail: `no sessions dir: ${sessions}` };
-    const found = codexRolloutForThread(sessions, threadId);
-    return found ? { ok: true } : { ok: false, detail: `rollout for thread ${threadId} not found under ${sessions}` };
-  }
-
-  async launchHarness(
-    binding: PodBinding,
-    opts: { launchId: string; resumeToken?: string; forkSource?: ForkSource },
-  ): Promise<LaunchResult> {
-    if (binding.permissionMode) {
-      return {
-        ok: false,
-        error: `codex runtime: permissionMode "${binding.permissionMode}" is rejected — codex permission axes live in the pod config.toml (approval_policy/sandbox_mode)`,
-      };
-    }
-    const mode: 'fresh' | 'resume' | 'fork' = opts.forkSource ? 'fork' : opts.resumeToken ? 'resume' : 'fresh';
-    const token = mode === 'fresh' ? undefined : (mode === 'resume' ? opts.resumeToken : opts.forkSource!.value);
-    if (mode !== 'fresh') {
-      const v = validateCodexSessionToken(token);
-      if (!v.ok) return { ok: false, error: `codex: ${v.error}`, recovery: 'attention_required' };
-    }
-    // C6 probe: the thread's rollout must exist before we commit to resuming/forking it.
-    if (mode !== 'fresh' && token) {
-      const seat0 = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);
-      const probe = this.probeSession({ ...binding, seatRoot: seat0 }, token);
-      if (!probe.ok) return { ok: false, error: `resume: ${probe.detail}`, recovery: 'attention_required' };
-    }
-
-    const seat = binding.seatRoot ?? path.join(this.env.home, 'pods', binding.role);
-    const paths = seatPaths(this.env.home, binding.role);
-    // Pending record (launchId-scoped) BEFORE the launch: a dead bridge is
-    // distinguishable from a missing one.
-    fs.mkdirSync(path.dirname(paths.runnerStatePath), { recursive: true });
-    fs.writeFileSync(paths.runnerStatePath, JSON.stringify(buildPendingState(opts.launchId, new Date().toISOString()), null, 2));
-
-    const cmd = buildCodexBridgeCommand({
-      bridgePath: this.env.codexBridgePath ?? path.join(import.meta.dirname, 'codex-bridge.js'),
-      stateRoot: this.env.home,
-      role: binding.role,
-      cwd: binding.cwd,
-      launchId: opts.launchId,
-      command: this.m.command,
-      shimPort: codexShimPort(),
-      model: binding.model,
-      resumeThread: mode === 'resume' ? token : undefined,
-      forkRef: mode === 'fork' ? token : undefined,
-      keyEnv: { ...binding.extraEnv, FLOCK_VLLM_KEY: process.env.FLOCK_CODEX_KEY ?? 'sk-dummy' },
-      // C10: raw child args/env from the manifest (form a)
-      childArgs: binding.child?.args,
-      childEnv: binding.child?.env,
-    });
-    // PERSISTENT PANE (same invariant as pi): typed-stop the old foreground,
-    // launch into the same window; on failure keep the window.
-    const target = terminal.winTarget(binding.role);
-    if (await terminal.windowExists(binding.role)) {
-      await terminal.stopWindowProcess(binding.role);
-      await terminal.sleep(400);
-    }
-    if (!(await terminal.windowExists(binding.role))) {
-      await terminal.spawnPod({ role: binding.role, dir: binding.cwd });
-    }
-    await terminal.launchInWindow(binding.role, cmd, binding.cwd, this.m.env);
-    const ready = await terminal.waitForRunnerReady(this.env.home, binding.role, opts.launchId, 25000);
-    if (!ready.ok) {
-      const evidence = (await terminal.capture(target, 30).catch(() => '')).slice(-800);
-      return {
-        ok: false,
-        error: ready.reason === 'exited'
-          ? `codex bridge exited during launch (code ${ready.code ?? '?'})`
-          : `codex bridge did not report ready in 25s${ready.detail ? ` (${ready.detail})` : ''}`,
-        recovery: 'attention_required',
-        evidence: evidence || undefined,
-      };
-    }
-    const panePid = await terminal.panePid(target).catch(() => null);
-    return {
-      ok: true,
-      mode,
-      target,
-      pid: panePid,
-      sessionId: ready.state.sessionId,
-      resumeToken: mode === 'fresh' ? undefined : token,
-      resumeType: 'codex_thread_id',
-    };
-  }
-
-  // ── the three questions (codex answers with typed signals, pi-shaped) ──
-  // (1) liveness — typed sidecar exit (launchId-scoped) + foreground guard,
-  //     byte-for-byte the pi rule (the bridge IS the pane's foreground).
-  async liveness(binding: PodBinding, run: RunLike): Promise<LivenessResult> {
-    const launchId = runLaunchId(run);
-    const st = terminal.readRunnerState(this.env.home, binding.role);
-    if (launchId && st?.exited && st.launchId === launchId) {
-      const ex = st.exited;
-      return { alive: false, reason: ex.code === 0 && !ex.signal ? 'clean' : `crashed(${ex.signal ? `signal ${ex.signal}` : `code ${ex.code}`})` };
-    }
-    if (launchId && st && st.launchId === launchId && !st.exited) {
-      const fg = await terminal.paneCommand(terminal.winTarget(binding.role)).catch(() => '');
-      if (terminal.SHELL_COMMANDS.has(fg)) {
-        return { alive: false, reason: 'crashed(bridge gone, pane at shell)' };
-      }
-    }
-    return { alive: true };
-  }
-
-  // (2) sendVerified — flockmsg v2 (nonce), raw paste, ack = the sidecar's
-  //     lastPrompt carrying our nonce (the bridge acks at enqueue).
-  async sendVerified(binding: PodBinding, text: string): Promise<SendVerifiedResult> {
-    const nonce = newNonce();
-    const wire = frameMessage(text, nonce);
-    const res = await terminal.send(terminal.winTarget(binding.role), wire, { raw: true });
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      const st = terminal.readRunnerState(this.env.home, binding.role);
-      if (st?.lastPrompt?.nonce === nonce) {
-        return { ok: true, attempts: res.attempts, ack: 'sidecar' };
-      }
-      await new Promise((r) => setTimeout(r, 300));
-    }
-    return { ok: false, attempts: res.attempts, detail: 'codex bridge did not ack the message (check the pod pane)' };
-  }
-
-  // (3) healthProbe — sidecar only. codex exec has NO interactive dialogs
-  //     (approval_policy never, sandbox full access): gate is always absent.
-  async healthProbe(binding: PodBinding): Promise<HealthProbe | null> {
-    const state = terminal.readRunnerState(this.env.home, binding.role);
-    if (!state) return { ready: false, busy: false };
-    return {
-      ready: !!state.ready && !state.exited,
-      busy: !!state.streaming,
-      lastActivityAt: state.lastPrompt?.at,
-    };
-  }
-
-  async checkReady(binding: PodBinding): Promise<ReadyResult> {
-    const target = terminal.winTarget(binding.role);
-    const state = terminal.readRunnerState(this.env.home, binding.role);
-    if (state?.exited) return { ready: false, reason: `bridge exited (code ${state.exited.code ?? '?'})`, code: 'runner_exited' };
-    const cmd = await terminal.paneCommand(target).catch(() => '');
-    const atShell = terminal.SHELL_COMMANDS.has(cmd);
-    if (state?.ready) {
-      if (atShell) return { ready: false, reason: 'stale: pane is at the shell', code: 'stale_ready' };
-      return { ready: true, reason: 'sidecar ready' };
-    }
-    if (!state) {
-      const out = await terminal.capture(target, 80).catch(() => '');
-      if (out.includes(RUNNER_ERROR_MARKER)) return { ready: false, reason: 'bridge error marker in pane', code: 'runner_error' };
-      if (out.includes(RUNNER_EXIT_MARKER)) return { ready: false, reason: 'bridge exit marker in pane', code: 'runner_exited' };
-      if (out.includes(CODEX_BRIDGE_READY_MARKER)) {
-        if (atShell) return { ready: false, reason: 'READY marker is stale scrollback; pane at the shell', code: 'stale_ready' };
-        return { ready: true, reason: 'ready marker (no sidecar)' };
-      }
-    }
-    return { ready: false, reason: 'awaiting runtime', code: 'awaiting_runtime' };
-  }
-}
-
 // T1: pod-level MCP config. Writes <agentDir>/mcp.json when servers are
 // given, REMOVES it otherwise — a relaunch with a manifest that has no mcp
 // must not keep the previous agent's servers.
@@ -1088,12 +575,6 @@ export function writePodMcpConfig(
     // servers), not kill the launch.
     console.warn(`[flock] mcp.json write failed: ${e instanceof Error ? e.message : e}`);
   }
-}
-
-// minimal quoting for the one-line paste (our builders emit [A-Za-z0-9._:@/-]
-// tokens; anything exotic gets JSON-quoted)
-function shellQuote(s: string): string {
-  return /^[A-Za-z0-9._:@/=-]*$/.test(s) ? s : JSON.stringify(s);
 }
 
 // ── Bash runtime (plain window) ─────────────────────────────────────────────
@@ -1163,6 +644,7 @@ export class BashRuntimeAdapter implements RuntimeAdapter {
   }
 }
 
+
 // ── Registry ────────────────────────────────────────────────────────────────
 
 // 'cmd' (raw --cmd window) has no adapter — the caller handles it.
@@ -1170,7 +652,9 @@ export function getAdapter(m: AgentManifest, env: AdapterEnv): RuntimeAdapter | 
   const rt = manifestRuntime(m);
   if (rt === 'pi') return new PiRuntimeAdapter(m, env);
   if (rt === 'bash') return new BashRuntimeAdapter(m, env);
-  if (rt === 'claude') return new ClaudeRuntimeAdapter(m, env);
-  if (rt === 'codex') return new CodexRuntimeAdapter(m, env);
+  // C12b: claude/codex adapters removed — a manifest with a removed runtime
+  // must NOT produce an adapter; the caller fails with "runtime not
+  // supported". The contract (RuntimeAdapter + bridge-protocol) is the
+  // extension point: a new runtime = one adapter, zero core lines.
   return null;
 }

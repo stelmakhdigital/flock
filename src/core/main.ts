@@ -12,8 +12,6 @@ import { notifyPm } from './pm.js';
 import { runRetentionSweep } from './retention.js';
 import { writePodAgentsMd, adapterForPod } from './ops.js';
 import { runEscalationTick } from './escalation.js';
-import { startCodexShim } from './codex-shim.js';
-import { codexShimPort } from './codex-protocol.js';
 import type { RunLike } from './runtime-adapter.js';
 import type { CoreCtx } from './ops.js';
 
@@ -66,7 +64,7 @@ ticks.register('health', 20_000, () => runHealthTick(ctx));
 // runkeeper (5s): the agent process is dead -> mark the run crashed fast.
 // Runtime-agnostic: the ADAPTER answers "is this run's agent alive?" with
 // its own typed signals (pi: launchId-scoped sidecar exit + foreground
-// guard; claude: pane foreground). No per-runtime branches in the core.
+// guard). No per-runtime branches in the core.
 // Adapters without liveness (bash/cmd) degrade to the generic pid check.
 async function checkRunLiveness(): Promise<void> {
   for (const pod of listPods(store)) {
@@ -138,17 +136,6 @@ ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 const pidFile = path.join(FLOCK_HOME, 'core.pid');
 
 const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: FLOCK_PORT }, () => {
-  // codex shim (5.5): in-process OpenAI-responses proxy that merges codex's
-  // developer-role messages into `instructions` (vLLM rejects the role in
-  // input). Only the pod's codex reaches it; local-only, no auth.
-  try {
-    const shim = startCodexShim(codexShimPort(FLOCK_PORT), process.env.FLOCK_CODEX_UPSTREAM ?? 'http://192.168.1.114:8000');
-    console.log(`[core] codex shim listening http://127.0.0.1:${shim.port} (upstream ${process.env.FLOCK_CODEX_UPSTREAM ?? 'http://192.168.1.114:8000'})`);
-  } catch (e) {
-    // shim down is not fatal: pi/claude pods are unaffected; codex spawns
-    // will fail at the first model call (visible in the pod pane)
-    console.warn('[core] codex shim failed to start:', e instanceof Error ? e.message : e);
-  }
   // pod-local unix sockets (visible to the pi sandbox, no network needed);
   // role tags the socket so the operator token arriving on it is scoped to
   // that pod's 'pod'-scope ops (5.3)

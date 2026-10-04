@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveTrust, validateResumeToken, resolveLaunchMode, seatPaths } from './bridge-protocol.js';
-import { mergeManagedBlock, pruneManagedBlocks, PiRuntimeAdapter, ClaudeRuntimeAdapter, getAdapter } from './runtime-adapter.js';
+import { mergeManagedBlock, pruneManagedBlocks, PiRuntimeAdapter, getAdapter } from './runtime-adapter.js';
 
 // ── resolveTrust: posture is authoritative ──
 assert.strictEqual(resolveTrust(undefined, undefined), 'approve'); // flock default
@@ -121,17 +121,11 @@ try {
   assert.strictEqual(typeof pi.liveness, 'function', 'pi answers liveness');
   assert.strictEqual(typeof pi.sendVerified, 'function', 'pi answers sendVerified');
   assert.strictEqual(typeof pi.healthProbe, 'function', 'pi answers healthProbe');
-  const claude = getAdapter({ id: 'c', command: 'claude', runtime: 'claude' }, env)!;
-  assert.strictEqual(claude.runtime, 'claude');
-  assert.strictEqual(typeof claude.liveness, 'function', 'claude answers liveness');
-  assert.strictEqual(typeof claude.sendVerified, 'function', 'claude answers sendVerified');
-  assert.strictEqual(typeof claude.healthProbe, 'function', 'claude answers healthProbe');
-  const codex = getAdapter({ id: 'codex', command: 'codex', runtime: 'codex' }, env)!;
-  assert.strictEqual(codex.runtime, 'codex');
-  assert.strictEqual(typeof codex.liveness, 'function', 'codex answers liveness');
-  assert.strictEqual(typeof codex.sendVerified, 'function', 'codex answers sendVerified');
-  assert.strictEqual(typeof codex.healthProbe, 'function', 'codex answers healthProbe');
-  assert.strictEqual(typeof codex.latestSessionToken, 'function', 'codex answers latestSessionToken (thread id)');
+  // C12b: removed runtimes produce NO adapter (a clean refusal at spawn,
+  // not a crash) — the contract stays the extension point.
+  assert.strictEqual(getAdapter({ id: 'c', command: 'claude', runtime: 'claude' }, env), null, 'claude: no adapter (C12b)');
+  assert.strictEqual(getAdapter({ id: 'x', command: 'codex', runtime: 'codex' }, env), null, 'codex: no adapter (C12b)');
+  assert.strictEqual(getAdapter({ id: 'y', command: 'gemini', runtime: 'gemini' }, env), null, 'unknown runtime: no adapter');
 }
 
 // pi liveness (pure sidecar logic, pane mocked at the shell):
@@ -222,85 +216,6 @@ try {
   p = await adapter.healthProbe!(binding);
   assert.strictEqual(p!.gate?.id, 'd2', 'most recent auto-deny is the gate');
 
-  fs.rmSync(tmp, { recursive: true, force: true });
-}
-
-// codex liveness (pure sidecar logic — the pi rule, bridge foreground):
-// typed exit -> clean / crashed; alive sidecar + pane at shell -> crashed.
-{
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-codex-'));
-  const env = { home: tmp, token: 't', runnerPath: '/x/runner.js' };
-  const { CodexRuntimeAdapter } = await import('./runtime-adapter.js');
-  const adapter = new CodexRuntimeAdapter({ id: 'codex', command: 'codex', runtime: 'codex' }, env);
-  const role = 'cx';
-  const binding = { role, cwd: path.join(tmp, 'pods', role), seatRoot: path.join(tmp, 'pods', role) };
-  const sp = seatPaths(tmp, role);
-  fs.mkdirSync(path.dirname(sp.runnerStatePath), { recursive: true });
-  const run = (launchId: string) => ({ id: 'run1', pid: 1, meta: JSON.stringify([{ ts: '2026-01-01T00:00:00Z', kind: 'created', launchId }]), started_at: '2026-01-01T00:00:00Z' });
-
-  // typed exit code 0 -> clean
-  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', exited: { code: 0, at: 'x' } }));
-  let r = await adapter.liveness!(binding, run('la_1'));
-  assert.deepStrictEqual(r, { alive: false, reason: 'clean' }, 'codex typed exit 0 = clean');
-
-  // typed exit with signal -> crashed
-  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', exited: { code: null, signal: 'SIGKILL', at: 'x' } }));
-  r = await adapter.liveness!(binding, run('la_1'));
-  assert.strictEqual(r.reason, 'crashed(signal SIGKILL)');
-
-  // stale sidecar from another launch -> not this run
-  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_9', updatedAt: 'x', exited: { code: 1, at: 'x' } }));
-  r = await adapter.liveness!(binding, run('la_1'));
-  assert.strictEqual(r.alive, true, 'codex: launchId scoping');
-
-  // no sidecar at all -> alive (generic pid check in core decides)
-  fs.rmSync(sp.runnerStatePath);
-  r = await adapter.liveness!(binding, run('la_1'));
-  assert.strictEqual(r.alive, true);
-
-  // healthProbe: sidecar ready/streaming/lastPrompt only, never a gate
-  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', streaming: true, lastPrompt: { text: 'hi', at: '2026-01-01T00:05:00Z' } }));
-  const p = await adapter.healthProbe!(binding);
-  assert.strictEqual(p!.ready, true);
-  assert.strictEqual(p!.busy, true);
-  assert.strictEqual(p!.lastActivityAt, '2026-01-01T00:05:00Z');
-  assert.strictEqual(p!.gate, undefined, 'codex has no interactive dialogs (approval never)');
-
-  // latestSessionToken: the sidecar's sessionId (the codex thread)
-  fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', sessionId: '01a1059d-5279-77b1-a79f-991941e01774' }));
-  assert.strictEqual(await adapter.latestSessionToken!(binding), '01a1059d-5279-77b1-a79f-991941e01774');
-  fs.rmSync(sp.runnerStatePath);
-  assert.strictEqual(await adapter.latestSessionToken!(binding), null, 'no sidecar -> no token (fresh relaunch)');
-
-  // project(): config.toml lands in the pod CODEX_HOME, shim-pointing
-  adapter.project({ ...binding, model: 'qwen3.8-27b-fp8' });
-  const cfg = fs.readFileSync(path.join(binding.seatRoot!, '.codex', 'config.toml'), 'utf8');
-  assert.ok(cfg.includes('model = "qwen3.8-27b-fp8"'));
-  assert.ok(cfg.includes('base_url = "http://127.0.0.1:'), 'provider points at the in-core shim');
-  assert.ok(cfg.includes('/v1'), 'responses endpoint');
-
-  fs.rmSync(tmp, { recursive: true, force: true });
-}
-
-// claude healthProbe (pure: a fake transcript file for the mtime; the pane
-// capture misses -> empty text = not ready, no gate)
-{
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-adapt3-'));
-  const env = { home: tmp, token: 't', runnerPath: '/x/runner.js' };
-  const adapter = new ClaudeRuntimeAdapter({ id: 'c', command: 'claude', runtime: 'claude' }, env);
-  const role = 'cp';
-  const seatRoot = path.join(tmp, 'pods', role);
-  const binding = { role, cwd: seatRoot, seatRoot };
-  const { claudeProjectsDir, claudeConfigDir } = await import('./claude-protocol.js');
-  const pdir = claudeProjectsDir(claudeConfigDir(seatRoot), seatRoot);
-  fs.mkdirSync(pdir, { recursive: true });
-  const tok = '11111111-2222-4333-8444-555555555555';
-  fs.writeFileSync(path.join(pdir, `${tok}.jsonl`), '{}\n');
-  const p = await adapter.healthProbe!(binding);
-  assert.ok(p, 'claude probe returns');
-  assert.strictEqual(p!.ready, false, 'no pane text -> not ready (capture miss)');
-  assert.strictEqual(p!.gate, undefined, 'no pane text -> no gate');
-  assert.ok(p!.lastActivityAt, 'lastActivityAt = the transcript mtime: ' + p!.lastActivityAt);
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 

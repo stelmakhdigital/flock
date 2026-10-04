@@ -20,18 +20,8 @@ const piManifest = { name: 't', runtime: 'pi', command: 'pi' };
 const adapter = getAdapter(piManifest as never, { home: os.tmpdir(), token: 'x', runnerPath: '/x/runner.js' } as never)!;
 assert.strictEqual(adapter.runtime, 'pi');
 
-// 3) probe helpers: codex rollout lookup (real on-disk shape from 5.5)
-const { codexRolloutForThread } = await import('./codex-protocol.js');
-const home = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-resume-'));
-const sessions = path.join(home, 'sessions');
-const dayDir = path.join(sessions, '2026', '10', '4');
-fs.mkdirSync(dayDir, { recursive: true });
-const thread = '01a105ae-7d32-70b2-81e1-b6407d9d9ec2';
-const rollout = path.join(dayDir, `rollout-2026-10-04T11-51-23-${thread}.jsonl`);
-fs.writeFileSync(rollout, '[]\n');
-assert.strictEqual(codexRolloutForThread(sessions, thread), rollout, 'finds the thread rollout in the date tree');
-assert.strictEqual(codexRolloutForThread(sessions, '00000000-0000-7000-8000-000000000000'), null, 'unknown thread: null');
-assert.strictEqual(codexRolloutForThread(path.join(home, 'missing'), thread), null, 'missing sessions dir: null');
+// 3) C12b: a removed runtime produces NO adapter — the clean-refusal path
+// (codex's rollout-lookup probe helper is gone with the codex adapter)
+assert.strictEqual(getAdapter({ id: 'c', command: 'codex', runtime: 'codex' } as never, { home: os.tmpdir(), token: 'x', runnerPath: '/x/runner.js' } as never), null, 'codex: no adapter');
 
-fs.rmSync(home, { recursive: true, force: true });
 console.log('resume: all checks passed');
