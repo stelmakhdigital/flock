@@ -58,7 +58,7 @@ pm и MCP `tools/call` — все идут через тот же путь. По
 - **Transactional handoff**: `flock task handoff <id> <to-role>` — одна
   транзакция: старая закрывается `handed-off (target)`, successor создаётся у
   получателя. Handoff не теряется. (Кросс-профильный handoff — two-phase,
-  фаза 5 — до релиза.)
+  детали в разделе Fleet ниже.)
 
 ```sh
 ./bin/flock task done <id> finished            # или: blocked|denied|canceled|escalated

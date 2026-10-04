@@ -16,6 +16,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { openStore, getTask, newId, listPendingOutboundHandoffs, getOutboundHandoff, commitOutboundHandoff } from './store.js';
 import { parseAddress, loadFleet, saveFleet, getProfile, fleetFile } from './fleet.js';
 import { createHttp } from './http.js';
+import { runFleetTick } from './fleet-tick.js';
+import { serve } from '@hono/node-server';
 import type { CoreCtx } from './ops.js';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-fleet-'));
@@ -135,5 +137,58 @@ seedTask(homeA, 't_orig', 'dev', 'original work', 'active');
   assert.match(res.error ?? '', /no pod: ghost/);
 }
 
+// --- 7) fleet tick: retry loop over a real HTTP endpoint ----------------------
+// B's /api/ops on an ephemeral port so the tick goes through the same
+// remoteApply path as production (fetch, token, timeout).
+const serverB = await new Promise<ReturnType<typeof serve>>((resolve) => {
+  const s = serve({ fetch: appB.fetch, port: 0 }, () => resolve(s));
+});
+const portB = (serverB.address() as { port: number }).port;
+const HANDOFF_MAX = Number(process.env.FLOCK_FLEET_HANDOFF_MAX_ATTEMPTS ?? 10);
+
+function seedOutbound(home: string, id: string, title: string, attempts = 0) {
+  const raw = new DatabaseSync(path.join(home, 'flock.db'));
+  raw.prepare("INSERT INTO outbound_handoffs(id, at, from_role, to_profile, to_role, title, body, priority, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(id, new Date().toISOString(), 'dev', 'b', 'dev', title, null, 50, attempts);
+  raw.close();
+}
+
+{
+  // dead remote: attempt counted, row stays 'pending', last_error is honest
+  const h1 = newId('t');
+  seedOutbound(homeA, h1, 'tick handoff');
+  saveFleet(homeA, { profiles: [{ name: 'b', url: 'http://127.0.0.1:1' }] });
+  await runFleetTick(ctxA);
+  let row = getOutboundHandoff(openStore(homeA), h1);
+  assert.strictEqual(row?.status, 'pending');
+  assert.strictEqual(row?.attempts, 1);
+  assert.ok(row?.last_error, 'last_error not recorded on failed attempt');
+
+  // live remote: the next tick commits (phase 2 = idempotent accept)
+  saveFleet(homeA, { profiles: [{ name: 'b', url: `http://127.0.0.1:${portB}`, token: tokenB }] });
+  await runFleetTick(ctxA);
+  row = getOutboundHandoff(openStore(homeA), h1);
+  assert.strictEqual(row?.status, 'committed');
+  const rawB = new DatabaseSync(path.join(homeB, 'flock.db'));
+  const n = (rawB.prepare('SELECT COUNT(*) AS c FROM tasks WHERE id = ?').get(h1) as { c: number }).c;
+  rawB.close();
+  assert.strictEqual(n, 1, 'remote successor missing or duplicated');
+}
+{
+  // budget exhausted: 'attention_required' + escalation (visible, honest)
+  const h2 = newId('t');
+  seedOutbound(homeA, h2, 'stalled handoff', HANDOFF_MAX - 1);
+  saveFleet(homeA, { profiles: [{ name: 'b', url: 'http://127.0.0.1:1' }] });
+  await runFleetTick(ctxA);
+  const row = getOutboundHandoff(openStore(homeA), h2);
+  assert.strictEqual(row?.status, 'attention_required');
+  assert.strictEqual(row?.attempts, HANDOFF_MAX);
+  const rawA = new DatabaseSync(path.join(homeA, 'flock.db'));
+  const esc = rawA.prepare('SELECT * FROM escalations WHERE key = ?').get(`fleet_handoff:${h2}`) as { state: string } | undefined;
+  rawA.close();
+  assert.ok(esc, 'escalation row missing for a stalled handoff');
+}
+
+serverB.close();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('fleet.test.js: all checks passed');
