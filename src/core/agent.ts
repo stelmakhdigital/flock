@@ -77,6 +77,12 @@ export interface AgentManifest {
   systemPrompt?: string; // replace default pi system prompt
   appendSystemPrompt?: string[]; // append text/file contents (repeatable flag)
   noContextFiles?: boolean; // skip AGENTS.md/CLAUDE.md discovery
+  // C10: UNIFIED child-args (form a). RAW passthrough into the child
+  // process's argv/env — the bridge is dumb about it (appends args last,
+  // merges env). Runtime-agnostic: pi, codex, any bridge runtime. The
+  // mapped axes above (thinking/tools/...) stay the manifest DICTIONARY;
+  // the flag mapping lives in the runtime implementation (pi-bridge).
+  child?: { args?: string[]; env?: Record<string, string> };
 }
 
 import { PM_PROTOCOL } from './pm-protocol.js';

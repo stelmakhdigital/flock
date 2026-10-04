@@ -225,6 +225,10 @@ export interface CodexBridgeArgs {
   resumeThread?: string; // thread id to continue (honest resume)
   forkRef?: string; // thread id to fork (new thread, parent context)
   keyEnv?: Record<string, string>; // extra env for the codex child (K=V)
+  // C10: raw child args/env from the manifest `child` field (form a) —
+  // appended to the codex argv (before the prompt), merged into the env.
+  childArgs?: string[];
+  childEnv?: Record<string, string>;
 }
 
 export const CODEX_BRIDGE_READY_MARKER = '[flock-codex] READY';
@@ -245,7 +249,9 @@ export function buildCodexBridgeCommand(o: CodexBridgeArgs): string {
   if (o.model) parts.push('--model', q(o.model));
   if (o.resumeThread) parts.push('--resume-thread', q(o.resumeThread));
   if (o.forkRef) parts.push('--fork-ref', q(o.forkRef));
+  if (o.childArgs?.length) parts.push('--child-args', q(JSON.stringify(o.childArgs)));
   for (const [k, v] of Object.entries(o.keyEnv ?? {})) parts.push('--env', q(k), q(v));
+  if (o.childEnv) parts.push('--child-env', q(JSON.stringify(o.childEnv)));
   return parts.join(' ');
 }
 

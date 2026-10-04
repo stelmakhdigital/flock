@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
-import { seatPaths } from './runner-protocol.js';
+import { seatPaths } from './bridge-protocol.js';
 
 const env = (k: string, dflt: number): number => {
   const v = Number(process.env[k]);

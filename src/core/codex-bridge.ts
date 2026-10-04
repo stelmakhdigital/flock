@@ -25,7 +25,7 @@ import {
   RUNNER_ERROR_MARKER,
   RUNNER_EXIT_MARKER,
   type RunnerState,
-} from './runner-protocol.js';
+} from './bridge-protocol.js';
 import {
   CODEX_BRIDGE_READY_MARKER,
   buildCodexChildEnv,
@@ -45,6 +45,9 @@ interface Args {
   resumeThread?: string;
   forkRef?: string;
   keyEnv: Record<string, string>;
+  // C10: raw child args/env (manifest `child` field)
+  childArgs: string[];
+  childEnv: Record<string, string>;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -65,6 +68,26 @@ function parseArgs(argv: string[]): Args {
     keyEnv: Object.fromEntries(
       argv.flatMap((a, i) => (a === '--env' ? [[argv[i + 1], argv[i + 2]] as [string, string]] : [])),
     ) as Record<string, string>,
+    childArgs: (() => {
+      const raw = get('--child-args');
+      try {
+        const v = raw ? JSON.parse(raw) : [];
+        return Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : [];
+      } catch {
+        return [];
+      }
+    })(),
+    childEnv: (() => {
+      const raw = get('--child-env');
+      try {
+        const v = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+        const out: Record<string, string> = {};
+        for (const [k, val] of Object.entries(v ?? {})) if (typeof val === 'string') out[k] = val;
+        return out;
+      } catch {
+        return {};
+      }
+    })(),
   };
   if (!args.stateRoot || !args.role || !args.launchId || !args.shimPort) {
     throw new Error('missing required args: --state-root --role --launch-id --shim-port');
@@ -204,13 +227,15 @@ export class CodexBridgeCore {
       });
     }
     if (this.threadId) args.push('resume', this.threadId);
+    // C10: raw manifest child args ride before the prompt separator
+    args.push(...this.args.childArgs);
     args.push('--', text);
     return this.spawnTurn(args, (ev) => this.onEvent(ev));
   }
 
   private spawnTurn(args: string[], onEvent: (ev: ReturnType<typeof parseCodexEvent>) => void): Promise<void> {
     return new Promise((resolve) => {
-      const env = buildCodexChildEnv(process.env, { codexHome: codexHome(this.paths().seatRoot), keyEnv: this.args.keyEnv });
+      const env = buildCodexChildEnv(process.env, { codexHome: codexHome(this.paths().seatRoot), keyEnv: { ...this.args.keyEnv, ...this.args.childEnv } });
       let child: ChildProcess;
       try {
         child = spawn(this.args.command, args, {

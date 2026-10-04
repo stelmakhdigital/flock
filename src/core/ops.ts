@@ -5,7 +5,7 @@ import { parseTeamYaml, TeamParseError } from './team.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest } from './agent.js';
 import { startPodSocket, stopPodSocket } from './http.js';
-import { seatPaths, validateResumeToken } from './runner-protocol.js';
+import { seatPaths, validateResumeToken } from './bridge-protocol.js';
 import { claudeConfigDir, claudeProjectsDir, validateClaudeSessionToken, latestClaudeSession } from './claude-protocol.js';
 import { validateCodexSessionToken } from './codex-protocol.js';
 import { getAdapter, mergeManagedBlock, pruneManagedBlocks, type PodBinding, type RuntimeAdapter, type StartupFile } from './runtime-adapter.js';
@@ -120,7 +120,6 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   esc_ls: { group: 'team', scopes: ['operator', 'pod'], summary: '5.4c durable escalations (ladder audit)', run: (o, c) => { const activeOnly = o.active === true || o.active === 'true'; return store.listEscalations(c.store, activeOnly); } },
   esc_ack: { group: 'team', scopes: ['operator'], summary: '5.4c acknowledge an escalation (stops operator reminders)', run: (o, c) => { const id = o.id as string | undefined; if (!id) throw new Error('id required'); const row = store.getEscalation(c.store, id); if (!row) throw new Error('escalation not found'); if (!store.ESC_ACTIVE_STATES.includes(row.state as (typeof store.ESC_ACTIVE_STATES)[number]) && row.state !== 'pm_notified') throw new Error(`escalation is ${row.state}`); store.setEscalationState(c.store, id, 'acknowledged', { resolvedReason: 'operator ack' }); c.emit?.({ type: 'escalation_resolved', id, key: row.key, reason: 'operator ack' }); return { ok: true, id, state: 'acknowledged' }; } },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
-  pod_answer: { group: 'pod', scopes: ['operator'], summary: 'answer a pending dialog (gate) in a pod', run: (o, c) => podAnswer(o, c) },
   pod_capture: { group: 'pod', scopes: ['operator'], summary: 'capture pod pane text', run: (o, c) => podCapture(o, c) },
   pod_close: { group: 'pod', scopes: ['operator', 'pod'], summary: 'close a pod (kill window, state=closed)', run: (o, c) => podClose(o, c) },
   // -- watchdog --------------------------------------------------------------
@@ -207,6 +206,9 @@ async function spawnAgent(ctx: CoreCtx, o: {
     if (!adapter) throw new OpError(400, `agent ${agentId}: no runtime adapter (manifest needs a supported "runtime")`);
 
     const childEnv: Record<string, string> = { ...(manifest.env ?? {}) };
+    // C10: the raw manifest `child` env rides through the unified --child-args
+    // channel (form a) — merged over the flock-managed vars in the bridge
+    if (manifest.child?.env) Object.assign(childEnv, manifest.child.env);
     if (adapter.runtime === 'pi' && !model) model = firstUserModel();
     if ((adapter.runtime === 'claude' || adapter.runtime === 'codex') && !model) {
       // pi config uses provider/model syntax; claude/codex want the bare model id
@@ -225,6 +227,8 @@ async function spawnAgent(ctx: CoreCtx, o: {
       // T1: first-class pi axes from the resolved manifest (pi runtime only —
       // other adapters ignore the block)
       pi: adapter.runtime === 'pi' ? piAxesFromManifest(manifest) : undefined,
+      // C10: raw child args/env from the manifest (any bridge runtime)
+      child: manifest.child?.args?.length || manifest.child?.env ? manifest.child : undefined,
     };
     // listInstalled: a clear spawn error instead of a dead window.
     const installed = await adapter.listInstalled(binding);
@@ -347,7 +351,7 @@ async function podSpawn(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkn
 // pod. pi (v3.1): HONEST resume — the exact persisted session file is
 // relaunched (--session <file>), never an interactive picker; a missing file
 // is attention_required (recorded in the run meta, never silent; C6). bash: fresh window.
-const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'runner.js'), codexBridgePath: path.join(import.meta.dirname, 'codex-bridge.js') });
+const adapterEnv = (ctx: CoreCtx) => ({ home: ctx.store.home, token: ctx.store.token, runnerPath: path.join(import.meta.dirname, 'pi-bridge.js'), codexBridgePath: path.join(import.meta.dirname, 'codex-bridge.js') });
 
 // Resolve the adapter for a stored pod (manifest -> runtime -> adapter) and
 // the minimal binding the signal-contract methods need (role/cwd/seatRoot).
@@ -525,22 +529,6 @@ async function podSend(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
 // Answer a pending extension dialog (permission gate) in a pi pod.
 // The pane is a text mirror — the operator's answer travels as a `/answer`
 // line the runner translates into an extension_ui_response for the pending
-// dialog (stage 4.1). Delivery is fire-and-log: the dialog either resolves
-// (activity ext_dialog_answered) or the runner explains why not (pane line).
-async function podAnswer(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
-  const role = requireRole(op);
-  const arg = String(op.arg ?? '1').trim();
-  if (!arg) throw new OpError(400, 'arg required (option number or value)');
-  const pod = requireLivePod(ctx, role);
-  if (podRuntime(pod.agent) !== 'pi') throw new OpError(400, `pod_answer is for pi-runtime pods (this is: ${podRuntime(pod.agent)})`);
-  const res = await terminal.send(pod.terminal_target!, `/answer ${arg}`, { raw: true });
-  const run = store.currentRun(ctx.store, role);
-  if (run && !run.ended_at) {
-    store.appendRunMeta(ctx.store, run.id, { kind: 'dialog_answer', arg: arg.slice(0, 200), attempts: res.attempts });
-  }
-  ctx.emit?.({ type: 'pod_dialog_answered', role, arg: arg.slice(0, 200) });
-  return { ok: true, attempts: res.attempts };
-}
 
 async function podCapture(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const role = requireRole(op);

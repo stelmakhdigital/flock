@@ -1,7 +1,7 @@
 import path from 'node:path';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
-import { frameMessage, newNonce } from "./runner-protocol.js";
+import { frameMessage, newNonce } from "./bridge-protocol.js";
 import { advanceWorkflow, podRelaunch, type CoreCtx } from './ops.js';
 import { notifyPm } from './pm.js';
 import { podRuntime } from './agent.js';

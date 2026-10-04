@@ -4,7 +4,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveTrust, validateResumeToken, resolveLaunchMode, seatPaths } from './runner-protocol.js';
+import { resolveTrust, validateResumeToken, resolveLaunchMode, seatPaths } from './bridge-protocol.js';
 import { mergeManagedBlock, pruneManagedBlocks, PiRuntimeAdapter, ClaudeRuntimeAdapter, getAdapter } from './runtime-adapter.js';
 
 // ── resolveTrust: posture is authoritative ──
@@ -207,19 +207,20 @@ try {
   let p = await adapter.healthProbe!(binding);
   assert.deepStrictEqual(p, { ready: false, busy: false, gate: undefined }, 'missing sidecar = not ready');
 
-  // sidecar ready + open dialog in the activity -> gate (channel answer, at preserved)
+  // sidecar ready + auto-denied dialog in the activity -> gate (channel
+  // attach: C10 — the operator answer channel is gone, the lever is the pane)
   fs.writeFileSync(sp.runnerStatePath, JSON.stringify({ ready: true, launchId: 'la_1', updatedAt: 'x', streaming: true, lastPrompt: { text: 'hi', at: '2026-01-01T00:05:00Z' } }));
-  fs.writeFileSync(sp.activityPath, JSON.stringify({ at: '2026-01-01T00:06:00Z', event: 'ext_dialog_unanswered', id: 'd1', method: 'select', title: 'pick one' }) + '\n');
+  fs.writeFileSync(sp.activityPath, JSON.stringify({ at: '2026-01-01T00:06:00Z', event: 'ext_dialog_auto_denied', id: 'd1', method: 'select', title: 'pick one' }) + '\n');
   p = await adapter.healthProbe!(binding);
   assert.strictEqual(p!.ready, true, 'ready from the sidecar');
   assert.strictEqual(p!.busy, true, 'busy = streaming');
   assert.strictEqual(p!.lastActivityAt, '2026-01-01T00:05:00Z', 'lastActivityAt = lastPrompt.at');
-  assert.deepStrictEqual(p!.gate, { id: 'd1', title: 'pick one', channel: 'answer', at: '2026-01-01T00:06:00.000Z' }, 'gate from activity, channel answer (at round-tripped via ISO)');
+  assert.deepStrictEqual(p!.gate, { id: 'd1', title: 'pick one', channel: 'attach', at: '2026-01-01T00:06:00.000Z' }, 'gate from activity, channel attach (at round-tripped via ISO)');
 
-  // the dialog gets answered -> no gate
-  fs.appendFileSync(sp.activityPath, JSON.stringify({ at: '2026-01-01T00:07:00Z', event: 'ext_dialog_answered', id: 'd1', via: 'operator' }) + '\n');
+  // a newer auto-deny is the gate the probe reports (most recent wins)
+  fs.appendFileSync(sp.activityPath, JSON.stringify({ at: '2026-01-01T00:07:00Z', event: 'ext_dialog_auto_denied', id: 'd2', method: 'confirm', title: 'another' }) + '\n');
   p = await adapter.healthProbe!(binding);
-  assert.strictEqual(p!.gate, undefined, 'answered dialog is not a gate');
+  assert.strictEqual(p!.gate?.id, 'd2', 'most recent auto-deny is the gate');
 
   fs.rmSync(tmp, { recursive: true, force: true });
 }

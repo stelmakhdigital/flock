@@ -17,16 +17,14 @@ import {
   parseRunnerState,
   buildPiChildEnv,
   buildPiChildArgs,
-  parsePiConfig,
+  parseChildArgs,
   unframeMessage,
   RUNNER_READY_MARKER,
   RUNNER_EXIT_MARKER,
   RUNNER_ERROR_MARKER,
-  parseAnswerLine,
-  dialogResponse,
   type RunnerState,
-  type PendingDialog,
-} from './runner-protocol.js';
+  strictestOption,
+} from './bridge-protocol.js';
 
 interface ParsedArgs {
   stateRoot: string;
@@ -40,7 +38,7 @@ interface ParsedArgs {
   trustOption: string;
   trustLevel: string;
   extraEnv: Record<string, string>;
-  piConfig: ReturnType<typeof parsePiConfig>;
+  childArgs: ReturnType<typeof parseChildArgs>;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -62,8 +60,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     extraEnv: Object.fromEntries(
       argv.flatMap((a, i) => (a === '--env' ? [[argv[i + 1], argv[i + 2]] as [string, string]] : [])),
     ) as Record<string, string>,
-    // T1: first-class pi config axes arrive in ONE JSON flag
-    piConfig: parsePiConfig(get('--pi-config')),
+    // C10: raw child args/env + mapped pi axes arrive in ONE JSON flag
+    childArgs: parseChildArgs(get('--child-args')),
   };
   if (!args.stateRoot || !args.role || !args.launchId) {
     throw new Error('missing required args: --state-root --role --launch-id');
@@ -103,8 +101,6 @@ export class RunnerCore {
   // extension dialogs waiting for a client response (select/confirm/input/editor).
   // pi has no timeout — these block the agent forever until answered (/answer)
   // or the runner dies. Cap: newest 10.
-  private pendingDialogs: PendingDialog[] = [];
-  private dialogCounter = 0;
 
   constructor(io: RunnerIO, paths: ReturnType<typeof seatPaths>, launchId: string, trustOption = 'untrusted') {
     this.io = io;
@@ -294,49 +290,16 @@ export class RunnerCore {
       this.io.appendActivity({ event: 'ext_dialog_answered', id, via: 'auto_trust' });
       return;
     }
-    // unanswered: track + mirror with an answer index
-    this.dialogCounter += 1;
-    const dialog: PendingDialog = {
-      id,
-      index: this.dialogCounter,
-      method: method as PendingDialog['method'],
-      title,
-      ...(options.length ? { options } : {}),
-      at: this.io.now(),
-    };
-    this.pendingDialogs.push(dialog);
-    if (this.pendingDialogs.length > 10) this.pendingDialogs.shift();
-    const optsHint = options.length ? ` [${options.map((o, i) => `${i + 1}) ${o}`).join(' | ')}]` : '';
-    this.io.mirrorLine(`[ext] ? [${dialog.index}] ${title.slice(0, 140)}${optsHint} — ответ: /answer <n|текст>`);
-    this.io.appendActivity({ event: 'ext_dialog_unanswered', id, index: dialog.index, method, title: title.slice(0, 200) });
-  }
-
-  /**
-   * Operator answer for a pending dialog: `/answer 2` | `/answer run` | …
-   * A dialog blocks the agent's turn, so at most one is pending per session;
-   * the target is the newest. For select: n = option number (as mirrored in
-   * the pane) or an option substring; for confirm: 1=yes 2=no or text;
-   * for input/editor: free text.
-   */
-  private handleAnswerLine(block: string): boolean {
-    const arg = parseAnswerLine(block);
-    if (!arg) return false;
-    const open = this.pendingDialogs;
-    if (open.length === 0) {
-      this.io.mirrorLine('[flock-runner] no pending dialog to answer');
-      return true;
-    }
-    const target = open[open.length - 1];
-    const payload = dialogResponse(target, arg);
-    if (!payload) {
-      this.io.mirrorLine(`[flock-runner] no such option for dialog [${target.index}]: ${block}`);
-      return true;
-    }
-    this.io.sendRpc({ type: 'extension_ui_response', id: target.id, ...payload });
-    this.pendingDialogs = this.pendingDialogs.filter((d) => d.id !== target.id);
-    this.io.mirrorLine(`[ext] → dialog [${target.index}] answered by operator: ${JSON.stringify(payload)}`);
-    this.io.appendActivity({ event: 'ext_dialog_answered', id: target.id, via: 'operator', payload });
-    return true;
+    // C10: there is no operator /answer channel anymore — an unanswered
+    // dialog would block the agent's turn FOREVER. The strictest option
+    // (last = the deny path in pi's option ordering) is auto-answered and
+    // the decision is mirrored + logged LOUDLY; the operator's real lever
+    // is attaching to the pane (or fixing the trust config).
+    const chosen = strictestOption(options);
+    if (chosen !== null) this.io.sendRpc({ type: 'extension_ui_response', id, value: chosen });
+    const optsHint = options.length ? ` [${options.map((o) => o).join(' | ')}]` : '';
+    this.io.mirrorLine(`[ext] AUTO-DENIED (no operator channel; attach to the pane) [${method}] ${title.slice(0, 140)}${optsHint}${chosen !== null ? ` → ${chosen}` : ''}`);
+    this.io.appendActivity({ event: 'ext_dialog_auto_denied', id, method, title: title.slice(0, 200), chosen: chosen ?? undefined });
   }
 
   handleUserBlock(rawBlock: string): void {
@@ -345,10 +308,6 @@ export class RunnerCore {
     if (block === '/abort') {
       this.io.sendRpc({ type: 'abort' });
       this.io.mirrorLine('[flock-runner] abort sent');
-      return;
-    }
-    if (block.startsWith('/answer')) {
-      this.handleAnswerLine(block);
       return;
     }
     if (block.startsWith('/followup ')) {
@@ -404,7 +363,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   fs.writeFileSync(paths.runnerStatePath, JSON.stringify(buildPendingState(args.launchId, new Date().toISOString())));
 
   const agentsMd = path.join(args.cwd, 'AGENTS.md');
-  const childArgs = buildPiChildArgs({
+  // C10: raw child.args (manifest `child` field) are appended LAST — they
+  // are the operator's explicit flags and win by position over the mapped
+  // axes; raw child.env is merged over the flock-managed env.
+  const baseArgs = buildPiChildArgs({
     sessionsDir: paths.sessionsDir,
     role: args.role,
     model: args.model,
@@ -413,8 +375,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     forkRef: args.forkRef,
     agentsMdPath: fs.existsSync(agentsMd) ? agentsMd : undefined,
     autoAllow: args.extraEnv['BASH_GUARD_AUTO_ALLOW'] === '1',
-    pi: Object.keys(args.piConfig).length ? args.piConfig : undefined,
+    pi: args.childArgs.pi && Object.keys(args.childArgs.pi).length ? args.childArgs.pi : undefined,
   });
+  const childArgs = [...baseArgs, ...(args.childArgs.args ?? [])];
   // Pre-seed the per-pod sandbox trust store: the project-trust DIALOG in RPC
   // mode kills the session (pi exits after the dialog resolves), so we never
   // let it appear. Per-pod file — the user's shared trust store is untouched.
@@ -426,7 +389,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   } catch {
     /* best-effort: the dialog auto-answer fallback remains */
   }
-  const childEnv = buildPiChildEnv(process.env, { agentDir: paths.agentDir, sessionsDir: paths.sessionsDir, trustFile, extra: args.extraEnv });
+  const childEnv = buildPiChildEnv(process.env, { agentDir: paths.agentDir, sessionsDir: paths.sessionsDir, trustFile, extra: { ...args.extraEnv, ...(args.childArgs.env ?? {}) } });
 
   console.log(`[flock-runner] starting pi --mode rpc (pod ${args.role}, launch ${args.launchId})`);
   console.log(`[flock-runner] input: plain lines; "/abort" cancels; "/followup <text>" queues after the turn`);

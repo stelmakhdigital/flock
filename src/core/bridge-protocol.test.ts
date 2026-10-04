@@ -10,13 +10,12 @@ import {
   buildPiChildEnv,
   buildRunnerCommand,
   parsePiConfig,
+  parseChildArgs,
   buildPiChildArgs,
   buildWindowLaunchCmd,
-  parseAnswerLine,
-  dialogResponse,
   newNonce,
-  type PendingDialog,
-} from './runner-protocol.js';
+  strictestOption,
+} from './bridge-protocol.js';
 
 // frame round-trip (multi-line, unicode)
 const msg = 'Task t_1: заголовок\nстрока 2\nПротокол: flock task done t_1';
@@ -101,37 +100,62 @@ assert.ok(cmd.includes('--launch-id') && cmd.includes('la_1'));
 assert.ok(cmd.includes('--approve'));
 assert.ok(!cmd.includes('--no-approve'));
 
-// T1 REGRESSION: no pi block -> byte-identical command to before T1 (no
-// --pi-config flag at all; a manifest without the new axes launches exactly
-// as it did)
-assert.ok(!cmd.includes('--pi-config'), 'no pi block: no --pi-config flag (regression)');
+// C10: --child-args is the UNIFIED raw passthrough (form a) — appended
+// LAST so the manifest wins over the mapped axes; env merges over the
+// flock-managed vars (see pi-bridge buildPiChildEnv)
+const cmdChild = buildRunnerCommand({
+  runnerPath: '/d/pi-bridge.js',
+  stateRoot: '/h',
+  role: 'raw',
+  cwd: '/d',
+  launchId: 'la_3',
+  trust: 'approve',
+  child: { args: ['--model', 'override/model'], env: { GREETING: 'привет' } },
+});
+assert.ok(cmdChild.includes('--child-args'), 'child-only block serialized');
+const mc = /--child-args '(.*)'(?= |$)/.exec(cmdChild);
+assert.ok(mc, 'child-args flag extractable (child-only)');
+const rtc = parseChildArgs(mc![1].replace(/'\\''/g, "'"));
+assert.deepStrictEqual(rtc.args, ['--model', 'override/model'], 'raw args verbatim');
+assert.deepStrictEqual(rtc.env, { GREETING: 'привет' }, 'raw env verbatim (unicode safe)');
 
-// T1: the pi config block rides in ONE JSON flag and round-trips
+// C10 REGRESSION: no child block -> byte-identical command to before C10
+// (no --child-args flag at all; a manifest without child/axes launches
+// exactly as it did)
+assert.ok(!cmd.includes('--child-args'), 'no child block: no --child-args flag (regression)');
+
+// C10: the child-args block (raw child + mapped pi axes) rides in ONE JSON
+// flag and round-trips
 const piBlock = { thinking: 'xhigh', tools: ['read', 'bash'], excludeTools: ['edit'], skills: ['/s/a', '/s/b'], noExtensions: true, extensions: ['builtin:web'], systemPrompt: 'You are terse.', appendSystemPrompt: ['a.md', 'b.md'], noContextFiles: true };
 const cmdPi = buildRunnerCommand({
-  runnerPath: '/d/runner.js',
+  runnerPath: '/d/pi-bridge.js',
   stateRoot: '/h',
   role: 'dev',
   cwd: '/d',
   launchId: 'la_2',
   trust: 'approve',
+  child: { args: ['--foo', 'bar'], env: { MY_VAR: '1' } },
   pi: piBlock,
 });
-assert.ok(cmdPi.includes('--pi-config'), 'pi block serialized');
+assert.ok(cmdPi.includes('--child-args'), 'child block serialized');
 // the flag is shell-quoted JSON: extract it back and parse it
-const m = /--pi-config '(.*)'(?= |$)/.exec(cmdPi);
-assert.ok(m, 'pi-config flag extractable');
-let rawJson = m![1].replace(/'\\''/g, "'");
-const rt = parsePiConfig(rawJson);
-assert.deepStrictEqual(rt, { ...piBlock, noSkills: undefined }, 'pi config round-trips build -> parse (value-wise)');
-// corrupt flag degrades to empty (pi still launches with defaults)
-assert.deepStrictEqual(parsePiConfig('not-json'), {}, 'corrupt pi-config degrades to {}');
-assert.deepStrictEqual(parsePiConfig(undefined), {}, 'absent pi-config is {}');
-// unknown keys are dropped by the parser (the runner never passes garbage to pi)
-const rt2 = parsePiConfig('{"thinking":"high","bogus":123,"tools":5}');
-assert.strictEqual(rt2.thinking, 'high', 'valid key parsed');
-assert.strictEqual(rt2.tools, undefined, 'bad-typed key dropped (stays undefined)');
-assert.ok(!('bogus' in rt2), 'unknown key not present');
+const m = /--child-args '(.*)'(?= |$)/.exec(cmdPi);
+assert.ok(m, 'child-args flag extractable');
+const rt = parseChildArgs(m![1].replace(/'\\''/g, "'"));
+assert.deepStrictEqual(rt.args, ['--foo', 'bar'], 'raw child args round-trip');
+assert.deepStrictEqual(rt.env, { MY_VAR: '1' }, 'raw child env round-trips');
+assert.strictEqual(rt.pi?.thinking, 'xhigh', 'mapped pi axes round-trip inside child-args');
+// corrupt flag degrades to empty (the child still launches with defaults)
+assert.deepStrictEqual(parseChildArgs('not-json'), {}, 'corrupt child-args degrades to {}');
+assert.deepStrictEqual(parseChildArgs(undefined), {}, 'absent child-args is {}');
+// unknown keys are dropped by the parser (the bridge never passes garbage to the child)
+const rt2 = parseChildArgs('{"args":["a"],"bogus":123,"env":{"K":"v","BAD":5}}');
+assert.deepStrictEqual(rt2.args, ['a'], 'valid args parsed');
+assert.deepStrictEqual(rt2.env, { K: 'v' }, 'bad-typed env entry dropped');
+assert.ok(!('bogus' in (rt2 as object)), 'unknown key not present');
+// parsePiConfig still works standalone (the pi-bridge maps the dictionary)
+const piRt = parsePiConfig(JSON.stringify(piBlock));
+assert.strictEqual(piRt.thinking, 'xhigh');
 
 // T1: pi child args — axes map 1:1 to pi flags (names verified vs pi --help)
 const cargs = buildPiChildArgs({ sessionsDir: '/s', role: 'x', trust: 'approve', pi: piBlock });
@@ -168,28 +192,9 @@ assert.ok(wlc.includes('FLOCK_POD_ROLE="dev"'));
 assert.ok(wlc.includes('PI_CODING_AGENT_DIR="/h/pods/dev/.pi/agent"'));
 assert.ok(wlc.endsWith('node /d/runner.js --x'));
 
-// operator answers for extension dialogs (permission gates)
-assert.deepStrictEqual(parseAnswerLine('/answer'), { kind: 'index', n: 1 });
-assert.deepStrictEqual(parseAnswerLine('/answer 2'), { kind: 'index', n: 2 });
-assert.deepStrictEqual(parseAnswerLine('/answer run'), { kind: 'value', v: 'run' });
-assert.strictEqual(parseAnswerLine('hello'), null);
-assert.strictEqual(parseAnswerLine('/answer2'), null);
-
-const sel: PendingDialog = { id: 'd1', index: 1, method: 'select', title: 't', options: ['Выполнить', 'Отменить'], at: 't' };
-assert.deepStrictEqual(dialogResponse(sel, { kind: 'index', n: 1 }), { value: 'Выполнить' });
-assert.deepStrictEqual(dialogResponse(sel, { kind: 'value', v: 'отменить' }), { value: 'Отменить' });
-// unambiguous substring (option carries "name — description")
-const sel2: PendingDialog = { id: 'd4', index: 4, method: 'select', title: 't', options: ['planner — planning', 'trivial — тестовый субагент', 'worker — implementation'], at: 't' };
-assert.deepStrictEqual(dialogResponse(sel2, { kind: 'value', v: 'trivial' }), { value: 'trivial — тестовый субагент' });
-assert.strictEqual(dialogResponse(sel2, { kind: 'value', v: 'r' }), null); // ambiguous: matches all three
-assert.strictEqual(dialogResponse(sel, { kind: 'index', n: 9 }), null);
-assert.strictEqual(dialogResponse(sel, { kind: 'value', v: 'нет такого' }), null);
-const conf: PendingDialog = { id: 'd2', index: 2, method: 'confirm', title: 't', at: 't' };
-assert.deepStrictEqual(dialogResponse(conf, { kind: 'index', n: 1 }), { confirmed: true });
-assert.deepStrictEqual(dialogResponse(conf, { kind: 'index', n: 2 }), { confirmed: false });
-assert.deepStrictEqual(dialogResponse(conf, { kind: 'value', v: 'yes' }), { confirmed: true });
-assert.deepStrictEqual(dialogResponse(conf, { kind: 'value', v: 'no' }), { confirmed: false });
-const inp: PendingDialog = { id: 'd3', index: 3, method: 'input', title: 't', at: 't' };
-assert.deepStrictEqual(dialogResponse(inp, { kind: 'value', v: 'текст' }), { value: 'текст' });
+// C10: the operator answer channel is GONE — the auto-deny picks the
+// strictest option (last = the deny path in pi's ordering)
+assert.strictEqual(strictestOption(['Allow all', 'Deny']), 'Deny');
+assert.strictEqual(strictestOption([]), null);
 
 console.log('runner-protocol: all checks passed');

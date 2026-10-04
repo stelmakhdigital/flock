@@ -37,7 +37,7 @@ import {
   detectGate,
   type RunnerState,
   type ActivityLine,
-} from './runner-protocol.js';
+} from './bridge-protocol.js';
 import {
   CLAUDE_BOOT_DIALOGS,
   CLAUDE_FIXED_ENV,
@@ -92,6 +92,10 @@ export interface PodBinding {
   extraEnv?: Record<string, string>; // flock-managed env for the harness child
   seatRoot?: string; // canonical pod state dir (home/pods/<role>); != cwd for worktree pods
   trustLevel?: string; // sandbox trust level (overrides manifest; e.g. off for worktree pods)
+  // C10: unified child-args (form a) — RAW passthrough into the child
+  // argv/env, runtime-agnostic (pi/codex bridges). Appended last by the
+  // bridge (explicit flags win by position).
+  child?: { args?: string[]; env?: Record<string, string> };
   // pi first-class config axes (T1): mapped to pi CLI flags by the runner.
   // Ignored by non-pi runtimes.
   pi?: {
@@ -430,6 +434,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       sessionFile: mode.mode === 'resume' ? mode.sessionFile : undefined,
       forkRef: mode.mode === 'fork' ? mode.forkRef : undefined,
       extraEnv: binding.extraEnv ? Object.entries(binding.extraEnv).map(([k, v]) => `${k}=${v}`) : undefined,
+      // C10: raw child args/env (manifest `child`) + mapped pi axes ride
+      // together in the single --child-args JSON flag
+      child: binding.child,
       pi: binding.pi,
     });
     // PERSISTENT PANE: the window outlives the runner.
@@ -526,14 +533,15 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   }
 
   // (3) healthProbe — sidecar (ready/streaming/lastPrompt.at) + the typed
-  //     activity log's open dialog (gate, channel 'answer').
+  //     activity log's auto-denied dialog (gate, channel 'attach': C10 —
+  //     the operator answer channel is gone, the lever is the pane).
   async healthProbe(binding: PodBinding): Promise<HealthProbe | null> {
     const state = terminal.readRunnerState(this.env.home, binding.role);
     const activity = readActivity(this.env.home, binding.role);
     const gateRaw = detectGate(activity);
     const gateAt = gateRaw && typeof gateRaw.at === 'string' ? Date.parse(gateRaw.at) : 0;
     const gate = gateRaw && typeof gateRaw.id === 'string' && Number.isFinite(gateAt)
-      ? { id: gateRaw.id, title: typeof gateRaw.title === 'string' ? gateRaw.title : '(без заголовка)', channel: 'answer' as const, at: new Date(gateAt).toISOString() }
+      ? { id: gateRaw.id, title: typeof gateRaw.title === 'string' ? gateRaw.title : '(без заголовка)', channel: 'attach' as const, at: new Date(gateAt).toISOString() }
       : undefined;
     if (!state) {
       // sidecar missing: nothing typed to report (a dead runner has no
@@ -951,6 +959,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       resumeThread: mode === 'resume' ? token : undefined,
       forkRef: mode === 'fork' ? token : undefined,
       keyEnv: { ...binding.extraEnv, FLOCK_VLLM_KEY: process.env.FLOCK_CODEX_KEY ?? 'sk-dummy' },
+      // C10: raw child args/env from the manifest (form a)
+      childArgs: binding.child?.args,
+      childEnv: binding.child?.env,
     });
     // PERSISTENT PANE (same invariant as pi): typed-stop the old foreground,
     // launch into the same window; on failure keep the window.

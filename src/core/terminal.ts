@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { seatPaths, parseRunnerState, buildWindowLaunchCmd, type RunnerState } from './runner-protocol.js';
+import { seatPaths, parseRunnerState, buildWindowLaunchCmd, type RunnerState } from './bridge-protocol.js';
 
 const execFileP = promisify(execFile);
 

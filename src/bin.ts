@@ -35,7 +35,6 @@ const USAGE = `flock — core CLI
   flock pod resume-token <role> <file|reset>   # зафиксировать сессию для resume (иначе — последняя)
   flock pod status [role]
   flock pod send <role> <text...>
-  flock pod answer <role> <n|текст>   # ответ оператором на dialog (gate) в pi-поде
   flock pod capture <role> [--lines N]
   flock pod close <role>
   flock team up [pods.yaml]              # team-реконсиляция: spawn недостающих, refresh живых
@@ -225,8 +224,6 @@ async function main(): Promise<void> {
         print({ pods, runs: data.runs });
       } else if (action === 'send') {
         print(await api('POST', '/api/ops', { type: 'pod_send', role, text: rest.slice(1).join(' ') }));
-      } else if (action === 'answer') {
-        print(await api('POST', '/api/ops', { type: 'pod_answer', role, arg: rest.slice(1).join(' ') }));
       } else if (action === 'capture') {
         const flags = rest.slice(1);
         print(await api('POST', '/api/ops', { type: 'pod_capture', role, lines: numFlag(flags, '--lines', 200) }));

@@ -6,7 +6,7 @@
 //   gate: an extension dialog (select/confirm/input/editor) is waiting for a
 //         human. pi has no timeout — the agent blocks forever until the
 //         operator answers (`flock pod answer <role> <arg>`). Detection:
-//         ext_dialog_unanswered in activity with no ext_dialog_answered for
+//         ext_dialog_auto_denied in activity for
 //         the same id after it.
 //
 //   idle: the agent is at rest (streaming=false) but a task it claimed is
@@ -62,8 +62,8 @@ export function healthOptsFromEnv(env: NodeJS.ProcessEnv = process.env): HealthO
 // The activity-log protocol (ActivityLine/parseActivity/readActivity/
 // detectGate) lives in runner-protocol.js — the pi healthProbe and the
 // tests share it. Re-exported from here so existing imports keep working.
-export type { ActivityLine } from './runner-protocol.js';
-export { parseActivity, readActivity, detectGate } from './runner-protocol.js';
+export type { ActivityLine } from './bridge-protocol.js';
+export { parseActivity, readActivity, detectGate } from './bridge-protocol.js';
 
 export interface IdleProbe {
   ready: boolean;

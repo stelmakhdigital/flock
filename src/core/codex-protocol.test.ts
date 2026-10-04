@@ -147,6 +147,15 @@ assert.strictEqual(codexHome('/h/pods/dev'), '/h/pods/dev/.codex');
     command: 'codex', shimPort: 7471,
   });
   assert.ok(q.includes("'/it'\\''s/bridge.js'"));
+  // C10: raw child args/env ride in ONE JSON flag (form a, same as pi)
+  const c = buildCodexBridgeCommand({
+    bridgePath: '/b', stateRoot: '/h', role: 'r', cwd: '/c', launchId: 'la_4',
+    command: 'codex', shimPort: 7471,
+    childArgs: ['--sandbox', 'workspace-write'], childEnv: { MY_VAR: '1' },
+  });
+  assert.ok(c.includes('--child-args'), 'child-args serialized');
+  assert.ok(c.includes('--child-env'), 'child-env serialized');
+  assert.ok(c.includes('\"--sandbox\"'), 'raw args verbatim in the JSON');
 }
 
 // ── buildCodexChildEnv: deny-by-default baseline + CODEX_HOME + keys ──

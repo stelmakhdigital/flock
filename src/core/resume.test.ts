@@ -8,7 +8,7 @@ import path from 'node:path';
 
 // 1) the pure decision layer: an invalid token is attention_required (no
 // retry_fresh left in the vocabulary)
-const { resolveLaunchMode } = await import('./runner-protocol.js');
+const { resolveLaunchMode } = await import('./bridge-protocol.js');
 const bad = resolveLaunchMode({ resumeToken: 'nope' });
 assert.strictEqual(bad.mode, 'error');
 assert.strictEqual(bad.recovery, 'attention_required', 'invalid token: attention_required, never retry_fresh');

@@ -151,7 +151,7 @@ export interface PiChildConfig {
 }
 
 export interface RunnerArgs {
-  runnerPath: string; // dist/core/runner.js
+  runnerPath: string; // dist/core/pi-bridge.js
   stateRoot: string; // FLOCK_HOME
   role: string;
   cwd: string;
@@ -163,10 +163,12 @@ export interface RunnerArgs {
   trustOption?: string; // fallback: option substring for an unexpected trust dialog
   trustLevel?: string; // sandbox trust level pre-seeded for the pod dir
   extraEnv?: string[]; // flock-managed env for the pi child (K=V, wins over operator shell)
-  pi?: PiChildConfig; // first-class pi axes (serialized as one --pi-config JSON flag)
+  // C10: raw child passthrough from the manifest `child` field (form a).
+  child?: { args?: string[]; env?: Record<string, string> };
+  pi?: PiChildConfig; // first-class pi axes (dict in manifest -> flags in pi-bridge)
 }
 
-export const RUNNER_PI_CONFIG_FLAG = '--pi-config';
+export const RUNNER_CHILD_ARGS_FLAG = '--child-args';
 
 // The command typed into the pod's tmux pane (shell-quoted).
 export function buildRunnerCommand(o: RunnerArgs): string {
@@ -189,9 +191,14 @@ export function buildRunnerCommand(o: RunnerArgs): string {
     const i = kv.indexOf('=');
     if (i > 0) parts.push('--env', q(kv.slice(0, i)), q(kv.slice(i + 1)));
   }
-  // T1: the whole pi config block in ONE JSON flag — the free-form runner
-  // format grows by exactly one flag, no matter how many axes appear.
-  if (o.pi && Object.keys(o.pi).length > 0) parts.push(RUNNER_PI_CONFIG_FLAG, q(JSON.stringify(o.pi)));
+  // C10: ONE JSON flag carries both the raw child passthrough (manifest
+  // `child`) and the mapped pi axes — the bridge command format grows by
+  // exactly one flag, no matter how many axes appear.
+  const childArgs: Record<string, unknown> = {};
+  if (o.child?.args?.length) childArgs.args = o.child.args;
+  if (o.child?.env && Object.keys(o.child.env).length) childArgs.env = o.child.env;
+  if (o.pi && Object.keys(o.pi).length > 0) childArgs.pi = o.pi;
+  if (Object.keys(childArgs).length > 0) parts.push(RUNNER_CHILD_ARGS_FLAG, q(JSON.stringify(childArgs)));
   return parts.join(' ');
 }
 
@@ -287,6 +294,37 @@ export function buildPiChildArgs(o: PiChildArgs): string[] {
 // The persistent shell pane: the window outlives the runner; each launch is a
 // new foreground process pasted into the pane with env prefix (flock CLI on
 // PATH, instance identity) + the runtime command. One line, JSON-quoted.
+// The --child-args flag: a shell-quoted JSON object {args?, env?, pi?}.
+// parseChildArgs is the inverse — lenient (bad types dropped, corrupt JSON
+// degrades to {} so the child still launches with defaults).
+export function parseChildArgs(raw: string | undefined): {
+  args?: string[];
+  env?: Record<string, string>;
+  pi?: PiChildConfig;
+} {
+  if (!raw) return {};
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (typeof v !== 'object' || v === null) return {};
+  const o = v as Record<string, unknown>;
+  const out: { args?: string[]; env?: Record<string, string>; pi?: PiChildConfig } = {};
+  if (Array.isArray(o.args) && o.args.every((x) => typeof x === 'string')) out.args = o.args as string[];
+  if (typeof o.env === 'object' && o.env !== null) {
+    const env: Record<string, string> = {};
+    for (const [k, val] of Object.entries(o.env as Record<string, unknown>)) if (typeof val === 'string') env[k] = val;
+    if (Object.keys(env).length) out.env = env;
+  }
+  if (typeof o.pi === 'object' && o.pi !== null) {
+    const pi = parsePiConfig(JSON.stringify(o.pi));
+    if (Object.keys(pi).length) out.pi = pi;
+  }
+  return out;
+}
+
 export function buildWindowLaunchCmd(
   cmd: string,
   o: { role: string; dir: string; home: string; port: string; basePath: string; extraEnv?: Record<string, string> },
@@ -385,58 +423,11 @@ export function resolveLaunchMode(opts: { resumeToken?: string; forkSource?: For
 //
 // pi RPC mode: blocking dialogs (select/confirm/input/editor) are emitted as
 // extension_ui_request and wait for the client's extension_ui_response —
-// INDEFINITELY when the extension passes no timeout. The pod pane is a text
-// mirror (no TUI), so the operator answers via a pane line: `/answer <arg>`.
-// `custom` dialogs (bash-guard, ask-user-question) are no-ops in RPC mode and
-// never block (pi resolves them to undefined; extensions default to abort).
-
-export interface PendingDialog {
-  id: string;
-  index: number; // 1-based, per runner lifetime
-  method: 'select' | 'confirm' | 'input' | 'editor';
-  title: string;
-  options?: string[]; // select
-  at: string; // ISO — when the request arrived
-}
-
-export type AnswerArg = { kind: 'index'; n: number } | { kind: 'value'; v: string };
-
-/** Parse an operator answer line: `/answer 2` | `/answer run` | `/answer any text`. */
-export function parseAnswerLine(line: string): AnswerArg | null {
-  const m = line.trim().match(/^\/answer(?:\s+(.*))?$/);
-  if (!m) return null;
-  const rest = (m[1] ?? '').trim();
-  if (!rest) return { kind: 'index', n: 1 }; // bare /answer = first option / yes
-  if (/^\d+$/.test(rest)) return { kind: 'index', n: parseInt(rest, 10) };
-  return { kind: 'value', v: rest };
-}
-
-/**
- * Build the extension_ui_response payload for a pending dialog.
- * pi response shapes (from rpc-mode parseResponse): select/input/editor carry
- * {value} (or {cancelled}), confirm carries {confirmed}. Returns null when the
- * argument does not match (bad index, no such option).
- */
-export function dialogResponse(dialog: PendingDialog, arg: AnswerArg): { value?: string; confirmed?: boolean } | null {
-  if (dialog.method === 'select') {
-    const opts = dialog.options ?? [];
-    if (arg.kind === 'index') {
-      const o = opts[arg.n - 1];
-      return o !== undefined ? { value: o } : null;
-    }
-    const exact = opts.find((x) => x.toLowerCase() === arg.v.toLowerCase());
-    if (exact !== undefined) return { value: exact };
-    // unambiguous substring match (options often carry "name — description")
-    const partial = opts.filter((x) => x.toLowerCase().includes(arg.v.toLowerCase()));
-    return partial.length === 1 ? { value: partial[0] } : null;
-  }
-  if (dialog.method === 'confirm') {
-    if (arg.kind === 'index') return { confirmed: arg.n === 1 };
-    return { confirmed: !/^(no|нет|abort|cancel)$/i.test(arg.v) };
-  }
-  // input / editor: free text (index form = the value of /n/ is the text itself)
-  return { value: arg.kind === 'value' ? arg.v : '' };
-}
+// INDEFINITELY when the extension passes no timeout. C10: there is no
+// operator answer channel — an unanswered dialog would block the agent's
+// turn forever, so the pi-bridge auto-answers with the strictest option
+// (last) and records `ext_dialog_auto_denied` LOUDLY; the operator's lever
+// is attaching to the pane (or fixing the trust config).
 
 // ── Typed activity log (pure) ───────────────────────────────────────────────
 // The pod's durable activity log (seat activityPath): one JSON event per line
@@ -480,21 +471,20 @@ export function readActivity(stateRoot: string, role: string, maxLines = 2000): 
   return parseActivity(raw, maxLines);
 }
 
-// The currently-open dialog gate: any ext_dialog_unanswered without an
-// ext_dialog_answered for the same id after it; the most recent one wins.
+// The strictest option of a dialog: pi orders options with the deny path
+// LAST ("Allow all" first, "Deny" last) — the auto-deny answer (C10).
+export function strictestOption(options: string[]): string | null {
+  return options.length ? options[options.length - 1] : null;
+}
+
+// The current dialog gate: an ext_dialog_auto_denied means the agent's next
+// step depends on an operator decision (the bridge auto-denied to keep the
+// turn alive; the agent may re-ask or proceed without). Most recent wins.
+// (C10: the gate is OBSERVABILITY — the lever is the pane.)
 export function detectGate(activity: ActivityLine[]): ActivityLine | null {
-  const openIdx = new Map<string, number>(); // dialog id -> index of its unanswered event
-  activity.forEach((a, i) => {
-    if (a.event === 'ext_dialog_unanswered' && typeof a.id === 'string') openIdx.set(a.id, i);
-    else if (a.event === 'ext_dialog_answered' && typeof a.id === 'string') openIdx.delete(a.id);
-  });
   let best: ActivityLine | null = null;
-  let bestIdx = -1;
-  for (const [id, idx] of openIdx) {
-    if (idx > bestIdx) {
-      bestIdx = idx;
-      best = activity[idx];
-    }
+  for (const a of activity) {
+    if (a.event === 'ext_dialog_auto_denied' && typeof a.id === 'string') best = a;
   }
   return best;
 }
