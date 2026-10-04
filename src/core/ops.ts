@@ -634,7 +634,6 @@ async function taskAdd(op: Record<string, unknown>, ctx: CoreCtx): Promise<unkno
     title,
     body: op.body ? String(op.body) : null,
     podRole: role,
-    priority: op.priority != null ? Math.max(0, Math.min(10, Math.trunc(Number(op.priority)))) : 0,
   });
   ctx.emit?.({ type: 'task_added', taskId: id, pod: role });
   void pmNotify(ctx, { type: 'task_added', detail: `таск ${id} "${title.slice(0, 80)}" → pod ${role} (очередь)` }).catch(() => {});
@@ -910,10 +909,9 @@ interface WfStep {
   id: string;
   role: string;
   title?: string;
-  // 5.4a: economy/reliability knobs
-  priority?: number; // 0..10, added to the instance priority for the step task
-  timeoutMin?: number; // 1..10080, active-task TTL -> blocked (step timeout)
-  retry?: number; // 0..5, auto re-queue on blocked/cancelled
+  // C7: the scribe model — no priority/retry/TTL knobs on steps. Stuck
+  // detection is the watchdog's job (escalation ladder), retry is an
+  // explicit operator action (task_unblock / relaunch).
   // 5.4d: DAG — ids of steps that must be done before this step starts.
   // Absent/empty = start with the instance (the sequential pipeline is the
   // special case: step N deps on step N-1).
@@ -930,15 +928,6 @@ function parseSteps(raw: unknown): WfStep[] {
     }
     if (ids.has(s.id)) throw new OpError(400, `duplicate step id: ${s.id}`);
     ids.add(s.id);
-    if (s.priority != null && (!Number.isInteger(s.priority) || s.priority < 0 || s.priority > 10)) {
-      throw new OpError(400, `step ${s.id}: priority must be an integer 0..10`);
-    }
-    if (s.timeoutMin != null && (!Number.isInteger(s.timeoutMin) || s.timeoutMin < 1 || s.timeoutMin > 10080)) {
-      throw new OpError(400, `step ${s.id}: timeoutMin must be an integer 1..10080`);
-    }
-    if (s.retry != null && (!Number.isInteger(s.retry) || s.retry < 0 || s.retry > 5)) {
-      throw new OpError(400, `step ${s.id}: retry must be an integer 0..5`);
-    }
     if (s.deps != null && (!Array.isArray(s.deps) || s.deps.some((d) => typeof d !== 'string' || !d))) {
       throw new OpError(400, `step ${s.id}: deps must be an array of step ids`);
     }
@@ -981,7 +970,6 @@ function enqueueStepTask(ctx: CoreCtx, inst: store.WorkflowInstance, wf: store.W
     podRole: step.role,
     workflowInstanceId: inst.id,
     workflowStep: step.id,
-    priority: (inst.priority ?? 0) + (step.priority ?? 0),
   });
 }
 
@@ -1008,7 +996,8 @@ function readySteps(steps: WfStep[], states: Record<string, string>): WfStep[] {
 // A workflow step task finished (done/blocked/cancelled) → move the instance:
 // done → mark the step done, enqueue the newly-ready steps (DAG frontier;
 // the sequential pipeline is the degenerate case), done + nothing left →
-// instance done; blocked/cancelled → retry budget per step, then stop.
+// instance done; blocked/cancelled → the scribe records it and stops the
+// instance (C7: no retry budget; unblock + advance is the operator's move).
 export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
   const task = store.getTask(ctx.store, taskId);
   if (!task || !task.workflow_instance_id) return;
@@ -1043,16 +1032,10 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
     store.setWorkflowInstanceState(ctx.store, inst.id, 'running', ready.map((s) => s.id).join(','));
     ctx.emit?.({ type: 'workflow_step', instanceId: inst.id, step: ready.map((s) => s.id).join(','), role: ready.map((s) => s.role).join(',') });
   } else {
-    // failure (blocked/cancelled): retry budget per step, then stop the instance
-    const attempts = store.wfStepAttempts(ctx.store, inst.id, task.workflow_step!);
-    const retryBudget = steps.find((s) => s.id === task.workflow_step)?.retry ?? 0;
-    if (task.status !== 'cancelled' && attempts < retryBudget) {
-      store.bumpWfStepAttempts(ctx.store, inst.id, task.workflow_step!);
-      store.setWfStepState(ctx.store, inst.id, task.workflow_step!, 'running');
-      enqueueStepTask(ctx, inst, wf, steps.find((s) => s.id === task.workflow_step)!);
-      ctx.emit?.({ type: 'workflow_retry', instanceId: inst.id, step: task.workflow_step, attempt: store.wfStepAttempts(ctx.store, inst.id, task.workflow_step!), reason: task.result ?? task.status });
-      return;
-    }
+    // C7 scribe: the runtime records the failure and stops the instance.
+    // There is no automatic retry budget — a failed step is the operator's
+    // decision (unblock the task and advance again, or cancel). The
+    // escalation ladder (5.4c) watches the blocked instance for the audit.
     store.setWfStepState(ctx.store, inst.id, task.workflow_step!, 'blocked');
     const state = task.status === 'cancelled' ? 'cancelled' : 'blocked';
     store.setWorkflowInstanceState(ctx.store, inst.id, state);
@@ -1060,34 +1043,6 @@ export function advanceWorkflow(ctx: CoreCtx, taskId: string): void {
   }
 }
 
-// 5.4a: step timeout/TTL — an active workflow step task that outlived the
-// step's timeoutMin is blocked (step timeout); advanceWorkflow then applies
-// the retry budget (re-queue) or stops the instance. Plain tasks (no
-// workflow) have no TTL: a long human-in-the-loop task must not be killed.
-export function checkWorkflowTimeouts(ctx: CoreCtx): void {
-  const now = Date.now();
-  for (const task of store.listTasks(ctx.store, 'active')) {
-    if (!task.workflow_instance_id || !task.workflow_step) continue;
-    const inst = store.getWorkflowInstance(ctx.store, task.workflow_instance_id);
-    if (!inst || inst.state !== 'running') continue;
-    const wf = store.getWorkflow(ctx.store, inst.workflow_id);
-    if (!wf) continue;
-    const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
-    const step = steps.find((s) => s.id === task.workflow_step);
-    if (!step?.timeoutMin || !task.claimed_at) continue;
-    const claimed = Date.parse(task.claimed_at);
-    if (Number.isNaN(claimed)) continue;
-    if (now - claimed > step.timeoutMin * 60_000) {
-      try {
-        store.setTaskStatus(ctx.store, task.id, 'blocked', { reason: `step ${step.id} timeout (${step.timeoutMin} min)`, result: `step ${step.id} timeout (${step.timeoutMin} min)` });
-        ctx.emit?.({ type: 'task_blocked', taskId: task.id, pod: task.pod_role, reason: `step ${step.id} timeout` });
-        advanceWorkflow(ctx, task.id);
-      } catch {
-        // already transitioned by a concurrent op; harmless
-      }
-    }
-  }
-}
 
 async function workflowDefine(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
   const name = String(op.name ?? '').trim();
@@ -1106,16 +1061,11 @@ async function workflowStart(op: Record<string, unknown>, ctx: CoreCtx): Promise
   const wf = store.getWorkflow(ctx.store, String(op.name ?? ''));
   if (!wf) throw new OpError(404, `no workflow: ${String(op.name ?? '')}`);
   const steps: WfStep[] = (JSON.parse(wf.spec) as { steps: WfStep[] }).steps;
-  const rawPrio = op.priority;
-  const priority = rawPrio != null ? Math.max(0, Math.min(10, Math.trunc(Number(rawPrio)))) : 0;
-  if (rawPrio != null && (!Number.isInteger(Number(rawPrio)) || Number(rawPrio) < 0 || Number(rawPrio) > 10)) {
-    throw new OpError(400, `priority must be an integer 0..10: ${String(rawPrio)}`);
-  }
   const instId = store.newId('wfi');
-  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null, priority });
+  store.insertWorkflowInstance(ctx.store, { id: instId, workflowId: wf.id, payload: op.payload ? String(op.payload) : null, priority: 0 });
   // 5.4d: start the DAG frontier — every step without deps (a sequential
   // pipeline: only steps[0] is ready at start, as before)
-  const instObj = { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null, priority } as store.WorkflowInstance;
+  const instObj = { id: instId, workflow_id: wf.id, payload: op.payload ? String(op.payload) : null, state: 'running', current_step: steps[0].id, created_at: '', finished_at: null, priority: 0 } as store.WorkflowInstance;
   const frontier = readySteps(steps, {});
   for (const s of frontier) {
     store.setWfStepState(ctx.store, instId, s.id, 'running');

@@ -564,11 +564,14 @@ TUI-маркерам, ack по транскрипту. Маркеры — хру
 бампе версии claude сверяйте маркеры (claude-protocol.ts) с новым TUI —
 hermetic-тест claude-protocol фиксирует текущие ожидания.
 
-Пошаговые "ручки" надёжности в манифесте workflow (JSON через `--steps-json`):
+Шаги workflow (JSON через `--steps-json`). C7 (scribe model): в шагах нет
+ручек priority/retry/timeoutMin — runtime закрывает и записывает, НЕ гейтит;
+stuck-детекция — на watchdog (лестница эскалаций), retry — явный акт оператора
+(`flock task unblock`):
 
 ```json
 [
-  {"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2},
+  {"id":"dev","role":"dev"},
   {"id":"rev","role":"rev","deps":["dev"]}
 ]
 ```
@@ -581,28 +584,17 @@ hermetic-тест claude-protocol фиксирует текущие ожидан
   (арбитер сам распределяет по подам); тело таска получает результаты
   зависимых шагов. Состояние шага — `wf_step_state.state`
   (pending/running/done/blocked), видно в `flock workflow status`.
-  Merge-отложенность S3 в DAG: merge откладывается, пока в инстансе есть
-  другие незавершённые шаги. Задержка: если ready пуст, но есть running —
-  ждём (не deadlock); deadlock (валидацией невозможен) блокирует инстанс.
-  Live: ромб a(pi)→b,c(параллельно)→d закрылся, b и c созданы в одну секунду,
-  d — только после обоих.
-
-- **priority** (0..10): шаг-таск получает `priority = instance + step`; арбитер
-  берёт из очереди **сначала приоритет, потом FIFO**. У `flock task add`
-  тоже `--priority N`, у `flock workflow start` — `--priority N` (базовый
-  уровень инстанса);
-- **timeoutMin** (1..10080): TTL активного step-таска (счёт с `claimed_at`).
-  Превышение → таск `blocked (step timeout)`; plain-таски (не workflow) TTL
-  не имеют — долгий human-in-the-loop не режется;
-- **retry** (0..5): бюджет повторных попыток на blocked/cancelled шаг. Пока
-  бюджет не исчерпан — шаг ре-квизится (новый таск), инстанс `running`;
-  исчерпан → инстанс `blocked` (оператор: `flock task unblock`). Счётчик —
-  `wf_step_state`, виден в `flock workflow status`.
+  Задержка: если ready пуст, но есть running — ждём (не deadlock); deadlock
+  (валидацией невозможен) блокирует инстанс.
+- **Scribe-поведение**: done шага → одна транзакция закрывает шаг и
+  проецирует все шаги, чьи deps теперь satisfied (DAG-фронт). Failed
+  шаг (blocked/cancelled) → сcribe записывает и ставит инстанс в
+  blocked/cancelled; автo-pовторов нет — оператор решает (unblock / cancel).
 
 ```sh
-./bin/flock workflow define pipe --steps-json '[{"id":"dev","role":"dev","timeoutMin":30,"retry":1,"priority":2},{"id":"rev","role":"rev"}]'
-./bin/flock workflow start pipe "фича X" --priority 3
-./bin/flock workflow status <instance_id>   # state + stepState (attempts)
+./bin/flock workflow define pipe --steps-json '[{"id":"dev","role":"dev"},{"id":"rev","role":"rev"}]'
+./bin/flock workflow start pipe "фича X"
+./bin/flock workflow status <instance_id>   # state + stepState
 ./bin/flock workflow rm <name>              # удалить определение (инстансы живут)
 ```
 
