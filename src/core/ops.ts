@@ -67,7 +67,34 @@ export async function apply(op: Record<string, unknown> | null, ctx: CoreCtx): P
     throw new OpError(403, `op ${t} is not available to pod tokens`);
   }
   d.validate?.(o, ctx);
-  return d.run(o, ctx);
+  const result = await d.run(o, ctx);
+  // C5: the append-only event log — one row per successful mutation. The
+  // log is the memory of the system (board / audit / events tail); the
+  // single-writer guarantee (one process) makes this race-free.
+  try {
+    store.insertEvent(ctx.store, {
+      kind: t,
+      actor: ctx.caller?.kind === 'pod' ? `pod:${ctx.caller.role}` : 'core',
+      subject: String(o.id ?? o.role ?? o.name ?? o.to ?? o.file ?? ''),
+      payload: opPayload(o),
+    });
+  } catch {
+    // event log is audit, never blocks the mutation itself
+  }
+  return result;
+}
+
+// A bounded projection of the op into the event payload (long strings
+// trimmed so the log stays readable; secrets never ride ops).
+function opPayload(o: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(o)) {
+    if (k === 'type') continue;
+    if (typeof v === 'string') out[k] = v.length > 300 ? v.slice(0, 300) + '…' : v;
+    else if (v !== null && typeof v === 'object') out[k] = JSON.stringify(v).slice(0, 300);
+    else out[k] = v;
+  }
+  return out;
 }
 
 // Op registry: every op is {group, summary, scopes, validate?, run}.

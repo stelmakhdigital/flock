@@ -622,6 +622,6 @@ node dist/core/pod-scope-check.js
 
 ## Этап 0 (готово)
 
-core: HTTP+WS (Hono, bearer), node:sqlite с миграциями, единый путь мутаций
+core: HTTP+SSE (Hono, bearer), node:sqlite с миграциями, единый путь мутаций
 `apply(op)`, tick-реестр с /healthz-доказательствами, tmux-транспорт
 (paste через load-buffer/paste-buffer), daemonize, рестарт-безопасность.

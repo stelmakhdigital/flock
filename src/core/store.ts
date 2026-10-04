@@ -354,6 +354,23 @@ CREATE TABLE IF NOT EXISTS outboxes(
 CREATE INDEX IF NOT EXISTS outboxes_pending_idx ON outboxes(pending, id);
 `,
   },
+  {
+    // C5: append-only event log — every mutation (ops + ticks) writes one
+    // event; the memory of the system (what happened and when) in one
+    // place. The board (next stage) and `flock events tail` read it.
+    name: '019_events',
+    sql: `
+CREATE TABLE IF NOT EXISTS events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  payload TEXT
+);
+CREATE INDEX IF NOT EXISTS events_at_idx ON events(at);
+`,
+  },
 ];
 
 function migrate(db: DatabaseSync): void {
@@ -785,6 +802,38 @@ export function handoffTask(
     throw e;
   }
   return { from: getTask(store, id)!, to: getTask(store, succId)! };
+}
+
+// ---------- events (C5) ----------
+
+export interface EventRow {
+  id: number;
+  at: string;
+  kind: string;
+  actor: string;
+  subject: string;
+  payload: string | null;
+}
+
+export function insertEvent(
+  store: Store,
+  e: { kind: string; actor: string; subject?: string; payload?: Record<string, unknown> | null },
+): number {
+  const r = dbOf(store)
+    .prepare('INSERT INTO events(at, kind, actor, subject, payload) VALUES (?, ?, ?, ?, ?)')
+    .run(nowIso(), e.kind, e.actor, e.subject ?? '', e.payload ? JSON.stringify(e.payload) : null);
+  return Number(r.lastInsertRowid);
+}
+
+export function listEvents(store: Store, sinceId = 0, limit = 200): EventRow[] {
+  return dbOf(store)
+    .prepare('SELECT id, at, kind, actor, subject, payload FROM events WHERE id > ? ORDER BY id ASC LIMIT ?')
+    .all(sinceId, limit) as unknown as EventRow[];
+}
+
+export function latestEventId(store: Store): number {
+  const r = dbOf(store).prepare('SELECT MAX(id) AS m FROM events').get() as { m: number | null };
+  return Number(r.m ?? 0);
 }
 
 // ---------- inboxes / outboxes (C4) ----------

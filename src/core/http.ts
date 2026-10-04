@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { Server } from 'node:http';
 import { Hono } from 'hono';
 import { createAdaptorServer } from '@hono/node-server';
-import { createNodeWebSocket } from '@hono/node-ws';
+import { streamSSE } from 'hono/streaming';
 import * as store from './store.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, manifestRuntime } from './agent.js';
@@ -30,7 +30,6 @@ declare module 'hono' {
 
 export function createHttp(ctx: CoreCtx) {
   const app = new Hono();
-  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
   app.use('*', async (c, next) => {
     const got = c.req.header('authorization')?.replace(/^Bearer\s+/i, '');
@@ -155,35 +154,54 @@ export function createHttp(ctx: CoreCtx) {
     }
   });
 
-  // bus -> websocket broadcast (UI will plug in at stage 5)
-  const clients = new Set<unknown>();
+  // C5: bus -> SSE broadcast. The event log (store) is the durable record;
+  // this live set is only the push channel for `flock events tail` / the
+  // board. Replaces the old WS feed (no in-tree consumers; @hono/node-ws
+  // dropped with it).
+  const live = new Set<(e: Record<string, unknown>) => void>();
   const emit = (e: Record<string, unknown>) => {
-    const s = JSON.stringify(e);
-    for (const ws of clients) {
+    for (const h of live) {
       try {
-        const w = ws as { readyState: number; send: (s: string) => void };
-        if (w.readyState === 1) w.send(s);
+        h(e);
       } catch {
-        // dead client, closed by onClose
+        // dead subscriber (stream already closed) — it removes itself on
+        // abort; never let one bad subscriber kill the bus
       }
     }
   };
 
   app.get(
     '/events',
-    upgradeWebSocket(() => ({
-      onOpen: (_evt: unknown, ws: unknown) => {
-        clients.add(ws);
-      },
-      onMessage: (_evt: unknown, _ws: unknown) => {},
-      onClose: (_evt: unknown, ws: unknown) => {
-        clients.delete(ws);
-      },
-    })),
-    (c: any) => c.body(null),
+    (c) =>
+      streamSSE(c, async (stream) => {
+        const since = Math.max(0, Number(c.req.query('since') ?? 0) | 0);
+        // backlog first (durable log), then live push
+        for (const ev of store.listEvents(ctx.store, since, 1000)) {
+          await stream.writeSSE({
+            id: String(ev.id),
+            event: ev.kind,
+            data: JSON.stringify({ at: ev.at, actor: ev.actor, subject: ev.subject, payload: ev.payload ? JSON.parse(ev.payload) : null }),
+          });
+        }
+        const off = (e: Record<string, unknown>) => {
+          void stream.writeSSE({
+            event: String(e.type ?? 'event'),
+            data: JSON.stringify(e),
+          }).catch(() => live.delete(off));
+        };
+        live.add(off);
+        const onAbort = () => live.delete(off);
+        c.req.raw.signal.addEventListener('abort', onAbort, { once: true });
+        // hold the stream open until the client disconnects
+        await new Promise<void>((resolve) => {
+          if (c.req.raw.signal.aborted) return resolve();
+          c.req.raw.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        live.delete(off);
+      }),
   );
 
-  return { app, injectWebSocket, emit };
+  return { app, emit };
 }
 
 // Per-pod unix socket: <pod dir>/core.sock. The pod dir is the workspace —

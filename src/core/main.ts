@@ -57,7 +57,7 @@ ticks.register('heartbeat', 10_000, () => {});
 // stage 4:   PM 5min (pipeline/intake) + goal loop (LLM lead, on trigger)
 
 const ctx: CoreCtx = { store, ticks, startedAt };
-const { app, injectWebSocket, emit } = createHttp(ctx);
+const { app, emit } = createHttp(ctx);
 ctx.emit = emit;
 // stage 1: arbiter — claim/verify/handoff of the task queue
 ticks.register('arbiter', ARBITER_INTERVAL_MS, () => runArbiterTick(ctx));
@@ -139,7 +139,6 @@ ticks.register('watchdog', 1000, () => runWatchdogTick(ctx));
 const pidFile = path.join(FLOCK_HOME, 'core.pid');
 
 const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: FLOCK_PORT }, () => {
-  injectWebSocket(server);
   // codex shim (5.5): in-process OpenAI-responses proxy that merges codex's
   // developer-role messages into `instructions` (vLLM rejects the role in
   // input). Only the pod's codex reaches it; local-only, no auth.

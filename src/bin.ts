@@ -65,6 +65,7 @@ const USAGE = `flock — core CLI
   flock task needs <id> [reason...]
   flock task handoff <id> <to-role>   # transactional: close (handed-off) + successor у to
   flock task cancel <id>
+  flock events tail [--since N]        # event-лог (SSE, live)
   flock message send <role> <text...>   # durable-сообщение в inbox (+ poke живому)
   flock message ls [role] [--unclaimed] [--all]
   flock message claim <id>
@@ -242,6 +243,45 @@ async function main(): Promise<void> {
         print(await api('POST', '/api/ops', { type: 'esc_ack', id }));
       } else {
         console.log('usage: flock esc ls [--all] | flock esc ack <id>');
+      }
+      return;
+    }
+
+    case 'events': {
+      // C5: the append-only event log — the memory of the system
+      if (sub === 'tail') {
+        const sinceArg = rest.find((r) => !r.startsWith('-'));
+        const since = sinceArg ? Number(sinceArg) || 0 : 0;
+        const token = process.env.FLOCK_TOKEN ?? readToken();
+        const res = await fetch(`http://127.0.0.1:${port()}/events?since=${since}`, {
+          headers: { authorization: `Bearer ${token ?? ''}` },
+        }).catch((e) => {
+          console.error(e instanceof Error ? e.message : String(e));
+          process.exit(1);
+        });
+        if (!res.ok || !res.body) {
+          console.error(`events tail: HTTP ${res.status}`);
+          process.exit(1);
+        }
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i: number;
+          while ((i = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            const id = frame.match(/^id:\s*(.+)$/m)?.[1];
+            const ev = frame.match(/^event:\s*(.+)$/m)?.[1] ?? 'event';
+            const data = frame.match(/^data:\s*(.+)$/m)?.[1];
+            if (data) console.log(`${id ?? ''}\t${ev}\t${data}`);
+          }
+        }
+      } else {
+        console.log('usage: flock events tail [--since N]');
       }
       return;
     }
