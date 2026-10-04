@@ -268,11 +268,9 @@ HTTP-запрос в `/api/ops` running core (один writer, token-аутен�
 ./bin/flock mcp serve    # stdio; подключить в MCP-клиент как stdio-сервер
 ```
 
-## Team up
+## Team lifecycle (C14): named teams + snapshots + honest restore
 
-`flock team up [pods.yaml]` — декларативный состав: reconcile (недостающих
-spawn, живым — refresh managed guidance в AGENTS.md), никого не убивает,
-идемпотентен.
+**Именованные команды** — `~/.flock/teams/<name>.yaml`. Формат:
 
 ```yaml
 pods:
@@ -285,10 +283,66 @@ pods:
     agent: pi
 ```
 
+`flock team up <name>` резолвит имя (файл-путь тоже работает):
+
+```sh
+flock team up alpha            # ~/.flock/teams/alpha.yaml
+flock team up ./pods.yaml      # legacy: файл напрямую
+flock team ls                  # команды + последние снапшоты
+```
+
+**Team down — auto-snapshot** (`flock team down <name>`): закрывает
+live-поды команды и сохраняет снапшот в
+`~/.flock/snapshots/<name>/<mono-id>/` (snapshot.json + sessions/).
+Копия сессии — **до** close (seat может почиститься). Под без сессии
+честно помечается `restorable: false`; чужой рантайм — в `skipped`.
+
+**Restore** (`flock team up <name> --restore <snap|latest>`):
+
+- live-поды + restore не запрошен → reconcile (обычный `team up`);
+- `--restore`: **refuse over live** (outcomes `awaiting-decision`, не
+  перезаписываем); сессия копируется в seat НОВОГО пода (seat-изоляция);
+  missing required session = hard failure **для того нода** (per-node
+  isolation: один битый нод не топит команду);
+- per-node outcome: `resumed | rebuilt | fresh | fresh-primed |
+  awaiting-decision | failed | attention_required | operator_recovered`
+  — печатаются в отчёт и в event log.
+
+```sh
+flock team down alpha          # close + snapshot (mono-id)
+flock team up alpha --restore latest
+flock team up alpha --restore 3
+```
+
+Снапшот-иды — **монотонные** (не timestamp): правило «newest» —
+лексикографическое, не зависит от clock skew. `ponytail:` второй контур
+восстановления поверх restart-safe core — осознанно по решению
+оператора; страховки: mono-id, refuse-over-live, per-node isolation.
+
 Pod'ы — plain-dir: рабочая директория пода — просто каталог; git,
 ветки, коммиты — за агентами (свой workflow, свои коммиты). Merge-гейты,
 review-гейты, merge-queue, conflict-резолвер и вся экономика — **убраны из
 core** (C1/C2).
+
+## Agent images (C13): чекапойнты сессий агента
+
+**Image** = момент сессии: копия сессионного файла + верbatim-манифест
+(`restore`-поле в image.json — чтобы user-defined агент, отсутствующий в
+другом профиле, воссоздавался). Хранилище — файлово-каноническое:
+`~/.flock/images/<name>/` (image.json + session-<name>.jsonl), sqlite не
+трогаем.
+
+```sh
+flock agents image save dev --as dev-flow   # чекапойнт текущей сессии
+flock agents image ls
+flock pod spawn flowtest --image dev-flow   # resumed (не fresh) из копии
+flock pod relaunch dev --image dev-flow     # image бьёт pin/latest/fork
+flock agents image rm dev-flow              # отказ без --force (evidence-защита)
+```
+
+Seat-изоляция: сессия копируется в sessions-dir **нового** пода, image
+store не мутирует. `--image` + `--fresh` = конфликт (image = resume из
+чекапойнта). Pi only (единственный рантайм с сессией).
 
 ## Content layer (C12): packs, workspace, plugins
 
@@ -333,8 +387,47 @@ flock plugins show <source>               # entry + SKILL.md/README (≤4KB)
 ./bin/flock -p team2 pod spawn dev
 ```
 
-БД/token/log/sessions — свои, инстансы не пересекаются. (Кросс-профильная
-координация — fleet-фаза.)
+БД/token/log/sessions — свои, инстансы не пересекаются.
+
+## Fleet (C15): кросс-профильная координация
+
+Profiles = независимые core (свой FLOCK_HOME/порт/tmux). **Invariant не
+ломается: каждый core — single-writer своего sqlite.** Fleet — **ребро**
+(сообщения/handoff между core), не общая память и не центральный
+оркестратор.
+
+```sh
+flock fleet add b http://127.0.0.1:7561 [--token <operator-token>]
+flock fleet ls                    # health (/healthz удалённого) + pending-очереди
+flock fleet rm b
+```
+
+Конфиг — `~/.flock/fleet.json` (per-profile). Адресация: `<profile>/<role>`;
+локальный профиль = без префикса.
+
+**Кросс-профильный message_send** — `message_send {to: "b/dev"}` → HTTP
+apply() на удалённый core (там — обычный local-путь: inbox + poke).
+На локальном core остаётся **только outbox-строка** (delivery-ledger):
+`pending=1` пока удалённый не принял; успех → `forwarded`; сбой → pending
++ event, флит-тик (60s) ретраит.
+
+**Кросс-профильный task_handoff — two-phase** (честно, не атомарно):
+
+1. локально (commit): таск закрывается `handed-off (outbound, pending)`
+   + строка `outbound_handoffs` (один транзакт);
+2. удалённо: `fleet_handoff_accept` — создание successor с
+   **предопределённым id** (идемпотентно: повтор с тем же id = no-op,
+   дубликатов нет);
+3. успех → локальный `committed`; сбой → `pending`, тик 60s ретраит,
+   N попыток (`FLOCK_FLEET_HANDOFF_MAX_ATTEMPTS`, default 10) →
+   `attention_required` + эскалация (лестница 5.4c).
+
+Event log на **обеих** сторонах фиксирует фазы (`task_handoff` /
+`fleet_handoff_accept` / `fleet_message_*`). `ponytail:` атомарный
+кросс-DB handoff невозможен при single-writer (два core = два писателя);
+потолок — eventual handoff с явным pending; истинная атомарность = общий
+store (другая архитектура, не сейчас). НЕ делаем: центральный
+оркестратор-процесс, mesh-синхронизацию состояний, репликацию sqlite.
 
 ## Retention
 
