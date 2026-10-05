@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>flock board</title>
+  <link rel="stylesheet" href="/board/assets/board.css">
+</head>
+<body>
+  <div id="login" class="login">
+    <form id="login-form">
+      <h1>flock board</h1>
+      <p>Токен core (из <code>~/.flock/token</code>):</p>
+      <input id="token" type="password" autocomplete="off" autofocus>
+      <button type="submit">войти</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+
+  <div id="app" class="hidden">
+    <header>
+      <span class="title">flock board</span>
+      <nav>
+        <button data-panel="pods" class="tab">Pods</button>
+        <button data-panel="tasks" class="tab">Tasks</button>
+        <button data-panel="events" class="tab active">Events</button>
+        <button data-panel="health" class="tab">Health</button>
+      </nav>
+      <span id="conn" class="conn" title="SSE-статус">—</span>
+      <button id="logout" title="сбросить токен">⎋</button>
+    </header>
+    <main>
+      <section id="panel-pods" class="panel">
+        <h2>Pods</h2>
+        <table id="pods-table">
+          <thead><tr><th>role</th><th>agent</th><th>state</th><th>model</th><th>dir</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section id="panel-tasks" class="panel">
+        <h2>Tasks</h2>
+        <div class="filters">
+          <button data-status="" class="fbtn active">все</button>
+          <button data-status="queued" class="fbtn">queued</button>
+          <button data-status="active" class="fbtn">active</button>
+          <button data-status="blocked" class="fbtn">blocked</button>
+          <button data-status="done" class="fbtn">done</button>
+        </div>
+        <table id="tasks-table">
+          <thead><tr><th>id</th><th>status</th><th>pod</th><th>title</th><th>handoff →</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section id="panel-events" class="panel">
+        <h2>Events</h2>
+        <ul id="events-list"></ul>
+      </section>
+      <section id="panel-health" class="panel">
+        <h2>Health</h2>
+        <div id="health-body"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/board/assets/board.js"></script>
+</body>
+</html>

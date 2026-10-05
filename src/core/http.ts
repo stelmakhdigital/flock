@@ -32,6 +32,9 @@ export function createHttp(ctx: CoreCtx) {
   const app = new Hono();
 
   app.use('*', async (c, next) => {
+    // web-board shell/assets are auth-free (no data, 127.0.0.1; the token
+    // travels as `Authorization: Bearer` on every data fetch — UI plan §1.4)
+    if (c.req.path === '/board' || c.req.path.startsWith('/board/assets/')) return next();
     const got = c.req.header('authorization')?.replace(/^Bearer\s+/i, '');
     if (got !== ctx.store.token) return c.json({ error: 'unauthorized' }, 401);
     // pod socket: mark the caller so op auth can narrow scope (the token is
@@ -136,6 +139,44 @@ export function createHttp(ctx: CoreCtx) {
     const status = c.req.query('status');
     const limit = Math.max(1, Math.min(500, Number(c.req.query('limit') ?? 50)));
     return c.json({ tasks: store.listTasks(ctx.store, status, limit) });
+  });
+
+  // web-board read endpoint (U1): the board reads events FROM THE STORE
+  // (durable log); the live SSE /events stream is only a nudge channel
+  app.get('/api/events', (c) => {
+    const since = Math.max(0, Number(c.req.query('since') ?? 0) | 0);
+    const limit = Math.max(1, Math.min(1000, Number(c.req.query('limit') ?? 200)) | 0);
+    return c.json({
+      events: store.listEvents(ctx.store, since, limit).map((e) => ({
+        id: e.id,
+        at: e.at,
+        kind: e.kind,
+        actor: e.actor,
+        subject: e.subject,
+        payload: e.payload ? safeJson(e.payload) : null,
+      })),
+    });
+  });
+
+  // web-board static shell (U1): the shell carries no data — the token form
+  // only — so it (and its assets) are served WITHOUT auth on 127.0.0.1.
+  // The token then travels as `Authorization: Bearer` on every data fetch.
+  const publicDir = path.join(path.dirname(new URL(import.meta.url).pathname), '..', '..', 'public');
+  app.get('/board', (c) => {
+    const html = fs.readFileSync(path.join(publicDir, 'board.html'));
+    return c.body(html, 200, { 'content-type': 'text/html; charset=utf-8' });
+  });
+  app.get('/board/assets/:f', (c) => {
+    const f = c.req.param('f');
+    if (!/^\w+\.(js|css)$/.test(f)) return c.json({ error: 'not found' }, 404);
+    const file = path.join(publicDir, `board.${f.split('.').pop()}`);
+    try {
+      const data = fs.readFileSync(file);
+      const type = f.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8';
+      return c.body(data, 200, { 'content-type': type });
+    } catch {
+      return c.json({ error: 'not found' }, 404);
+    }
   });
 
   app.post('/api/ops', async (c) => {

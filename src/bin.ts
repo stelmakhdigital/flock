@@ -26,6 +26,7 @@ const USAGE = `flock — core CLI
 
   flock core up | down | restart | status
   flock healthz
+  flock board [--token]                    # URL web-board (+ токен) — read-only обзор (поды/таски/события/health)
   flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--posture floor|full_bypass] [--cmd c]
       plain-dir: под получает рабочую директорию; git за агентами (core git не видит)
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
@@ -194,6 +195,16 @@ async function main(): Promise<void> {
     case 'healthz': {
       const h = await healthz();
       print(h.body);
+      return;
+    }
+
+    case 'board': {
+      const url = `http://127.0.0.1:${process.env.FLOCK_PORT ?? 7460}/board`;
+      console.log(url);
+      if (rest[0] === '--token') {
+        const token = readToken();
+        console.log(`token: ${token ?? '(нет токена — core не запущен?)'}`);
+      }
       return;
     }
 

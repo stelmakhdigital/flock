@@ -124,6 +124,28 @@ curl -N -H "Authorization: Bearer $(cat ~/.flock/token)" "http://127.0.0.1:7460/
 WS-фид убран (C5): `GET /events?since=<id>` — SSE (Hono streaming), backlog
 из `events` + live-push.
 
+## Web board (read-only)
+
+`http://127.0.0.1:<PORT>/board` — локальный web-обзор core (поды, таски,
+события, health). Шелл (HTML/CSS/JS, без build-step) отдаётся без auth —
+dанных в нём нет; токен core вводится на странице и дальше летает как
+`Authorization: Bearer` в каждом запросе (sessionStorage).
+
+Механика (UI-plan §1.2): **store-эндпоинты — source of truth**, SSE
+`/events` — только nudge-канал (board никогда не рисует данные из
+live-фрейма): nudge → re-fetch затронутых панелей из `GET /api/*`;
+15s fallback-поллинг; reconnect с backoff. Мутаций из board нет
+(read-only срез; операторские действия — срез [U3]+).
+
+```sh
+./bin/flock board          # напечатать URL (и токен, при --token)
+curl -s http://127.0.0.1:7460/board | head   # шелл (без auth, 127.0.0.1)
+```
+
+Read-эндпоинты: `GET /api/events?since=&limit=` (durable-лог; board читает
+события из store, не из live-фрейма), `GET /api/pods`, `GET /api/tasks`,
+`GET /api/health` (gate/idle alerts + activeEscalations).
+
 ## Workflow: scribe model + DAG
 
 Определение = именованный набор шагов; instance двигает шаги через обычную
