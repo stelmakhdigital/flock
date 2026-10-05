@@ -197,6 +197,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   message_send: { group: 'message', scopes: ['operator', 'pod'], summary: 'send a durable message to a pod inbox (+ poke if live; from = caller pod or operator)', run: (o, c) => messageSend(o, c) },
   message_list: { group: 'message', scopes: ['operator', 'pod'], summary: 'list inbox messages (pod token: own inbox; {unclaimed?})', run: (o, c) => messageList(o, c) },
   message_claim: { group: 'message', scopes: ['operator', 'pod'], summary: 'mark an inbox message claimed (pod token: own inbox only)', run: (o, c) => messageClaim(o, c) },
+  message_broadcast: { group: 'message', scopes: ['operator', 'pod'], summary: 'durable broadcast to all pods (or a role subset): one inbox row per pod, + poke the live ones (pod token: pm only)', run: (o, c) => messageBroadcast(o, c) },
   task_blocked: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task blocked (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_blocked', o, 'blocked'); return taskReport(o, c, 'blocked'); } },
   task_needs: { group: 'task', scopes: ['operator', 'pod'], summary: 'report task needs help (pod-scoped: own pod only)', run: async (o, c) => { await pmNotifyMaybe(c, 'task_needs', o, 'needs'); return taskReport(o, c, 'needs'); } },
   // -- pm / goal loop ---------------------------------------------------------
@@ -1604,6 +1605,44 @@ async function messageList(op: Record<string, unknown>, ctx: CoreCtx): Promise<u
         return all.sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, limit);
       })();
   return { to: to ?? '(all)', messages };
+}
+
+// broadcast: one durable row per target pod over the SAME inbox/poke path
+// as message_send (no second contour). targets: explicit role list, or ALL
+// pods when omitted (the team «chatroom»). The sender is the caller (pod
+// token: pm only — a random pod cannot talk to the whole team) or 'operator'.
+// A dead target keeps its row (read on relaunch / via message ls); pokes
+// are best-effort. Unknown role = 404 before anything is written.
+async function messageBroadcast(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
+  const text = String(op.text ?? '').trim();
+  if (!text) throw new OpError(400, 'text required');
+  if (ctx.caller?.kind === 'pod' && !isCoordinator(ctx)) {
+    throw new OpError(403, `pod token ${ctx.caller.role}: broadcast is an operator/pm action`);
+  }
+  const from = ctx.caller?.kind === 'pod' ? ctx.caller.role : (op.from !== undefined ? String(op.from) : 'operator');
+  const wanted = op.roles !== undefined ? (Array.isArray(op.roles) ? op.roles.map(String) : String(op.roles).split(/[\s,]+/).filter(Boolean)) : null;
+  let roles: string[];
+  if (wanted) {
+    for (const r of wanted) if (!store.getPodByRole(ctx.store, r)) throw new OpError(404, `no pod: ${r} (spawn it first)`);
+    roles = [...new Set(wanted)];
+  } else {
+    roles = store.listPods(ctx.store).map((p) => p.role);
+  }
+  if (!roles.length) throw new OpError(404, 'no pods to broadcast to (spawn at least one)');
+  const per: Record<string, boolean | 'target-not-live' | 'failed'> = {};
+  const ids: number[] = [];
+  for (const role of roles) {
+    const { inboxId } = store.insertInboxMessage(ctx.store, { from, to: role, text });
+    ids.push(inboxId);
+    const pod = store.getPodByRole(ctx.store, role)!;
+    if (pod.state !== 'live') { per[role] = 'target-not-live'; continue; }
+    try {
+      await apply({ type: 'pod_send', role, text: `[flock-broadcast from ${from} to ${roles.length} pods]\n${text}` }, ctx);
+      per[role] = true;
+    } catch { per[role] = 'failed'; }
+  }
+  ctx.emit?.({ type: 'message_broadcast', from, to: roles.join(','), count: roles.length, ids });
+  return { ok: true, from, count: roles.length, inboxIds: ids, poked: per };
 }
 
 async function messageClaim(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {

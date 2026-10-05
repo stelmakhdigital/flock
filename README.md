@@ -101,10 +101,15 @@ mailbox получателя, `outboxes` — sender-side record (local send —
 ./bin/flock message send <role> "текст..."   # durable-строка + best-effort poke живому
 ./bin/flock message ls [role] [--unclaimed] [--all]
 ./bin/flock message claim <id>
+./bin/flock message broadcast [--to r1,r2] "текст..."   # без --to: всем подам (общий «chatroom»-канал)
 ```
 
 - Доставка = **durable inbox-строка** + poke живому под'у (`pod send`).
   Мёртвый/закрытый под — сообщение остаётся в inbox и дождётся relaunch.
+- Broadcast — та же durable-строка **на каждый** целевой под (один inbox
+  row per pod) + poke живым; без `--to` — все поды (общий «chatroom»-канал
+  команды). Из под-токенов broadcast доступен только pm (оператор — всегда).
+  Мутация — единый путь: op `message_broadcast` поверх того же inbox/poke.
 - Pod-токен видит только свой inbox и не пишет сам себе; оператор — любой
   или все unclaimed.
 -	pm читает свои inbox-сообщения через `flock pm state`

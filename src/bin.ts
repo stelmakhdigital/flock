@@ -77,6 +77,7 @@ const USAGE = `flock — core CLI
   flock message send <role> <text...>   # durable-сообщение в inbox (+ poke живому)
   flock message ls [role] [--unclaimed] [--all]
   flock message claim <id>
+  flock message broadcast [--to r1,r2] <text...>   # без --to — всем подам (общий «chatroom»-канал; durable + poke живым)
   flock mcp serve                         # stdio JSON-RPC (MCP): tools = OP_REGISTRY (C9)
   flock task unblock <id>               # blocked → queued (arbiter возьмёт заново)
   flock workflow define <name> --steps "id1:role1,id2:role2"
@@ -533,8 +534,18 @@ async function main(): Promise<void> {
           process.exit(1);
         }
         print(await api('POST', '/api/ops', { type: 'message_claim', id: Number(id) }));
+      } else if (sub === 'broadcast') {
+        // flock message broadcast [--to r1,r2] <text...> — без --to: все поды
+        const ti = rest.indexOf('--to');
+        const roles = ti >= 0 ? (rest[ti + 1] ?? '').split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+        const text = rest.filter((a, i) => i !== ti && i !== ti + 1).join(' ').trim();
+        if (!text) {
+          console.error('usage: flock message broadcast [--to r1,r2] <text...>   (без --to — всем подам; общий «chatroom»-канал)');
+          process.exit(1);
+        }
+        print(await api('POST', '/api/ops', { type: 'message_broadcast', text, roles }));
       } else {
-        console.log('usage: flock message send <role> <text...> | ls [role] [--unclaimed] [--all] | claim <id>');
+        console.log('usage: flock message send <role> <text...> | ls [role] [--unclaimed] [--all] | claim <id> | broadcast [role...] <text...>');
       }
       return;
     }
