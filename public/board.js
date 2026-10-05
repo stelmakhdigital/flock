@@ -41,12 +41,13 @@
     const t = $('#token').value.trim();
     if (!t) return;
     try {
-      await apiGet('/healthz');
       sessionStorage.setItem('flock-token', t);
+      await apiGet('/healthz');
       $('#login-error').textContent = '';
       showApp();
       start();
     } catch {
+      sessionStorage.removeItem('flock-token');
       $('#login-error').textContent = 'нет доступа — проверь токен (или core не запущен)';
     }
   });
