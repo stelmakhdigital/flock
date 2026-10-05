@@ -537,15 +537,16 @@ async function main(): Promise<void> {
       } else if (sub === 'broadcast') {
         // flock message broadcast [--to r1,r2] <text...> — без --to: все поды
         const ti = rest.indexOf('--to');
+        const excl = ti >= 0 ? new Set([ti, ti + 1]) : new Set<number>();
         const roles = ti >= 0 ? (rest[ti + 1] ?? '').split(',').map((s) => s.trim()).filter(Boolean) : undefined;
-        const text = rest.filter((a, i) => i !== ti && i !== ti + 1).join(' ').trim();
+        const text = rest.filter((_, i) => !excl.has(i)).join(' ').trim();
         if (!text) {
           console.error('usage: flock message broadcast [--to r1,r2] <text...>   (без --to — всем подам; общий «chatroom»-канал)');
           process.exit(1);
         }
         print(await api('POST', '/api/ops', { type: 'message_broadcast', text, roles }));
       } else {
-        console.log('usage: flock message send <role> <text...> | ls [role] [--unclaimed] [--all] | claim <id> | broadcast [role...] <text...>');
+        console.log('usage: flock message send <role> <text...> | ls [role] [--unclaimed] [--all] | claim <id> | broadcast [--to r1,r2] <text...>');
       }
       return;
     }
