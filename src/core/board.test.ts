@@ -231,6 +231,81 @@ const postOp = (op: Record<string, unknown>) =>
     body: JSON.stringify({ type: 'campaign_pause', id: 'cam_none' }),
   }), { flockRole: 'dev' });
   assert.strictEqual(opOnly.status, 403, 'operator-only op is refused for a pod caller (control)');
+
+  // ---- 8) [U5] read-only panels: fleet / watchdog / messages / pm -----------
+  // The four panels are read-only and use EXISTING ops/GET endpoints (no new
+  // ops in this task); here we fix the response SHAPES the panels render:
+  // fleet_ls → {profiles, pending}; message_list → {to, messages} (unclaimed
+  // filter); watchdog_list → {jobs}; GET /api/watchdog → {jobs};
+  // GET /api/watchdog/:id/history → {job, history} (404 — honest, not 500);
+  // GET /api/pm → {pm: digest with tasks/…/unclaimedMessages, alerts}.
+
+  // 8a) fleet_ls → 200 ok:true with the two sections the panel renders.
+  const fl = await postOp({ type: 'fleet_ls' });
+  assert.strictEqual(fl.status, 200, 'fleet_ls is a 200');
+  const flBody = (await fl.json()) as { ok: boolean; result: { profiles: unknown[]; pending: { handoffs: unknown[]; messages: unknown[] } } };
+  assert.strictEqual(flBody.ok, true, 'fleet_ls ok:true');
+  assert.ok(Array.isArray(flBody.result.profiles), 'fleet_ls result.profiles is an array');
+  assert.ok(Array.isArray(flBody.result.pending.handoffs), 'fleet_ls pending.handoffs is an array');
+  assert.ok(Array.isArray(flBody.result.pending.messages), 'fleet_ls pending.messages is an array');
+
+  // 8b) message_list → 200 ok:true with {to, messages}; the unclaimed filter
+  //     narrows the list. A message is delivered to a live pod inbox (dev is
+  //     live in this store), so the operator sees it unclaimed first.
+  const ms = await postOp({ type: 'message_send', to: 'dev', text: 'board.test [U5] inbox row' });
+  assert.strictEqual(ms.status, 200, 'message_send (seed) is a 200');
+  const ml = await postOp({ type: 'message_list', to: 'dev' });
+  assert.strictEqual(ml.status, 200, 'message_list is a 200');
+  const mlBody = (await ml.json()) as { ok: boolean; result: { to: string; messages: { text: string; claimed: number }[] } };
+  assert.strictEqual(mlBody.ok, true, 'message_list ok:true');
+  assert.strictEqual(mlBody.result.to, 'dev', 'message_list scoped to the role');
+  assert.ok(mlBody.result.messages.some((m) => m.text === 'board.test [U5] inbox row' && m.claimed === 0), 'the sent message is listed, unclaimed');
+  const mlUn = await postOp({ type: 'message_list', to: 'dev', unclaimed: true });
+  assert.strictEqual(mlUn.status, 200, 'message_list unclaimed is a 200');
+  const mlUnBody = (await mlUn.json()) as { result: { messages: { claimed: number }[] } };
+  assert.ok(mlUnBody.result.messages.length >= 1, 'unclaimed filter still returns the fresh message');
+  assert.ok(mlUnBody.result.messages.every((m) => m.claimed === 0), 'unclaimed filter excludes claimed rows');
+
+  // 8c) watchdog_list op → 200 {jobs}; GET /api/watchdog → {jobs} (same rows).
+  const wd = await postOp({ type: 'watchdog_register', policy: 'timer', target: 'dev', spec: { afterSeconds: 3600 } });
+  assert.strictEqual(wd.status, 200, 'watchdog_register (seed) is a 200');
+  const wdList = await postOp({ type: 'watchdog_list' });
+  assert.strictEqual(wdList.status, 200, 'watchdog_list is a 200');
+  const wdBody = (await wdList.json()) as { ok: boolean; result: { jobs: { id: string; policy: string; target_pod: string; state: string }[] } };
+  assert.strictEqual(wdBody.ok, true, 'watchdog_list ok:true');
+  const job = wdBody.result.jobs.find((j) => j.policy === 'timer' && j.target_pod === 'dev');
+  assert.ok(job, 'the registered timer job is listed');
+  assert.strictEqual(job!.state, 'active', 'the fresh job is active');
+  const wdGet = await get('/api/watchdog');
+  assert.strictEqual(wdGet.status, 200, 'GET /api/watchdog is a 200');
+  const wdGetBody = (await wdGet.json()) as { jobs: { id: string }[] };
+  assert.ok(Array.isArray(wdGetBody.jobs) && wdGetBody.jobs.some((j) => j.id === job!.id), 'GET /api/watchdog lists the same job');
+
+  // 8d) GET /api/watchdog/:id/history → 200 {job, history}; a nonexistent id
+  //     is an honest 404 (not a 500).
+  const wh = await get(`/api/watchdog/${job!.id}/history`);
+  assert.strictEqual(wh.status, 200, 'watchdog history is a 200');
+  const whBody = (await wh.json()) as { job: { id: string }; history: unknown[] };
+  assert.strictEqual(whBody.job.id, job!.id, 'history carries the job');
+  assert.ok(Array.isArray(whBody.history), 'history is an array');
+  const wh404 = await get('/api/watchdog/wd_none/history');
+  assert.strictEqual(wh404.status, 404, 'nonexistent watchdog id is a 404, not a 500');
+  const wh404Body = (await wh404.json()) as { error: string };
+  assert.ok(typeof wh404Body.error === 'string' && wh404Body.error.length > 0, 'the 404 carries an error message');
+
+  // 8e) GET /api/pm → 200 with the digest (tasks counts + … + unclaimedMessages)
+  //     and the alerts array (same health_alerts the Health panel shows).
+  const pm = await get('/api/pm');
+  assert.strictEqual(pm.status, 200, 'GET /api/pm is a 200');
+  const pmBody = (await pm.json()) as { pm: { at: string; tasks: Record<string, number>; openTasks: unknown[]; unclaimedMessages: unknown[] }; alerts: unknown[] };
+  assert.ok(pmBody.pm, '/api/pm has a pm digest');
+  assert.ok(typeof pmBody.pm.at === 'string', 'digest.at is set');
+  assert.ok(typeof pmBody.pm.tasks === 'object' && pmBody.pm.tasks !== null, 'digest.tasks is the status counts');
+  assert.ok(Array.isArray(pmBody.pm.openTasks), 'digest.openTasks is an array');
+  assert.ok(Array.isArray(pmBody.pm.unclaimedMessages), 'digest.unclaimedMessages is an array');
+  assert.ok(Array.isArray(pmBody.alerts), '/api/pm carries the alerts array');
+  const pmCounts = Object.values(pmBody.pm.tasks).reduce((a, b) => a + b, 0);
+  assert.ok(pmCounts > 0, 'the seeded tasks appear in the digest counts');
 }
 
 fs.rmSync(home, { recursive: true, force: true });

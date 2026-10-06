@@ -68,6 +68,10 @@
     workflow: ['workflows'], // [U4]: workflow_defined/started/step/done/blocked/removed
     campaign: ['campaigns'], // [U4]: campaign_status (created/paused/resumed/cancelled/tick)
     topology: ['topologies', 'pods'], // [U4]: topology_up — каталог live-отметки + поды
+    fleet: ['fleet'], // [U5]: fleet_profile_added/removed, fleet_handoff_*, fleet_message_*
+    watchdog: ['watchdog'], // [U5]: watchdog_registered/fired/terminal
+    message: ['messages', 'pm'], // [U5]: message_sent/broadcast/claimed — inbox + pm-digest (unclaimed)
+    pm: ['pm'], // [U5]: pm_up (op-аудит в store-логе/SSE-backlog); pm_*-событий в core нет
   };
   function invalidate(kind) {
     const set = new Set(['events']);
@@ -75,7 +79,7 @@
     for (const p of KIND_PANELS[prefix] ?? []) set.add(p);
     return [...set];
   }
-  const refetchers = { pods: refreshPods, tasks: refreshTasks, events: () => refreshEvents(false), health: refreshHealth, escalations: refreshEscalations, workflows: refreshWorkflows, campaigns: refreshCampaigns, topologies: refreshTopologies };
+  const refetchers = { pods: refreshPods, tasks: refreshTasks, events: () => refreshEvents(false), health: refreshHealth, escalations: refreshEscalations, workflows: refreshWorkflows, campaigns: refreshCampaigns, topologies: refreshTopologies, fleet: refreshFleet, watchdog: refreshWatchdog, messages: refreshMessages, pm: refreshPm };
 
   // ---------- login ----------
   function showLogin(err) { $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); if (err) $('#login-error').textContent = err; }
@@ -327,6 +331,127 @@
       }));
   }
 
+  // ---------- [U5] read-only panels: fleet / watchdog / messages / pm ----------
+
+  // Fleet panel (plan [U5]): op fleet_ls — profiles (name, url, remote
+  // /healthz ok?, detail) + pending cross-profile work (handoffs, outbox).
+  async function refreshFleet() {
+    const { result } = await apiOp({ type: 'fleet_ls' });
+    const profiles = result?.profiles ?? [];
+    const pending = result?.pending ?? { handoffs: [], messages: [] };
+    const parts = [];
+    if (!profiles.length) parts.push('<div class="empty">профилей нет</div>');
+    else {
+      const rows = profiles.map((p) =>
+        `<tr><td>${p.name}</td><td class="dir">${p.url}</td><td class="${p.healthy ? 'ok' : 'bad'}">${p.healthy ? 'ok' : 'недоступен'}</td><td class="dir">${p.detail ?? ''}</td></tr>`).join('');
+      parts.push(`<h3 class="sub">profiles</h3><table><thead><tr><th>name</th><th>url</th><th>/healthz</th><th>detail</th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    const h = pending.handoffs ?? [], m = pending.messages ?? [];
+    if (h.length || m.length) {
+      parts.push(`<h3 class="sub">pending cross-profile</h3>`);
+      if (h.length) {
+        const rows = h.map((x) => `<tr><td>${x.id}</td><td>${x.to}</td><td>${x.attempts}</td><td class="state">${x.status}</td><td class="dir">${x.last_error ?? ''}</td></tr>`).join('');
+        parts.push(`<table><thead><tr><th>id</th><th>to</th><th>attempts</th><th>status</th><th>last error</th></tr></thead><tbody>${rows}</tbody></table>`);
+      }
+      if (m.length) {
+        const rows = m.map((x) => `<tr><td>${x.outboxId}</td><td>${x.to}</td><td>${x.attempts}</td><td class="dir">${x.from_ ?? ''}</td></tr>`).join('');
+        parts.push(`<table><thead><tr><th>outbox</th><th>to</th><th>attempts</th><th>from</th></tr></thead><tbody>${rows}</tbody></table>`);
+      }
+    }
+    box(parts, '#fleet-body');
+  }
+
+  // Watchdog panel (plan [U5]): op watchdog_list (jobs: policy, target, state,
+  // last fire) + per-job раскрываемая история через GET /api/watchdog/:id/history
+  // (как steps в [U4]).
+  async function refreshWatchdog() {
+    const { result } = await apiOp({ type: 'watchdog_list' });
+    const jobs = result?.jobs ?? [];
+    const parts = [];
+    if (!jobs.length) parts.push('<div class="empty">jobs нет</div>');
+    else {
+      const rows = jobs.map((j) =>
+        `<tr class="${j.state === 'active' ? 'active' : 'done'}"><td>${j.id}</td><td>${j.policy}</td><td>${j.target_pod}</td><td class="state">${j.state}</td><td class="dir">${j.last_fire_at ? j.last_fire_at.slice(5, 16).replace('T', ' ') : '—'}</td><td><button class="wdh" data-id="${j.id}">history</button></td></tr>`).join('');
+      parts.push(`<table><thead><tr><th>id</th><th>policy</th><th>target</th><th>state</th><th>last fire</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#watchdog-body');
+    document.querySelectorAll('#watchdog-body .wdh').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          const r = await fetch(`/api/watchdog/${encodeURIComponent(b.dataset.id)}/history`, { headers: { authorization: `Bearer ${token()}` } });
+          if (!r.ok) throw new Error(`${r.status}: ${(await r.json().catch(() => ({}))).error ?? ''}`);
+          const { history } = await r.json();
+          const rows = (history ?? []).map((h) =>
+            `<tr><td class="dir">${h.evaluated_at ? h.evaluated_at.slice(5, 16).replace('T', ' ') : '—'}</td><td class="state">${h.outcome}</td><td class="dir">${h.skip_reason ?? ''}</td><td class="dir">${h.delivery_status ?? ''}</td></tr>`).join('');
+          const old = document.querySelector(`#watchdog-body .wdhd[data-for="${b.dataset.id}"]`);
+          if (old) old.remove();
+          const d = document.createElement('div');
+          d.className = 'wdhd';
+          d.dataset.for = b.dataset.id;
+          d.innerHTML = `<div class="wfxd-title">history ${b.dataset.id} — ${history?.length ?? 0} записей</div>` +
+            (rows ? `<table><thead><tr><th>at</th><th>outcome</th><th>skip</th><th>delivery</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">история пуста</div>');
+          $('#watchdog-body').appendChild(d);
+        } catch (e) { toast(`watchdog history (${b.dataset.id}): ${e.message}`, 'error'); }
+      }));
+  }
+
+  // Messages panel (plan [U5]): op message_list — inbox per pod (select-фильтр
+  // по роли, как фильтры задач в [U2]; «все» = unclaimed по всем подам) +
+  // unclaimed-флаг на строке.
+  let msgRole = '';
+  async function refreshMessages() {
+    const { result } = await apiOp(msgRole ? { type: 'message_list', to: msgRole } : { type: 'message_list' });
+    const msgs = result?.messages ?? [];
+    // роли для select — из /api/pods (operator видит все)
+    let roles = [];
+    try { ({ pods: roles } = await apiGet('/api/pods')); } catch { roles = []; }
+    const sel = `<select id="msg-role"><option value="">все (unclaimed)</option>${roles.map((p) => `<option value="${p.role}"${p.role === msgRole ? ' selected' : ''}>${p.role}</option>`).join('')}</select>`;
+    const parts = [`<div class="filters">${sel}</div>`];
+    if (!msgs.length) parts.push('<div class="empty">сообщений нет</div>');
+    else {
+      const rows = msgs.map((m) =>
+        `<tr class="${m.claimed ? 'done' : 'active'}"><td class="dir">${m.at.slice(5, 16).replace('T', ' ')}</td><td>${m.from_}</td><td>${m.to}</td><td class="dir">${String(m.text).slice(0, 120)}</td><td class="${m.claimed ? 'claimed' : 'unclaimed'}">${m.claimed ? 'claimed' : 'unclaimed'}</td></tr>`).join('');
+      parts.push(`<table><thead><tr><th>at</th><th>from</th><th>to</th><th>text</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#messages-body');
+    document.querySelector('#msg-role')?.addEventListener('change', (e) => {
+      msgRole = e.target.value || '';
+      refreshMessages().catch(() => {});
+    });
+  }
+
+  // PM panel (plan [U5]): GET /api/pm — компактный digest (tasks counts, open
+  // tasks, campaigns, pods+activity, live runs, unclaimed pm-сообщения) +
+  // alerts (та же health_alerts, что в Health-панели).
+  async function refreshPm() {
+    const { pm, alerts } = await apiGet('/api/pm');
+    const parts = [];
+    if (!pm) parts.push('<div class="empty">pm: данных нет</div>');
+    else {
+      const counts = Object.entries(pm.tasks ?? {}).map(([s, n]) => `${s}: ${n}`).join(' · ') || '—';
+      parts.push(`<div class="pm-line">tasks — ${counts}</div>`);
+      const open = pm.openTasks ?? [];
+      parts.push(open.length
+        ? `<div class="pm-line">open: ${open.map((t) => `${t.id} (${t.status}, ${t.pod})`).join(', ')}</div>`
+        : '<div class="pm-line empty">open-задач нет</div>');
+      const camps = pm.campaigns ?? [];
+      if (camps.length) parts.push(`<div class="pm-line">campaigns: ${camps.map((c) => `${c.id} (${c.status}, ${c.done}/${c.total})`).join(', ')}</div>`);
+      const wait = pm.waitingOnClosed ?? [];
+      if (wait.length) parts.push(`<div class="pm-line bad">zombie-очередь (queued на closed pod): ${wait.map((t) => `${t.id} (${t.pod})`).join(', ')}</div>`);
+      const pods = (pm.pods ?? []).map((p) => `<span class="topo ${p.state === 'live' ? 'topo-live' : 'topo-idle'}">${p.role}${p.state === 'live' ? (p.activity ? ` · ${p.activity}` : ' ●') : ''}</span>`).join(' ');
+      parts.push(`<div class="pm-line">pods — ${pods || '—'}</div>`);
+      const runs = pm.liveRuns ?? [];
+      if (runs.length) parts.push(`<div class="pm-line">live runs: ${runs.map((r) => `${r.pod} (${r.run})`).join(', ')}</div>`);
+      const un = pm.unclaimedMessages ?? [];
+      if (un.length) parts.push(`<div class="pm-line">pm unclaimed: ${un.map((m) => `${m.id} от ${m.from}`).join(', ')}</div>`);
+    }
+    if (alerts?.length) {
+      const rows = alerts.map((a) => `<tr><td>${a.pod_role}</td><td>${a.kind}</td><td class="state">${a.state}</td><td class="dir">${a.note ?? ''}</td></tr>`).join('');
+      parts.push(`<h3 class="sub">alerts</h3><table><thead><tr><th>pod</th><th>kind</th><th>state</th><th>note</th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#pm-body');
+  }
+
   function invalidatePanels(kind) {
     for (const p of invalidate(kind)) refetchers[p]().catch(() => {});
   }
@@ -381,9 +506,9 @@
     if (started) return;
     started = true;
     await refreshEvents(true); // history paint + lastEventId catch-up
-    await Promise.allSettled([refreshPods(), refreshTasks(), refreshHealth(), refreshEscalations(), refreshWorkflows(), refreshCampaigns(), refreshTopologies()]);
+    await Promise.allSettled([refreshPods(), refreshTasks(), refreshHealth(), refreshEscalations(), refreshWorkflows(), refreshCampaigns(), refreshTopologies(), refreshFleet(), refreshWatchdog(), refreshMessages(), refreshPm()]);
     openSse();
-    setInterval(() => { void Promise.allSettled([refreshPods(), refreshTasks(), refreshEvents(false), refreshHealth(), refreshEscalations(), refreshWorkflows(), refreshCampaigns(), refreshTopologies()]); }, 15000);
+    setInterval(() => { void Promise.allSettled([refreshPods(), refreshTasks(), refreshEvents(false), refreshHealth(), refreshEscalations(), refreshWorkflows(), refreshCampaigns(), refreshTopologies(), refreshFleet(), refreshWatchdog(), refreshMessages(), refreshPm()]); }, 15000);
   }
 
   if (token()) {

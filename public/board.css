@@ -72,3 +72,19 @@ td.dir, .subj { color: #8b93a7; }
 .topo { display: inline-block; margin-right: 8px; font-size: 12px; }
 .topo-live { color: #4ade80; font-weight: bold; }
 .topo-idle { color: #6b7280; }
+
+/* [U5] read panels: fleet / watchdog / messages / pm */
+#fleet-body .sub, #messages-body .sub, #pm-body .sub { color: #8b93a7; font-size: 12px; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+td.ok, .ok { color: #4ade80; font-weight: bold; }
+td.bad, .bad { color: #f87171; font-weight: bold; }
+.unclaimed { color: #fbbf24; font-weight: bold; }
+.claimed { color: #6b7280; }
+.wdh { background: #1e3a5f; border: 1px solid #2563eb; color: #c7d2fe; padding: 2px 10px; cursor: pointer; border-radius: 4px; font: inherit; font-size: 12px; }
+.wdh:hover { background: #2563eb; color: #fff; }
+.wdhd { margin: 10px 0; padding: 8px 10px; border: 1px solid #23262e; border-radius: 6px; }
+#messages-body .filters select { background: #171a20; color: #d7dce5; border: 1px solid #2a2f3a; border-radius: 4px; padding: 2px 8px; font: inherit; font-size: 12px; }
+#watchdog-body tr.active td.state { color: #4ade80; font-weight: bold; }
+#watchdog-body tr.done td.state { color: #6b7280; }
+.pm-line { margin: 4px 0; padding: 4px 8px; border-left: 2px solid #2a2f3a; font-size: 13px; }
+.pm-line.empty { color: #6b7280; }
+.pm-line.bad { border-left-color: #b91c1c; color: #fca5a5; }
