@@ -39,14 +39,30 @@
     </header>
     <main>
       <section id="panel-pods" class="panel">
-        <h2>Pods</h2>
+        <h2>Pods <button id="newpod-toggle" class="newbtn">+ New pod</button></h2>
+        <div id="newpod-form" class="newform hidden">
+          <input id="newpod-role" class="nfin" type="text" placeholder="role (required: [a-z0-9-])" required>
+          <input id="newpod-dir" class="nfin" type="text" placeholder="dir (опц., дефолт ~/.flock/pods/<role>)">
+          <input id="newpod-agent" class="nfin" type="text" placeholder="agent (опц.)">
+          <input id="newpod-cmd" class="nfin" type="text" placeholder="cmd (опц., plain-под, напр. sleep 3600)">
+          <button id="newpod-create" class="nfsave">Create</button>
+          <span class="nfnote">spawn процесса — с confirm</span>
+        </div>
         <table id="pods-table">
           <thead><tr><th>role</th><th>agent</th><th>state</th><th>model</th><th>dir</th><th>actions</th></tr></thead>
           <tbody></tbody>
         </table>
       </section>
       <section id="panel-tasks" class="panel">
-        <h2>Tasks</h2>
+        <h2>Tasks <button id="newtask-toggle" class="newbtn">+ New task</button></h2>
+        <div id="newtask-form" class="newform hidden">
+          <select id="newtask-role" class="nfin"></select>
+          <input id="newtask-title" class="nfin" type="text" placeholder="title (required)" required>
+          <textarea id="newtask-body" class="nfin" rows="2" placeholder="body (опц.)"></textarea>
+          <input id="newtask-priority" class="nfin" type="number" placeholder="priority (опц.)">
+          <button id="newtask-add" class="nfsave">Add</button>
+          <span class="nfnote">без confirm (аддитивное действие)</span>
+        </div>
         <div class="filters">
           <button data-status="" class="fbtn active">все</button>
           <button data-status="queued" class="fbtn">queued</button>

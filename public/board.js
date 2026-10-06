@@ -39,10 +39,11 @@
     setTimeout(() => el.remove(), 4200);
   }
 
-  // act(op, {destructive?}) — THE operator-action pattern (foundation for
-  // [U4]/[U6]): destructive → confirm() → POST /api/ops → toast(ok/error).
+  // act(op, {destructive?, okToast?}) — THE operator-action pattern (foundation
+  // for [U4]/[U6]/[U8]): destructive → confirm() → POST /api/ops → toast(ok/error).
+  // okToast(result) — кастомный ok-текст (напр. с id созданного таска); дефолт — «label: ok».
   // Returns {ok, result?|error?|cancelled?}; the caller re-fetches the panel.
-  async function act(op, { destructive = false } = {}) {
+  async function act(op, { destructive = false, okToast } = {}) {
     // label несёт идентификатор (id или role) + флаги (fresh) — confirm-текст
     // покрывает «что именно» делаем
     const label = op.type + (op.id ? ` (${op.id})` : op.role ? ` (${op.role}${op.fresh ? ', fresh' : ''})` : '');
@@ -52,7 +53,7 @@
     }
     try {
       const body = await apiOp(op);
-      toast(`${label}: ok`, 'ok');
+      toast(okToast ? okToast(body.result) : `${label}: ok`, 'ok');
       return { ok: true, result: body.result };
     } catch (e) {
       toast(`${label}: ${e.message}`, 'error');
@@ -234,6 +235,63 @@
       tbody.appendChild(tr);
     }
   }
+
+  // ---------- [U8] creation: New pod (pod_spawn, confirm) / New task (task_add) ----------
+
+  // role-валидация — ровно core'овский ROLE_RE (ops.ts): не отправлять
+  // заведомо ошибочные ops (core ответил бы 400 «bad role»)
+  const ROLE_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
+
+  $('#newpod-toggle').addEventListener('click', () => $('#newpod-form').classList.toggle('hidden'));
+  $('#newpod-create').addEventListener('click', async () => {
+    const role = $('#newpod-role').value.trim();
+    if (!role) { toast('new pod: role required', 'error'); return; }
+    if (!ROLE_RE.test(role)) { toast(`pod_spawn: bad role (want [a-z0-9][a-z0-9-]{0,30}): ${role}`, 'error'); return; }
+    const dir = $('#newpod-dir').value.trim();
+    const agent = $('#newpod-agent').value.trim();
+    const cmd = $('#newpod-cmd').value.trim();
+    const op = { type: 'pod_spawn', role };
+    if (dir) op.dir = dir;
+    if (agent) op.agent = agent;
+    if (cmd) op.cmd = cmd;
+    const r = await act(op, { destructive: true }); // spawn процесса — явное дорогое действие
+    if (r.ok) {
+      $('#newpod-role').value = ''; $('#newpod-dir').value = '';
+      $('#newpod-agent').value = ''; $('#newpod-cmd').value = '';
+      $('#newpod-form').classList.add('hidden');
+      refreshPods().catch(() => {});
+    }
+  });
+
+  $('#newtask-toggle').addEventListener('click', async () => {
+    // role-select заполняем из существующих подов (task_add требует pod)
+    const sel = $('#newtask-role');
+    try {
+      const { pods } = await apiGet('/api/pods');
+      sel.innerHTML = pods.length
+        ? pods.map((p) => `<option value="${p.role}"${p.state === 'live' ? '' : ''}>${p.role} (${p.state})</option>`).join('')
+        : '<option value="">(нет подов — сначала создай pod)</option>';
+    } catch { sel.innerHTML = '<option value="">(нет подов — сначала создай pod)</option>'; }
+    $('#newtask-form').classList.toggle('hidden');
+  });
+  $('#newtask-add').addEventListener('click', async () => {
+    const role = $('#newtask-role').value;
+    const title = $('#newtask-title').value.trim();
+    if (!role) { toast('new task: сначала создай pod', 'error'); return; }
+    if (!title) { toast('new task: title required', 'error'); return; }
+    const body = $('#newtask-body').value.trim();
+    const pr = $('#newtask-priority').value;
+    const op = { type: 'task_add', role, title };
+    if (body) op.body = body;
+    if (pr !== '' && pr !== undefined) op.priority = Number(pr);
+    // аддитивное действие — без confirm (как Done в [U6]); ok-toast с id таска
+    const r = await act(op, { okToast: (res) => `task_add (${role}): ok — ${res && res.id ? res.id : ''}` });
+    if (r.ok) {
+      $('#newtask-title').value = ''; $('#newtask-body').value = ''; $('#newtask-priority').value = '';
+      $('#newtask-form').classList.add('hidden');
+      refreshTasks().catch(() => {});
+    }
+  });
 
   // compact age of an alert (from first_at) for the Health panel
   function ageIso(iso) {

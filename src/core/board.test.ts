@@ -11,12 +11,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+// [U8] MUST be imported first: sets FLOCK_HOME to a fresh tmp home BEFORE
+// terminal.ts computes TMUX_SESSION — the real pod_spawn test then runs in
+// an isolated tmux session, never the operator's.
+import { testHome } from './board.test-env.js';
+import { TMUX_SESSION } from './terminal.js';
 import { DatabaseSync } from 'node:sqlite';
 import { openStore, insertEvent, upsertEscalation } from './store.js';
 import { createHttp } from './http.js';
 import type { CoreCtx } from './ops.js';
 
-const home = fs.mkdtempSync(path.join(os.tmpdir(), 'flock-board-'));
+const home = testHome;
 const store = openStore(home);
 {
   const raw = new DatabaseSync(path.join(home, 'flock.db'));
@@ -409,6 +414,54 @@ const postOp = (op: Record<string, unknown>) =>
   assert.ok(/GUI не найден/.test(boardOpen.stdout), '--open headless prints an honest fallback note');
   assert.ok(boardOpen.stdout.includes('http://127.0.0.1:7499/board'), 'the URL is printed anyway (open it manually)');
 }
+
+// ---- 11) [U8] creation: New task (task_add) / New pod (pod_spawn) — the
+//         op path the board's forms use (same as [U6] actions) ----
+
+// 11a) task_add {role, title} on an existing pod → ok:true + task queued
+const ta = await postOp({ type: 'task_add', role: 'dev', title: 'u8 new task' });
+assert.strictEqual(ta.status, 200);
+const taBody = (await ta.json()) as { ok: boolean; result: { id: string; status: string; pod_role: string } };
+assert.strictEqual(taBody.ok, true, `task_add ok: ${JSON.stringify(taBody)}`);
+assert.strictEqual(taBody.result.status, 'queued');
+assert.strictEqual(taBody.result.pod_role, 'dev');
+const tl11 = await postOp({ type: 'task_list', limit: 500 });
+const tl11Body = (await tl11.json()) as { ok: boolean; result: Array<{ id: string; status: string }> };
+assert.strictEqual(tl11.status, 200);
+const added = tl11Body.result.find((t) => t.id === taBody.result.id);
+assert.ok(added && added.status === 'queued', 'task_add: the task is visible in task_list (queued)');
+
+// 11b) task_add on a non-existent pod → 404 ok:false «no pod» — core is alive
+const taBad = await postOp({ type: 'task_add', role: 'ghost', title: 'x' });
+assert.strictEqual(taBad.status, 404);
+const taBadBody = (await taBad.json()) as { ok: boolean; error?: string };
+assert.strictEqual(taBadBody.ok, false);
+assert.ok(/no pod/.test(taBadBody.error ?? ''), `no-pod error text: ${JSON.stringify(taBadBody)}`);
+const tl11b = await postOp({ type: 'task_list', limit: 5 });
+assert.strictEqual(tl11b.status, 200, 'core is alive after a 404 task_add');
+
+// 11c) pod_spawn {role, cmd} (plain cmd pod, no LLM) → ok:true + pod in the
+//      store, state not closed. REAL spawn: isolated tmux session
+//      (FLOCK_HOME → testHome, see board.test-env.js).
+const ps = await postOp({ type: 'pod_spawn', role: 'u8p', cmd: 'sleep 3600' });
+assert.strictEqual(ps.status, 200);
+const psBody = (await ps.json()) as { ok: boolean; error?: string };
+assert.strictEqual(psBody.ok, true, `pod_spawn ok: ${JSON.stringify(psBody)}`);
+const pods11 = await get('/api/pods');
+const pods11Body = (await pods11.json()) as { pods: Array<{ role: string; state: string }> };
+const u8p = pods11Body.pods.find((p) => p.role === 'u8p');
+assert.ok(u8p, 'pod_spawn: the pod is in /api/pods');
+assert.notStrictEqual(u8p.state, 'closed', `pod state not closed: ${u8p.state}`);
+
+// 11d) pod_spawn again on the live role → 409 ok:false «already» (honest)
+const ps2 = await postOp({ type: 'pod_spawn', role: 'u8p', cmd: 'sleep 3600' });
+assert.strictEqual(ps2.status, 409);
+const ps2Body = (await ps2.json()) as { ok: boolean; error?: string };
+assert.strictEqual(ps2Body.ok, false);
+assert.ok(/already/.test(ps2Body.error ?? ''), `already error text: ${JSON.stringify(ps2Body)}`);
+
+// teardown: the isolated tmux session (u8p runs sleep 3600 there)
+spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION], { stdio: 'ignore' });
 
 fs.rmSync(home, { recursive: true, force: true });
 console.log('board.test.js: all checks passed');
