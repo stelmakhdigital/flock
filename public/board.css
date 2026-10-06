@@ -108,3 +108,33 @@ textarea.nfin { min-width: 220px; resize: vertical; }
 .nfsave { background: #1e3a5f; border: 1px solid #2563eb; color: #c7d2fe; padding: 3px 12px; cursor: pointer; border-radius: 4px; font: inherit; font-size: 12px; }
 .nfsave:hover { background: #2563eb; color: #fff; }
 .nfnote { color: #6b7280; font-size: 11px; }
+
+/* [U9] Terminal modal (live-capture, read-only) */
+.termmodal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.6); z-index: 50; display: flex; align-items: center; justify-content: center; }
+.termmodal.hidden { display: none; }
+.termmodal > div.termhead { }
+#term-modal { display: flex; flex-direction: column; }
+#term-modal.hidden { display: none; }
+.termhead { display: flex; gap: 8px; align-items: center; background: #171a20; border: 1px solid #2a2f3a; border-bottom: none; border-radius: 8px 8px 0 0; padding: 8px 10px; }
+#term-title { font-weight: 600; color: #d7dce5; flex: 1; }
+.term-lines { background: #171a20; color: #d7dce5; border: 1px solid #2a2f3a; border-radius: 4px; padding: 2px 6px; }
+.term-refresh, .term-close { background: #1e3a5f; border: 1px solid #2563eb; color: #c7d2fe; padding: 2px 10px; cursor: pointer; border-radius: 4px; font: inherit; font-size: 12px; }
+.term-close { background: #3f1d1d; border-color: #b91c1c; color: #fecaca; }
+.term-refresh:hover, .term-close:hover { filter: brightness(1.2); }
+.term-hint { background: #171a20; border: 1px solid #2a2f3a; border-top: none; padding: 4px 10px; color: #6b7280; font-size: 11px; font-family: ui-monospace, monospace; }
+.term-text { background: #0b0e13; color: #c9d1d9; border: 1px solid #2a2f3a; margin: 0; padding: 8px 10px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 55vh; overflow: auto; flex: 1; border-radius: 0 0 0 8px; }
+.term-error { background: #3f1d1d; color: #fecaca; border: 1px solid #b91c1c; border-top: none; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 12px; }
+.term-error.hidden { display: none; }
+/* [U9] task detail expansion */
+.tdetwrap td { background: #12151b; }
+.tdet { display: flex; flex-direction: column; gap: 4px; padding: 6px 10px; font-size: 12px; }
+.tdet-head { color: #86efac; font-weight: 600; }
+.tdet-row { display: flex; gap: 8px; }
+.tdet-k { color: #6b7280; min-width: 64px; flex-shrink: 0; }
+.tdet-v { color: #d7dce5; margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; }
+/* [U9] Terminal / Capture buttons */
+.pterm { background: #172554; border: 1px solid #1d4ed8; color: #bfdbfe; }
+.pterm:hover { background: #1d4ed8; color: #fff; }
+.tcap { background: #172554; border: 1px solid #1d4ed8; color: #bfdbfe; }
+.tcap:hover { background: #1d4ed8; color: #fff; }
+#tasks-table tr { cursor: pointer; }

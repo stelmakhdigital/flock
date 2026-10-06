@@ -117,6 +117,18 @@
       </section>
     </main>
   </div>
+  <!-- [U9] Terminal: live-capture панели пода (read-only, op pod_capture) -->
+  <div id="term-modal" class="termmodal hidden">
+    <div class="termhead">
+      <span id="term-title">Terminal</span>
+      <select id="term-lines" class="term-lines"><option value="50">50</option><option value="200" selected>200</option><option value="500">500</option></select>
+      <button id="term-refresh" class="term-refresh">Refresh</button>
+      <button id="term-close" class="term-close">Close</button>
+    </div>
+    <div id="term-hint" class="term-hint"></div>
+    <pre id="term-text" class="term-text"></pre>
+    <div id="term-error" class="term-error hidden"></div>
+  </div>
   <script src="/board/assets/board.js"></script>
 </body>
 </html>

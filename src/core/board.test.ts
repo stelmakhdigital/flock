@@ -460,11 +460,45 @@ const ps2Body = (await ps2.json()) as { ok: boolean; error?: string };
 assert.strictEqual(ps2Body.ok, false);
 assert.ok(/already/.test(ps2Body.error ?? ''), `already error text: ${JSON.stringify(ps2Body)}`);
 
-// teardown: the isolated tmux session (u8p runs sleep 3600 there) + the
-// pod-local unix socket server (startPodSocket on spawn keeps the event
-// loop alive; stopPodSocket — the same core path pod_close uses)
-spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION], { stdio: 'ignore' });
+// [U9] teardown note: the isolated tmux session is killed at the very end
+// (after §12) — both spawned cmd pods (u8p, u8t) live in it. The u8p
+// pod-local unix socket is closed here (startPodSocket on spawn keeps the
+// event loop alive; stopPodSocket — the same core path pod_close uses).
 stopPodSocket(path.join(home, 'pods', 'u8p'));
+
+// ---- 12) [U9] terminal: pod_capture (read-only, the board's Terminal) ----
+
+// 12a) pod that echoes a marker into the pane → capture contains it.
+//      REAL spawn (isolated tmux session, board.test-env.js).
+const ps12 = await postOp({ type: 'pod_spawn', role: 'u8t', cmd: "bash -c 'echo FLOCK_BOARD_TERM_OK; sleep 300'" });
+assert.strictEqual(ps12.status, 200);
+const ps12Body = (await ps12.json()) as { ok: boolean; error?: string };
+assert.strictEqual(ps12Body.ok, true, `pod_spawn u8t ok: ${JSON.stringify(ps12Body)}`);
+await new Promise((r) => setTimeout(r, 700)); // окно поднялось, echo отработал
+const cap = await postOp({ type: 'pod_capture', role: 'u8t', lines: 50 });
+assert.strictEqual(cap.status, 200);
+const capBody = (await cap.json()) as { ok: boolean; result: { role: string; text: string } };
+assert.strictEqual(capBody.ok, true, `pod_capture ok: ${JSON.stringify(capBody).slice(0, 200)}`);
+assert.ok(capBody.result.text.includes('FLOCK_BOARD_TERM_OK'), 'capture contains the pane marker line');
+
+// 12b) closed pod → 404 «no live pod» (honest, not 500)
+const capC = await postOp({ type: 'pod_capture', role: 'rev', lines: 50 }); // pod_rev seeded closed
+assert.strictEqual(capC.status, 404);
+const capCBody = (await capC.json()) as { ok: boolean; error?: string };
+assert.strictEqual(capCBody.ok, false);
+assert.ok(/no live pod/.test(capCBody.error ?? ''), `closed-pod capture error: ${JSON.stringify(capCBody)}`);
+
+// 12c) non-existent pod → 404 ok:false
+const capG = await postOp({ type: 'pod_capture', role: 'ghost9', lines: 50 });
+assert.strictEqual(capG.status, 404);
+const capGBody = (await capG.json()) as { ok: boolean; error?: string };
+assert.strictEqual(capGBody.ok, false);
+assert.ok(/no live pod/.test(capGBody.error ?? ''), `missing-pod capture error: ${JSON.stringify(capGBody)}`);
+
+// teardown: the isolated tmux session (u8p: sleep 3600, u8t: sleep 300)
+// + the u8t pod-local socket (keeps the event loop alive)
+spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION], { stdio: 'ignore' });
+stopPodSocket(path.join(home, 'pods', 'u8t'));
 
 fs.rmSync(home, { recursive: true, force: true });
 console.log('board.test.js: all checks passed');

@@ -162,6 +162,13 @@
         c5.appendChild(b);
       }
       if (p.state === 'live') {
+        // [U9] Terminal — live-capture (read-only): только live-поды —
+        // core capture'ит лишь live (requireLivePod: 404 «no live pod»);
+        // у closed capture по определению недоступен — кнопка не вводит в заблуждение
+        const tb = document.createElement('button');
+        tb.className = 'pbtn pterm'; tb.textContent = 'Terminal'; tb.dataset.role = p.role;
+        tb.addEventListener('click', () => openTerminal(p.role));
+        c5.appendChild(tb);
         const b = document.createElement('button');
         b.className = 'pbtn pcl'; b.textContent = 'Close'; b.dataset.role = p.role;
         b.addEventListener('click', () => {
@@ -232,9 +239,95 @@
         });
         c5.appendChild(h);
       }
+      // [U9] клик по строке таска — раскрытие (как steps в Workflows [U4]):
+      // body / result / closed (reason/by/at) / pod_role / времена +
+      // Capture pod'а (capture-модал, lines 50). Кнопки действий — без
+      // раскрытия (e.target — button → пропускаем).
+      tr.addEventListener('click', (e) => {
+        const tgt = e.target;
+        if (tgt && typeof tgt.closest === 'function' && tgt.closest('button')) return;
+        const wrap = tr.nextElementSibling;
+        if (wrap && wrap.classList.contains('tdetwrap')) { wrap.remove(); return; }
+        let closedLine = '—';
+        if (t.closed) {
+          try {
+            const cc = JSON.parse(t.closed);
+            closedLine = [cc.reason, cc.target ? `→ ${cc.target}` : '', cc.by ? `by ${cc.by}` : '', cc.at ? `at ${cc.at}` : ''].filter(Boolean).join(' · ');
+          } catch { closedLine = t.closed; }
+        }
+        const det = document.createElement('tr');
+        det.className = 'tdetwrap';
+        det.innerHTML = '<td colspan="6"></td>';
+        const box = document.createElement('div');
+        box.className = 'tdet';
+        box.innerHTML =
+          `<div class="tdet-head">${t.id} — ${t.status} · pod: ${t.pod_role}</div>` +
+          `<div class="tdet-row"><span class="tdet-k">body</span><pre class="tdet-v">${t.body ?? '—'}</pre></div>` +
+          `<div class="tdet-row"><span class="tdet-k">result</span><pre class="tdet-v">${t.result ?? '—'}</pre></div>` +
+          `<div class="tdet-row"><span class="tdet-k">closed</span><span class="tdet-v">${closedLine}</span></div>` +
+          `<div class="tdet-row"><span class="tdet-k">время</span><span class="tdet-v">created ${t.created_at} · claimed ${t.claimed_at ?? '—'} · finished ${t.finished_at ?? '—'}</span></div>`;
+        // Capture pod'а — всегда: «как посмотреть решение» одной кнопкой;
+        // если под не live — модалка честно покажет error core (no live pod)
+        const cap = document.createElement('button');
+        cap.className = 'tbtn tcap'; cap.textContent = `Capture pod'а (${t.pod_role})`;
+        cap.dataset.role = t.pod_role;
+        cap.addEventListener('click', () => openTerminal(t.pod_role, { lines: 50 }));
+        box.appendChild(cap);
+        det.children[0].appendChild(box);
+        tr.after(det);
+      });
       tbody.appendChild(tr);
     }
   }
+
+  // ---------- [U9] Terminal: live-capture панели пода (read-only, op pod_capture) ----------
+  // Модалка одна на весь board: openTerminal(role, {lines}) — capture + hint
+  // «tmux attach -t …» + авто-refresh раз в 5с (паттерн fallback-поллинга),
+  // пока открыта; закрывается — интервал гаснет. Error (под мёртв/окно
+  // убрано) — дословно в модалке, board не ломается.
+  let termTimer = null;
+  let termRole = null;
+
+  async function termCapture() {
+    if (!termRole) return;
+    const errEl = $('#term-error');
+    errEl.classList.add('hidden');
+    try {
+      const { result } = await apiOp({ type: 'pod_capture', role: termRole, lines: Number($('#term-lines').value || 200) });
+      $('#term-text').textContent = result.text;
+    } catch (e) {
+      errEl.textContent = e && e.message ? e.message : String(e); // дословно (напр. «no live pod: X»)
+      errEl.classList.remove('hidden');
+    }
+  }
+  function openTerminal(role, { lines = 200 } = {}) {
+    termRole = role;
+    termErrorReset();
+    $('#term-lines').value = String(lines);
+    $('#term-text').textContent = '…';
+    $('#term-modal').classList.remove('hidden');
+    // hint из /api/pods (terminal_target) — read-эндпоинт, без ops
+    apiGet('/api/pods').then(({ pods }) => {
+      const p = pods.find((x) => x.role === role);
+      $('#term-title').textContent = `Terminal — ${role}` + (p ? ` (${p.state})` : '');
+      $('#term-hint').textContent = p && p.terminal_target
+        ? `tmux attach -t ${p.terminal_target} — откроется в локальном tmux (read-only capture: ввод команд не входит)`
+        : 'tmux-окно недоступно (под не live)';
+    }).catch(() => { $('#term-title').textContent = `Terminal — ${role}`; $('#term-hint').textContent = ''; });
+    if (termTimer) clearInterval(termTimer);
+    termTimer = setInterval(termCapture, 5000);
+    void termCapture();
+  }
+  function termErrorReset() { const e = $('#term-error'); e.textContent = ''; e.classList.add('hidden'); }
+  function closeTerminal() {
+    if (termTimer) clearInterval(termTimer);
+    termTimer = null;
+    termRole = null;
+    $('#term-modal').classList.add('hidden');
+  }
+  $('#term-refresh').addEventListener('click', () => void termCapture());
+  $('#term-lines').addEventListener('change', () => void termCapture());
+  $('#term-close').addEventListener('click', closeTerminal);
 
   // ---------- [U8] creation: New pod (pod_spawn, confirm) / New task (task_add) ----------
 
