@@ -15,7 +15,7 @@ import { listPacks, readPackMeta, buildPackBundle } from './packs.js';
 import { readWorkspace, resolveWorkspaceRef, workspacePath } from './workspace.js';
 import { piList, pluginShowDetail, type PluginEntry } from './plugins.js';
 import * as fleet from './fleet.js';
-import { topologySpec, renderTopologyYaml } from './topologies.js';
+import { topologySpec, renderTopologyYaml, listTopologies } from './topologies.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -150,6 +150,7 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
   team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
   topology_up: { group: 'team', scopes: ['operator'], summary: 'launch a named topology preset (conveyor, adversarial-review, research-team, secrets-manager) via the team path', run: (o, c) => topologyUp(o, c) },
+  topology_ls: { group: 'team', scopes: ['operator', 'pod'], summary: 'topology catalog: name/summary/pods per preset + which preset roles are live now', run: (_o, c) => { const live = new Set(store.listPods(c.store).filter((p) => p.state === 'live').map((p) => p.role)); return listTopologies().map((t) => ({ ...t, live: t.pods.filter((r) => live.has(r)) })); } },
   esc_ls: { group: 'team', scopes: ['operator', 'pod'], summary: '5.4c durable escalations (ladder audit)', run: (o, c) => { const activeOnly = o.active === true || o.active === 'true'; return store.listEscalations(c.store, activeOnly); } },
   esc_ack: { group: 'team', scopes: ['operator'], summary: '5.4c acknowledge an escalation (stops operator reminders)', run: (o, c) => { const id = o.id as string | undefined; if (!id) throw new Error('id required'); const row = store.getEscalation(c.store, id); if (!row) throw new Error('escalation not found'); if (!store.ESC_ACTIVE_STATES.includes(row.state as (typeof store.ESC_ACTIVE_STATES)[number]) && row.state !== 'pm_notified') throw new Error(`escalation is ${row.state}`); store.setEscalationState(c.store, id, 'acknowledged', { resolvedReason: 'operator ack' }); c.emit?.({ type: 'escalation_resolved', id, key: row.key, reason: 'operator ack' }); return { ok: true, id, state: 'acknowledged' }; } },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },

@@ -62,9 +62,12 @@
   const KIND_PANELS = {
     pod: ['pods'],
     task: ['tasks'],
-    team: ['pods'],
+    team: ['pods', 'topologies'], // team up/down/restore: pods + topology live-отметки
     escalation: ['health', 'escalations'], // plan §1.2: escalation_*/health_* → health+escalations
     health: ['health', 'escalations'],
+    workflow: ['workflows'], // [U4]: workflow_defined/started/step/done/blocked/removed
+    campaign: ['campaigns'], // [U4]: campaign_status (created/paused/resumed/cancelled/tick)
+    topology: ['topologies', 'pods'], // [U4]: topology_up — каталог live-отметки + поды
   };
   function invalidate(kind) {
     const set = new Set(['events']);
@@ -72,7 +75,7 @@
     for (const p of KIND_PANELS[prefix] ?? []) set.add(p);
     return [...set];
   }
-  const refetchers = { pods: refreshPods, tasks: refreshTasks, events: () => refreshEvents(false), health: refreshHealth, escalations: refreshEscalations };
+  const refetchers = { pods: refreshPods, tasks: refreshTasks, events: () => refreshEvents(false), health: refreshHealth, escalations: refreshEscalations, workflows: refreshWorkflows, campaigns: refreshCampaigns, topologies: refreshTopologies };
 
   // ---------- login ----------
   function showLogin(err) { $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); if (err) $('#login-error').textContent = err; }
@@ -209,6 +212,121 @@
   }
   function box(parts, sel) { $(sel).innerHTML = parts.join(''); }
 
+  // ---------- [U4] structural panels ----------
+
+  // Workflows panel (plan [U4]): op workflow_ls (definitions + instances);
+  // per instance — «steps» button → op workflow_status: step states
+  // (pending/running/done/blocked), DAG deps, attempts.
+  async function refreshWorkflows() {
+    const { result } = await apiOp({ type: 'workflow_ls' });
+    const wfs = result?.workflows ?? [];
+    const insts = result?.instances ?? [];
+    const parts = [];
+    if (!wfs.length && !insts.length) parts.push('<div class="empty">workflows нет</div>');
+    if (wfs.length) {
+      const rows = wfs.map((w) => {
+        let steps = '—';
+        try {
+          const spec = JSON.parse(w.spec);
+          steps = (spec.steps ?? []).map((s) => `${s.id}→${s.role}${s.deps?.length ? ` (deps: ${s.deps.join(',')})` : ''}`).join(', ');
+        } catch { /* spec не распарсился — оставим — */ }
+        return `<tr><td>${w.name}</td><td class="dir">${steps}</td></tr>`;
+      }).join('');
+      parts.push(`<h3 class="sub">definitions</h3><table><thead><tr><th>name</th><th>steps</th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    if (insts.length) {
+      const wmap = new Map(wfs.map((w) => [w.id, w]));
+      const rows = insts.map((i) =>
+        `<tr><td>${i.id}</td><td>${wmap.get(i.workflow_id)?.name ?? i.workflow_id}</td><td class="state">${i.state}</td><td>${i.created_at.slice(5, 16).replace('T', ' ')}</td><td><button class="wfx" data-id="${i.id}">steps</button></td></tr>`).join('');
+      parts.push(`<h3 class="sub">instances</h3><table><thead><tr><th>id</th><th>workflow</th><th>state</th><th>created</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#workflows-body');
+    document.querySelectorAll('#workflows-body .wfx').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          const { result: st } = await apiOp({ type: 'workflow_status', id: b.dataset.id });
+          let steps = [];
+          try { steps = (st?.workflow && JSON.parse(st.workflow.spec)?.steps) ?? []; } catch { /* — */ }
+          const byStep = new Map((st?.stepState ?? []).map((s) => [s.step, s]));
+          const rows = steps.map((s) => {
+            const ss = byStep.get(s.id);
+            return `<tr><td>${s.id}</td><td>${s.role}</td><td class="state">${ss?.state ?? 'pending'}</td><td class="dir">${s.deps?.length ? s.deps.join(', ') : '—'}</td><td>${ss?.attempts ?? 0}</td></tr>`;
+          }).join('');
+          const old = document.querySelector(`#workflows-body .wfxd[data-for="${b.dataset.id}"]`);
+          if (old) old.remove();
+          const d = document.createElement('div');
+          d.className = 'wfxd';
+          d.dataset.for = b.dataset.id;
+          d.innerHTML = `<div class="wfxd-title">steps ${b.dataset.id} — instance: ${st?.instance?.state ?? '?'}</div>` +
+            `<table><thead><tr><th>step</th><th>role</th><th>state</th><th>deps</th><th>attempts</th></tr></thead><tbody>${rows}</tbody></table>`;
+          $('#workflows-body').appendChild(d);
+        } catch (e) { toast(`workflow_status (${b.dataset.id}): ${e.message}`, 'error'); }
+      }));
+  }
+
+  // Campaigns panel (plan [U4]): op campaign_ls (goal, done/total, state) +
+  // действия через act(): Pause/Resume — без confirm, Cancel — destructive
+  // (confirm-текст с id campaign). После ok — toast (в act) + re-fetch.
+  async function refreshCampaigns() {
+    const { result } = await apiOp({ type: 'campaign_ls' });
+    const camps = result?.campaigns ?? [];
+    const parts = [];
+    if (!camps.length) parts.push('<div class="empty">campaigns нет</div>');
+    else {
+      const rows = camps.map((c) => {
+        const btns = c.status === 'paused'
+          ? `<button class="cb cresume" data-id="${c.id}">Resume</button>`
+          : `<button class="cb cpause" data-id="${c.id}">Pause</button>`;
+        const cancel = c.status !== 'cancelled' && c.status !== 'done'
+          ? ` <button class="cb ccancel" data-id="${c.id}">Cancel</button>` : '';
+        return `<tr class="${c.status === 'paused' || c.status === 'cancelled' || c.status === 'done' ? 'done' : 'active'}"><td>${c.id}</td><td class="dir">${c.goal}</td><td>${c.done}/${c.total}</td><td class="state">${c.status}</td><td>${btns}${cancel}</td></tr>`;
+      }).join('');
+      parts.push(`<table><thead><tr><th>id</th><th>goal</th><th>done/total</th><th>state</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#campaigns-body');
+    document.querySelectorAll('#campaigns-body .cpause').forEach((b) =>
+      b.addEventListener('click', async () => {
+        const r = await act({ type: 'campaign_pause', id: b.dataset.id }); // не destructive
+        if (r.ok) refreshCampaigns().catch(() => {});
+      }));
+    document.querySelectorAll('#campaigns-body .cresume').forEach((b) =>
+      b.addEventListener('click', async () => {
+        const r = await act({ type: 'campaign_resume', id: b.dataset.id }); // не destructive
+        if (r.ok) refreshCampaigns().catch(() => {});
+      }));
+    document.querySelectorAll('#campaigns-body .ccancel').forEach((b) =>
+      b.addEventListener('click', async () => {
+        const r = await act({ type: 'campaign_cancel', id: b.dataset.id }, { destructive: true }); // confirm с id
+        if (r.ok) refreshCampaigns().catch(() => {});
+      }));
+  }
+
+  // Topologies panel (plan [U4]): op topology_ls (каталог: name/summary/pods +
+  // live-отметки) + кнопка Up → op topology_up {name} (reconcile — НЕ
+  // destructive, confirm не нужен). После ok — toast + re-fetch (live-отметки
+  // обновятся), plus pods-панель (поды действительно запущены).
+  async function refreshTopologies() {
+    const { result } = await apiOp({ type: 'topology_ls' });
+    const topos = Array.isArray(result) ? result : [];
+    const parts = [];
+    if (!topos.length) parts.push('<div class="empty">каталог пуст</div>');
+    else {
+      const rows = topos.map((t) => {
+        const live = new Set(t.live ?? []);
+        const pods = t.pods.map((r) =>
+          `<span class="topo ${live.has(r) ? 'topo-live' : 'topo-idle'}">${r}${live.has(r) ? ' ●' : ''}</span>`).join(' ');
+        return `<tr><td>${t.name}</td><td class="dir">${t.summary}</td><td>${pods}</td><td><button class="tup" data-name="${t.name}">Up</button></td></tr>`;
+      }).join('');
+      parts.push(`<table><thead><tr><th>name</th><th>summary</th><th>pods (● = live)</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#topologies-body');
+    document.querySelectorAll('#topologies-body .tup').forEach((b) =>
+      b.addEventListener('click', async () => {
+        const r = await act({ type: 'topology_up', name: b.dataset.name }); // reconcile — не destructive
+        if (r.ok) { refreshTopologies().catch(() => {}); refreshPods().catch(() => {}); }
+      }));
+  }
+
   function invalidatePanels(kind) {
     for (const p of invalidate(kind)) refetchers[p]().catch(() => {});
   }
@@ -263,9 +381,9 @@
     if (started) return;
     started = true;
     await refreshEvents(true); // history paint + lastEventId catch-up
-    await Promise.allSettled([refreshPods(), refreshTasks(), refreshHealth(), refreshEscalations()]);
+    await Promise.allSettled([refreshPods(), refreshTasks(), refreshHealth(), refreshEscalations(), refreshWorkflows(), refreshCampaigns(), refreshTopologies()]);
     openSse();
-    setInterval(() => { void Promise.allSettled([refreshPods(), refreshTasks(), refreshEvents(false), refreshHealth(), refreshEscalations()]); }, 15000);
+    setInterval(() => { void Promise.allSettled([refreshPods(), refreshTasks(), refreshEvents(false), refreshHealth(), refreshEscalations(), refreshWorkflows(), refreshCampaigns(), refreshTopologies()]); }, 15000);
   }
 
   if (token()) {

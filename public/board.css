@@ -58,3 +58,17 @@ td.dir, .subj { color: #8b93a7; }
 .toast.ok { background: #0d2818; color: #4ade80; border-color: #14532d; }
 .toast.error { background: #2d1416; color: #f87171; border-color: #7f1d1d; }
 @keyframes toastin { from { opacity: 0; transform: translate(-50%, 6px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* [U4] structural panels: workflows / campaigns / topologies */
+#workflows-body .sub, #campaigns-body .sub, #topologies-body .sub { color: #8b93a7; font-size: 12px; margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+.wfxd { margin: 10px 0; padding: 8px 10px; border: 1px solid #23262e; border-radius: 6px; }
+.wfxd-title { color: #8b93a7; font-size: 12px; margin-bottom: 6px; }
+.cb, .tup, .wfx { background: #1e3a5f; border: 1px solid #2563eb; color: #c7d2fe; padding: 2px 10px; cursor: pointer; border-radius: 4px; font: inherit; font-size: 12px; }
+.cb:hover, .tup:hover, .wfx:hover { background: #2563eb; color: #fff; }
+.ccancel { background: #3d1519; border-color: #b91c1c; color: #fca5a5; }
+.ccancel:hover { background: #b91c1c; color: #fff; }
+#campaigns-body tr.active td.state { color: #fbbf24; font-weight: bold; }
+#campaigns-body tr.done td.state { color: #6b7280; }
+.topo { display: inline-block; margin-right: 8px; font-size: 12px; }
+.topo-live { color: #4ade80; font-weight: bold; }
+.topo-idle { color: #6b7280; }

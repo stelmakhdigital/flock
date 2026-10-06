@@ -22,6 +22,10 @@ const store = openStore(home);
     .run(path.join(home, 'pods', 'dev'), new Date().toISOString());
   raw.prepare("INSERT OR IGNORE INTO pods(id, role, dir, terminal_target, agent, state, created_at) VALUES ('pod_rev', 'rev', ?, 't', 'bash', 'closed', ?)")
     .run(path.join(home, 'pods', 'rev'), new Date().toISOString());
+  // [U4] a live pod whose role belongs to the `conveyor` preset, so the
+  // topology_ls live-mark is observable (conveyor.live must contain 'review').
+  raw.prepare("INSERT OR IGNORE INTO pods(id, role, dir, terminal_target, agent, state, created_at) VALUES ('pod_review', 'review', ?, 't', 'pi', 'live', ?)")
+    .run(path.join(home, 'pods', 'review'), new Date().toISOString());
   raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_q', 'queued work', 'dev', 'queued', ?)").run(new Date().toISOString());
   raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at, closed) VALUES ('t_h', 'handed work', 'dev', 'done', ?, ?)")
     .run(new Date().toISOString(), JSON.stringify({ reason: 'handed-off', target: 'rev', at: new Date().toISOString(), by: 'cli' }));
@@ -167,6 +171,66 @@ const postOp = (op: Record<string, unknown>) =>
   assert.strictEqual(ackBody.result.state, 'acknowledged', 'row transitions to acknowledged');
   const re = (await (await postOp({ type: 'esc_ls' })).json()) as { result: Array<Record<string, unknown>> };
   assert.strictEqual(re.result.find((e) => e.id === escId)?.state, 'acknowledged', 'state persisted');
+}
+
+// 7) [U4] structural panels: the new read-op topology_ls (catalog shape +
+//    live-mark) plus the existing workflow_ls / campaign_ls the panels render
+//    from. topology_ls must be reachable from a POD-scoped caller too.
+{
+  // 7a) topology_ls → 200 ok:true, an ARRAY of the 4 presets, each with
+  //     name/summary/pods + a live-mark; the live pod 'review' marks conveyor.
+  const tl = await postOp({ type: 'topology_ls' });
+  assert.strictEqual(tl.status, 200, 'topology_ls is a 200');
+  const tlBody = (await tl.json()) as { ok: boolean; result: Array<Record<string, unknown>> };
+  assert.strictEqual(tlBody.ok, true, 'topology_ls ok:true');
+  assert.ok(Array.isArray(tlBody.result), 'topology_ls result is an array');
+  assert.strictEqual(tlBody.result.length, 4, 'catalog has the 4 presets');
+  for (const f of ['name', 'summary', 'pods', 'live']) {
+    assert.ok(f in tlBody.result[0], `topology row has ${f}`);
+  }
+  const names = tlBody.result.map((t) => t.name as string).sort();
+  assert.deepStrictEqual(names, ['adversarial-review', 'conveyor', 'research-team', 'secrets-manager'], 'the 4 preset names');
+  const conv = tlBody.result.find((t) => t.name === 'conveyor')!;
+  assert.ok(Array.isArray(conv.pods) && (conv.pods as string[]).includes('review'), 'conveyor lists its pods incl. review');
+  assert.deepStrictEqual(conv.live, ['review'], 'live pod review marks conveyor (live-mark works)');
+  const ar = tlBody.result.find((t) => t.name === 'adversarial-review')!;
+  assert.deepStrictEqual(ar.live, [], 'a preset with no live roles has an empty live-mark');
+
+  // 7b) workflow_ls → 200 ok:true with the two arrays the panel renders.
+  const wl = await postOp({ type: 'workflow_ls' });
+  assert.strictEqual(wl.status, 200, 'workflow_ls is a 200');
+  const wlBody = (await wl.json()) as { ok: boolean; result: { workflows: unknown[]; instances: unknown[] } };
+  assert.strictEqual(wlBody.ok, true, 'workflow_ls ok:true');
+  assert.ok(Array.isArray(wlBody.result.workflows), 'workflow_ls result.workflows is an array');
+  assert.ok(Array.isArray(wlBody.result.instances), 'workflow_ls result.instances is an array');
+
+  // 7c) campaign_ls → 200 ok:true with the campaigns array.
+  const cl = await postOp({ type: 'campaign_ls' });
+  assert.strictEqual(cl.status, 200, 'campaign_ls is a 200');
+  const clBody = (await cl.json()) as { ok: boolean; result: { campaigns: unknown[] } };
+  assert.strictEqual(clBody.ok, true, 'campaign_ls ok:true');
+  assert.ok(Array.isArray(clBody.result.campaigns), 'campaign_ls result.campaigns is an array');
+
+  // 7d) topology_ls under a POD-scoped caller (env.flockRole) → 200 ok:true.
+  //     The op is registered with scopes ['operator','pod'], so a pod token
+  //     must reach it (unlike operator-only ops such as campaign_pause).
+  const podReq = new Request('http://core/api/ops', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'topology_ls' }),
+  });
+  const podRes = await app.fetch(podReq, { flockRole: 'dev' });
+  assert.strictEqual(podRes.status, 200, 'topology_ls is reachable from a pod scope');
+  const podBody = (await podRes.json()) as { ok: boolean };
+  assert.strictEqual(podBody.ok, true, 'topology_ls ok:true from a pod scope');
+  // control: an operator-only op under the same pod caller is refused (403),
+  // proving the scope narrowing is what 7d exercises, not a blanket allow.
+  const opOnly = await app.fetch(new Request('http://core/api/ops', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'campaign_pause', id: 'cam_none' }),
+  }), { flockRole: 'dev' });
+  assert.strictEqual(opOnly.status, 403, 'operator-only op is refused for a pod caller (control)');
 }
 
 fs.rmSync(home, { recursive: true, force: true });
