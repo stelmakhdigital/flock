@@ -16,21 +16,63 @@
     return r.json();
   }
 
+  // operator action transport: POST /api/ops {type, …args} → {ok, result|error}
+  // (single-writer; the board never mutates state any other way — UI plan §1.3)
+  async function apiOp(op) {
+    const r = await fetch('/api/ops', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token()}` },
+      body: JSON.stringify(op),
+    });
+    if (r.status === 401) { showLogin('токен не принят (401)'); throw new Error('401'); }
+    const body = await r.json().catch(() => ({ ok: false, error: `статус ${r.status}` }));
+    if (!body.ok) throw new Error(body.error || 'операция отклонена');
+    return body; // { ok: true, result }
+  }
+
+  // toast(msg, kind): short operator feedback on an action result (ok/error)
+  function toast(msg, kind = 'ok') {
+    const el = document.createElement('div');
+    el.className = `toast ${kind}`;
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 4200);
+  }
+
+  // act(op, {destructive?}) — THE operator-action pattern (foundation for
+  // [U4]/[U6]): destructive → confirm() → POST /api/ops → toast(ok/error).
+  // Returns {ok, result?|error?|cancelled?}; the caller re-fetches the panel.
+  async function act(op, { destructive = false } = {}) {
+    const label = op.type + (op.id ? ` (${op.id})` : '');
+    if (destructive) {
+      const yes = window.confirm(`Подтвердить действие: ${label}?`);
+      if (!yes) { toast(`${label}: отменено`, 'error'); return { ok: false, cancelled: true }; }
+    }
+    try {
+      const body = await apiOp(op);
+      toast(`${label}: ok`, 'ok');
+      return { ok: true, result: body.result };
+    } catch (e) {
+      toast(`${label}: ${e.message}`, 'error');
+      return { ok: false, error: e.message };
+    }
+  }
+
   // event.kind → panels to refresh (plan §1.2 map; any kind → events)
   const KIND_PANELS = {
-    pod: 'pods',
-    task: 'tasks',
-    team: 'pods',
-    escalation: 'health',
-    health: 'health',
+    pod: ['pods'],
+    task: ['tasks'],
+    team: ['pods'],
+    escalation: ['health', 'escalations'], // plan §1.2: escalation_*/health_* → health+escalations
+    health: ['health', 'escalations'],
   };
   function invalidate(kind) {
     const set = new Set(['events']);
     const prefix = String(kind).split('_')[0];
-    if (KIND_PANELS[prefix]) set.add(KIND_PANELS[prefix]);
+    for (const p of KIND_PANELS[prefix] ?? []) set.add(p);
     return [...set];
   }
-  const refetchers = { pods: refreshPods, tasks: refreshTasks, events: () => refreshEvents(false), health: refreshHealth };
+  const refetchers = { pods: refreshPods, tasks: refreshTasks, events: () => refreshEvents(false), health: refreshHealth, escalations: refreshEscalations };
 
   // ---------- login ----------
   function showLogin(err) { $('#app').classList.add('hidden'); $('#login').classList.remove('hidden'); if (err) $('#login-error').textContent = err; }
@@ -110,20 +152,60 @@
     }
   }
 
+  // compact age of an alert (from first_at) for the Health panel
+  function ageIso(iso) {
+    const ms = Date.now() - Date.parse(iso);
+    if (!Number.isFinite(ms) || ms < 0) return '—';
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return `${Math.max(0, Math.floor(ms / 1000))}s`;
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ${m % 60}m`;
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  }
+
+  // Health panel (plan [U3]): GET /api/health → gate/idle alerts (role, kind,
+  // age) + the health opts (thresholds). Active escalations live in their own
+  // panel (refreshEscalations) — "attention" is kept separate from "health".
   async function refreshHealth() {
     const h = await apiGet('/api/health');
     const parts = [];
-    if (!h.alerts.length) parts.push('<div class="empty">alert\'ов нет — все поды живы</div>');
+    if (!h.alerts.length) parts.push('<div class="empty">алертов нет — все поды живы</div>');
     else {
-      const rows = h.alerts.map((a) => `<tr><td>${a.pod_role}</td><td>${a.kind}</td><td>${a.state}</td><td>${a.count}</td><td>${a.first_at.slice(11, 19)}</td><td class="dir">${a.note ?? ''}</td></tr>`).join('');
-      parts.push(`<table><thead><tr><th>pod</th><th>kind</th><th>state</th><th>count</th><th>first</th><th>note</th></tr></thead><tbody>${rows}</tbody></table>`);
+      const rows = h.alerts.map((a) =>
+        `<tr><td>${a.pod_role}</td><td>${a.kind}</td><td>${ageIso(a.first_at)}</td><td class="state">${a.state}</td><td class="dir">${a.note ?? ''}</td></tr>`).join('');
+      parts.push(`<table><thead><tr><th>role</th><th>kind</th><th>age</th><th>state</th><th>note</th></tr></thead><tbody>${rows}</tbody></table>`);
     }
-    if (h.activeEscalations.length) {
-      parts.push('<h3 style="color:#8b93a7;font-size:12px;margin-top:14px">активные эскалации</h3><table><thead><tr><th>id</th><th>kind</th><th>state</th><th>subject</th><th>created</th></tr></thead><tbody>');
-      for (const e of h.activeEscalations) parts.push(`<tr><td>${e.id}</td><td>${e.kind}</td><td>${e.state}</td><td>${e.subject}</td><td>${e.created_at.slice(11, 19)}</td></tr>`);
-      parts.push('</tbody></table>');
-    }
+    const o = h.opts;
+    parts.push(`<div class="opts">opts — gate≥${o.gateDetectMin}m (re-alert ${o.gateRealertMin}m) · idle≥${o.idleMin}m · nudge ${o.nudgeEveryMin}m · escalate after ${o.escalateAfterNudges} nudges / ${o.escalateAfterMin}m</div>`);
     box(parts, '#health-body');
+  }
+
+  // Escalations panel (plan [U3]): op esc_ls (ladder audit) — every row gets
+  // the columns id/key/state/kind/subject/created_at; the ACTIVE states
+  // (open/pm_notified/escalated) are highlighted and carry the Ack button,
+  // which runs the operator-action pattern act() with confirm.
+  const ESC_ACTIVE = new Set(['open', 'pm_notified', 'escalated']);
+  async function refreshEscalations() {
+    const { result } = await apiOp({ type: 'esc_ls' });
+    const escs = Array.isArray(result) ? result : [];
+    const parts = [];
+    if (!escs.length) parts.push('<div class="empty">эскалаций нет</div>');
+    else {
+      const rows = escs.map((e) => {
+        const active = ESC_ACTIVE.has(e.state);
+        const btn = active ? `<button class="ack" data-id="${e.id}">Ack</button>` : '<span class="dir">—</span>';
+        const created = e.created_at.slice(5, 16).replace('T', ' ');
+        return `<tr class="${active ? 'active' : 'done'}"><td>${e.id}</td><td>${e.key}</td><td class="state">${e.state}</td><td>${e.kind}</td><td class="dir">${e.subject}</td><td>${created}</td><td>${btn}</td></tr>`;
+      }).join('');
+      parts.push(`<table><thead><tr><th>id</th><th>key</th><th>state</th><th>kind</th><th>subject</th><th>created</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
+    }
+    box(parts, '#escalations-body');
+    document.querySelectorAll('#escalations-body .ack').forEach((b) =>
+      b.addEventListener('click', async () => {
+        const r = await act({ type: 'esc_ack', id: b.dataset.id }, { destructive: true });
+        if (r.ok) { refreshEscalations().catch(() => {}); } // instant re-fetch, don't wait for the nudge
+      }));
   }
   function box(parts, sel) { $(sel).innerHTML = parts.join(''); }
 
@@ -181,9 +263,9 @@
     if (started) return;
     started = true;
     await refreshEvents(true); // history paint + lastEventId catch-up
-    await Promise.allSettled([refreshPods(), refreshTasks(), refreshHealth()]);
+    await Promise.allSettled([refreshPods(), refreshTasks(), refreshHealth(), refreshEscalations()]);
     openSse();
-    setInterval(() => { void Promise.allSettled([refreshPods(), refreshTasks(), refreshEvents(false), refreshHealth()]); }, 15000);
+    setInterval(() => { void Promise.allSettled([refreshPods(), refreshTasks(), refreshEvents(false), refreshHealth(), refreshEscalations()]); }, 15000);
   }
 
   if (token()) {

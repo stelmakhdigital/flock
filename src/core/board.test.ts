@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { openStore, insertEvent } from './store.js';
+import { openStore, insertEvent, upsertEscalation } from './store.js';
 import { createHttp } from './http.js';
 import type { CoreCtx } from './ops.js';
 
@@ -37,6 +37,12 @@ const app = createHttp(ctx).app;
 const token = fs.readFileSync(path.join(home, 'token'), 'utf8').trim();
 const get = (p: string, authed = true) =>
   app.fetch(new Request(`http://core${p}`, { headers: authed ? { authorization: `Bearer ${token}` } : {} }));
+const postOp = (op: Record<string, unknown>) =>
+  app.fetch(new Request('http://core/api/ops', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(op),
+  }));
 
 // 1) shell + assets: 200 WITHOUT auth (the shell carries no data)
 {
@@ -122,6 +128,45 @@ const get = (p: string, authed = true) =>
   assert.ok(Array.isArray(body.alerts), 'alerts array');
   assert.ok(Array.isArray(body.activeEscalations), 'activeEscalations array');
   assert.ok(body.opts, 'health opts present');
+}
+
+// 6) [U3] Escalations: op esc_ls (array shape) + esc_ack (acknowledge + honest
+//    error on a missing id — a handled ok:false, NOT an uncaught crash).
+{
+  // seed an active escalation (state 'open') the way the ladder would
+  const { id: escId } = upsertEscalation(store, { key: 'pod:dev:idle', kind: 'idle', subject: 'task t_q stalled' });
+
+  // 6a) esc_ls → 200 ok:true, an ARRAY of escalations with the panel's fields
+  const ls = await postOp({ type: 'esc_ls' });
+  assert.strictEqual(ls.status, 200, 'esc_ls is a 200');
+  const lsBody = (await ls.json()) as { ok: boolean; result: Array<Record<string, unknown>> };
+  assert.strictEqual(lsBody.ok, true, 'esc_ls ok:true');
+  assert.ok(Array.isArray(lsBody.result), 'esc_ls result is an array');
+  const row = lsBody.result.find((e) => e.id === escId);
+  assert.ok(row, 'the seeded escalation is listed');
+  for (const f of ['id', 'key', 'state', 'kind', 'subject', 'created_at']) {
+    assert.ok(f in row!, `escalation row has ${f}`);
+  }
+  assert.strictEqual(row!.state, 'open', 'freshly seeded escalation is active (open)');
+
+  // 6b) esc_ack on a MISSING id → ok:false with an honest error, and the core
+  //     keeps serving (the "не 500 crash" guarantee: a handled refusal, not a
+  //     process crash — proven by the follow-up read still answering 200)
+  const missing = await postOp({ type: 'esc_ack', id: 'esc_does_not_exist' });
+  const missBody = (await missing.json()) as { ok: boolean; error?: string };
+  assert.strictEqual(missBody.ok, false, 'esc_ack on missing id is ok:false');
+  assert.match(missBody.error ?? '', /not found/i, 'honest error names the cause');
+  const alive = await postOp({ type: 'esc_ls' });
+  assert.strictEqual(alive.status, 200, 'core still serves ops after the refused ack (no crash)');
+
+  // 6c) esc_ack on the ACTIVE id → ok:true, row flips to acknowledged (durable)
+  const ack = await postOp({ type: 'esc_ack', id: escId });
+  assert.strictEqual(ack.status, 200, 'esc_ack on an active id is a 200');
+  const ackBody = (await ack.json()) as { ok: boolean; result: { state: string } };
+  assert.strictEqual(ackBody.ok, true, 'esc_ack ok:true');
+  assert.strictEqual(ackBody.result.state, 'acknowledged', 'row transitions to acknowledged');
+  const re = (await (await postOp({ type: 'esc_ls' })).json()) as { result: Array<Record<string, unknown>> };
+  assert.strictEqual(re.result.find((e) => e.id === escId)?.state, 'acknowledged', 'state persisted');
 }
 
 fs.rmSync(home, { recursive: true, force: true });

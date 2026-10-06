@@ -25,6 +25,7 @@
         <button data-panel="tasks" class="tab">Tasks</button>
         <button data-panel="events" class="tab active">Events</button>
         <button data-panel="health" class="tab">Health</button>
+        <button data-panel="escalations" class="tab">Escalations</button>
       </nav>
       <span id="conn" class="conn" title="SSE-статус">—</span>
       <button id="logout" title="сбросить токен">⎋</button>
@@ -58,6 +59,10 @@
       <section id="panel-health" class="panel">
         <h2>Health</h2>
         <div id="health-body"></div>
+      </section>
+      <section id="panel-escalations" class="panel">
+        <h2>Escalations</h2>
+        <div id="escalations-body"></div>
       </section>
     </main>
   </div>
