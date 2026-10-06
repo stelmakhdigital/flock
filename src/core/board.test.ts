@@ -18,7 +18,7 @@ import { testHome } from './board.test-env.js';
 import { TMUX_SESSION } from './terminal.js';
 import { DatabaseSync } from 'node:sqlite';
 import { openStore, insertEvent, upsertEscalation } from './store.js';
-import { createHttp } from './http.js';
+import { createHttp, stopPodSocket } from './http.js';
 import type { CoreCtx } from './ops.js';
 
 const home = testHome;
@@ -426,9 +426,9 @@ assert.strictEqual(taBody.ok, true, `task_add ok: ${JSON.stringify(taBody)}`);
 assert.strictEqual(taBody.result.status, 'queued');
 assert.strictEqual(taBody.result.pod_role, 'dev');
 const tl11 = await postOp({ type: 'task_list', limit: 500 });
-const tl11Body = (await tl11.json()) as { ok: boolean; result: Array<{ id: string; status: string }> };
+const tl11Body = (await tl11.json()) as { ok: boolean; result: { tasks: Array<{ id: string; status: string }> } };
 assert.strictEqual(tl11.status, 200);
-const added = tl11Body.result.find((t) => t.id === taBody.result.id);
+const added = tl11Body.result.tasks.find((t) => t.id === taBody.result.id);
 assert.ok(added && added.status === 'queued', 'task_add: the task is visible in task_list (queued)');
 
 // 11b) task_add on a non-existent pod → 404 ok:false «no pod» — core is alive
@@ -460,8 +460,11 @@ const ps2Body = (await ps2.json()) as { ok: boolean; error?: string };
 assert.strictEqual(ps2Body.ok, false);
 assert.ok(/already/.test(ps2Body.error ?? ''), `already error text: ${JSON.stringify(ps2Body)}`);
 
-// teardown: the isolated tmux session (u8p runs sleep 3600 there)
+// teardown: the isolated tmux session (u8p runs sleep 3600 there) + the
+// pod-local unix socket server (startPodSocket on spawn keeps the event
+// loop alive; stopPodSocket — the same core path pod_close uses)
 spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION], { stdio: 'ignore' });
+stopPodSocket(path.join(home, 'pods', 'u8p'));
 
 fs.rmSync(home, { recursive: true, force: true });
 console.log('board.test.js: all checks passed');
