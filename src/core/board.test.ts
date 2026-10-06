@@ -9,6 +9,8 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { openStore, insertEvent, upsertEscalation } from './store.js';
 import { createHttp } from './http.js';
@@ -383,6 +385,29 @@ const postOp = (op: Record<string, unknown>) =>
   const pods = await get('/api/pods');
   const podsBody = (await pods.json()) as { pods: { role: string; state: string }[] };
   assert.strictEqual(podsBody.pods.find((p) => p.role === 'review')!.state, 'closed', 'pod review is closed');
+
+  // ---- 10) [U7] `flock board` CLI — URL + token-hint + honest --open -------
+  // (паттерн bin-тестов mcp.test.ts: спавн dist/bin.js, сверка stdout)
+  const binJs = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin.js');
+  const boardEnv = { ...process.env, FLOCK_PORT: '7499', FLOCK_HOME: home };
+  const boardOut = spawnSync(process.execPath, [binJs, 'board'], { env: boardEnv, encoding: 'utf8' });
+  assert.strictEqual(boardOut.status, 0, 'flock board exits 0');
+  assert.ok(boardOut.stdout.includes('http://127.0.0.1:7499/board'), 'stdout has the board URL from FLOCK_PORT');
+  assert.ok(/login:/.test(boardOut.stdout) && boardOut.stdout.includes('token'), 'stdout has the token hint');
+  assert.ok(boardOut.stdout.includes('board --token'), 'the hint points to flock board --token');
+  // --token: изолированный home без core — честное сообщение, exit 0
+  const boardTok = spawnSync(process.execPath, [binJs, 'board', '--token'], { env: boardEnv, encoding: 'utf8' });
+  assert.strictEqual(boardTok.status, 0, 'flock board --token exits 0 without a running core');
+  assert.ok(boardTok.stdout.includes('token:'), '--token prints the token line');
+  // --open без GUI (headless: нет DISPLAY/WAYLAND_DISPLAY) — honest fallback:
+  // exit 0, заметка «GUI не найден», без падения
+  const boardOpen = spawnSync(process.execPath, [binJs, 'board', '--open'], {
+    env: { ...boardEnv, DISPLAY: '', WAYLAND_DISPLAY: '' },
+    encoding: 'utf8',
+  });
+  assert.strictEqual(boardOpen.status, 0, '--open does not fail without a GUI');
+  assert.ok(/GUI не найден/.test(boardOpen.stdout), '--open headless prints an honest fallback note');
+  assert.ok(boardOpen.stdout.includes('http://127.0.0.1:7499/board'), 'the URL is printed anyway (open it manually)');
 }
 
 fs.rmSync(home, { recursive: true, force: true });

@@ -129,27 +129,52 @@ curl -N -H "Authorization: Bearer $(cat ~/.flock/token)" "http://127.0.0.1:7460/
 WS-фид убран (C5): `GET /events?since=<id>` — SSE (Hono streaming), backlog
 из `events` + live-push.
 
-## Web board (read-only)
+## Web board
 
-`http://127.0.0.1:<PORT>/board` — локальный web-обзор core (поды, таски,
-события, health). Шелл (HTML/CSS/JS, без build-step) отдаётся без auth —
-dанных в нём нет; токен core вводится на странице и дальше летает как
+`http://127.0.0.1:<PORT>/board` — операторская web-панель core. Шелл
+(HTML/CSS/JS, без build-step) отдаётся без auth — данных в нём нет; токен
+core вводится в login-форму на странице и дальше летает как
 `Authorization: Bearer` в каждом запросе (sessionStorage).
+
+**12 панелей:** Pods (live/closed, activity), Tasks (статусы, handoff →),
+Events (durable-лог из store), Health (gate/idle alerts + thresholds),
+Escalations (активные эскалации + Ack), Workflows (definitions/instances +
+раскрываемые шаги: state, DAG-deps, attempts), Campaigns (goal, done/total,
+state + Pause/Resume/Cancel), Topologies (каталог пресетов + live-отметки
+ролей + Up), Fleet (профили с remote /healthz + pending cross-profile),
+Watchdog (jobs + раскрываемая история срабатываний), Messages (inbox per
+pod, unclaimed-флаг, фильтр по роли), PM (digest: задачи/campaigns/pods/
+unclaimed + alerts).
+
+**Операторские действия — через существующие ops** (единый путь
+`POST /api/ops` → `apply(op)`; core решений не принимает — board только
+вызывает ops, как CLI): Escalations **Ack**; Campaigns **Pause/Resume**
+(без confirm) и **Cancel** (destructive confirm); Topologies **Up**
+(reconcile); Tasks **Done** (closure reason)/ **Unblock** (только blocked)
+без confirm, **Cancel** и **Handoff** (to-role) — destructive confirm;
+Pods **Relaunch** (prompt `--fresh`; default — honest resume) и **Close** —
+destructive confirm. Разрушительные — только через confirm-диалог с
+id/role; на каждое действие — toast (ok с результатом либо ошибка
+dословно) + мгновенный re-fetch затронутой панели.
 
 Механика (UI-plan §1.2): **store-эндпоинты — source of truth**, SSE
 `/events` — только nudge-канал (board никогда не рисует данные из
 live-фрейма): nudge → re-fetch затронутых панелей из `GET /api/*`;
-15s fallback-поллинг; reconnect с backoff. Мутаций из board нет
-(read-only срез; операторские действия — срез [U3]+).
+15s fallback-поллинг; reconnect с backoff.
 
 ```sh
-./bin/flock board          # напечатать URL (и токен, при --token)
+./bin/flock board             # URL + hint на токен (~/.flock/token)
+./bin/flock board --token     # + сам токен (login: в форму или сюда)
+./bin/flock board --open      # открыть в браузере (без GUI — честная заметка, не падает)
 curl -s http://127.0.0.1:7460/board | head   # шелл (без auth, 127.0.0.1)
 ```
 
 Read-эндпоинты: `GET /api/events?since=&limit=` (durable-лог; board читает
 события из store, не из live-фрейма), `GET /api/pods`, `GET /api/tasks`,
-`GET /api/health` (gate/idle alerts + activeEscalations).
+`GET /api/health` (gate/idle alerts + activeEscalations), `GET /api/pm`
+(pm-digest + alerts), `GET /api/watchdog` / `GET /api/watchdog/:id/history`.
+Read-ops для панелей: `fleet_ls`, `watchdog_list`, `message_list`,
+`workflow_ls`/`workflow_status`, `campaign_ls`, `topology_ls` (+ live-роли).
 
 ## Workflow: scribe model + DAG
 

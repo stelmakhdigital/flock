@@ -1,6 +1,7 @@
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
 import { coreUp, coreDown, coreStatus, healthz, readToken } from './core/up.js';
 
 // multi-flock: `flock -p <name> <cmd>...` (or FLOCK_PROFILE env) runs against
@@ -26,7 +27,7 @@ const USAGE = `flock — core CLI
 
   flock core up | down | restart | status
   flock healthz
-  flock board [--token]                    # URL web-board (+ токен) — read-only обзор (поды/таски/события/health)
+  flock board [--token] [--open]              # URL web-board + hint на токен; --open — браузер (honest fallback без GUI)
   flock pod spawn <role> [--dir d] [--agent <id>] [--model M] [--fork <role|file>] [--posture floor|full_bypass] [--cmd c]
       plain-dir: под получает рабочую директорию; git за агентами (core git не видит)
       agent id: встроенные (pi, bash) или <FLOCK_HOME>/agents/<id>.json (manifest)
@@ -202,9 +203,28 @@ async function main(): Promise<void> {
     case 'board': {
       const url = `http://127.0.0.1:${process.env.FLOCK_PORT ?? 7460}/board`;
       console.log(url);
-      if (rest[0] === '--token') {
+      // [U7] hint на токен: login-форма на странице либо flock board --token
+      const boardHome = process.env.FLOCK_HOME ?? path.join(os.homedir(), '.flock');
+      console.log(`login: вставь токен в форму на странице или: flock board --token (файл токена: ${boardHome}/token)`);
+      // флаги могут быть в sub (flock board --token) и/или в rest
+      const flags = [sub, ...rest];
+      if (flags.includes('--token')) {
         const token = readToken();
         console.log(`token: ${token ?? '(нет токена — core не запущен?)'}`);
+      }
+      // [U7] --open: браузер, если opener доступен; без GUI — honest fallback
+      // (заметка, НЕ падение; URL уже напечатан)
+      if (flags.includes('--open')) {
+        const headless = process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+        const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+        const probe = headless ? null : spawnSync(opener, ['--help'], { stdio: 'ignore' });
+        if (headless || probe?.error) {
+          console.log(`GUI не найден (headless или нет ${opener}) — открой URL вручную`);
+        } else {
+          const child = spawn(opener, [url], { stdio: 'ignore', detached: true });
+          child.on('error', () => console.log(`${opener} не запустился — открой URL вручную`));
+          child.unref();
+        }
       }
       return;
     }
