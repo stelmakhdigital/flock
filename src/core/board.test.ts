@@ -27,6 +27,11 @@ const store = openStore(home);
   raw.prepare("INSERT OR IGNORE INTO pods(id, role, dir, terminal_target, agent, state, created_at) VALUES ('pod_review', 'review', ?, 't', 'pi', 'live', ?)")
     .run(path.join(home, 'pods', 'review'), new Date().toISOString());
   raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_q', 'queued work', 'dev', 'queued', ?)").run(new Date().toISOString());
+  // [U6] operator actions: an active task (Done) and a blocked task (Unblock)
+  raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_a', 'active work', 'dev', 'active', ?)").run(new Date().toISOString());
+  raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_b', 'blocked work', 'dev', 'blocked', ?)").run(new Date().toISOString());
+  raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_c', 'handoff source', 'dev', 'active', ?)").run(new Date().toISOString());
+  raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at) VALUES ('t_d', 'cancel target', 'dev', 'queued', ?)").run(new Date().toISOString());
   raw.prepare("INSERT INTO tasks(id, title, pod_role, status, created_at, closed) VALUES ('t_h', 'handed work', 'dev', 'done', ?, ?)")
     .run(new Date().toISOString(), JSON.stringify({ reason: 'handed-off', target: 'rev', at: new Date().toISOString(), by: 'cli' }));
   raw.close();
@@ -115,9 +120,9 @@ const postOp = (op: Record<string, unknown>) =>
 // 4) GET /api/tasks: the Tasks panel shape (status filter, closed.target = handoff)
 {
   const all = (await (await get('/api/tasks?limit=100')).json()) as { tasks: Array<{ id: string; status: string; pod_role: string; closed: string | null }> };
-  assert.strictEqual(all.tasks.length, 2);
+  assert.strictEqual(all.tasks.length, 6); // t_q, t_h + the [U6] seeds t_a..t_d
   const q = (await (await get('/api/tasks?status=queued&limit=100')).json()) as { tasks: Array<{ id: string }> };
-  assert.strictEqual(q.tasks.length, 1);
+  assert.strictEqual(q.tasks.length, 2); // t_q + t_d (both queued at this point)
   assert.strictEqual(q.tasks[0].id, 't_q');
   const done = (await (await get('/api/tasks?status=done&limit=100')).json()) as { tasks: Array<{ closed: string | null }> };
   const target = JSON.parse(done.tasks[0].closed!) as { target: string };
@@ -306,6 +311,78 @@ const postOp = (op: Record<string, unknown>) =>
   assert.ok(Array.isArray(pmBody.alerts), '/api/pm carries the alerts array');
   const pmCounts = Object.values(pmBody.pm.tasks).reduce((a, b) => a + b, 0);
   assert.ok(pmCounts > 0, 'the seeded tasks appear in the digest counts');
+
+  // ---- 9) [U6] operator actions through the op path (the board buttons) ---
+  // The Tasks/Pods panels call EXISTING ops through act() → POST /api/ops;
+  // here we fix the mutation results the panels re-render after re-fetch:
+  // task_done → done (closure), task_unblock → queued, task_cancel →
+  // cancelled, task_handoff → done(handed-off) + successor at {to},
+  // pod_close → state closed. Wrong id → ok:false with an honest error
+  // (not a 500; the core keeps serving).
+  const statusOf = async (id: string): Promise<{ status: string; closed: string | null }> => {
+    const r = await postOp({ type: 'task_list', limit: 500 });
+    const body = (await r.json()) as { result: { tasks: { id: string; status: string; closed: string | null }[] } };
+    const t = body.result.tasks.find((x) => x.id === id);
+    assert.ok(t, `task ${id} is listed`);
+    return { status: t!.status, closed: t!.closed };
+  };
+
+  // 9a) task_done {id, reason:'finished'} → ok:true + the task is done.
+  const done = await postOp({ type: 'task_done', id: 't_a', reason: 'finished' });
+  assert.strictEqual(done.status, 200, 'task_done is a 200');
+  const doneBody = (await done.json()) as { ok: boolean };
+  assert.strictEqual(doneBody.ok, true, 'task_done ok:true');
+  const stA = await statusOf('t_a');
+  assert.strictEqual(stA.status, 'done', 'task t_a is done after task_done');
+  assert.strictEqual(JSON.parse(stA.closed!).reason, 'finished', 'the closure reason is persisted');
+
+  // 9b) task_done on a nonexistent id → ok:false with an honest error
+  //     (404, not a 500) and the core keeps serving afterwards.
+  const doneBad = await postOp({ type: 'task_done', id: 't_none', reason: 'finished' });
+  assert.strictEqual(doneBad.status, 404, 'wrong id is a 404, not a 500');
+  const doneBadBody = (await doneBad.json()) as { ok: boolean; error: string };
+  assert.strictEqual(doneBadBody.ok, false, 'wrong id is ok:false');
+  assert.ok(doneBadBody.error, 'the error is honest (carries a message)');
+  const alive = await postOp({ type: 'task_list' });
+  assert.strictEqual(alive.status, 200, 'the core keeps serving after the error');
+
+  // 9c) task_unblock on a blocked task → queued.
+  const unblk = await postOp({ type: 'task_unblock', id: 't_b' });
+  assert.strictEqual(unblk.status, 200, 'task_unblock is a 200');
+  const unblkBody = (await unblk.json()) as { ok: boolean };
+  assert.strictEqual(unblkBody.ok, true, 'task_unblock ok:true');
+  assert.strictEqual((await statusOf('t_b')).status, 'queued', 'blocked → queued');
+
+  // 9d) task_handoff {id, to} → the source closes handed-off + a successor
+  //     task appears at the target role (rev exists in this store).
+  const ho = await postOp({ type: 'task_handoff', id: 't_c', to: 'rev' });
+  assert.strictEqual(ho.status, 200, 'task_handoff is a 200');
+  const hoBody = (await ho.json()) as { ok: boolean; result: { next: { id: string; pod_role: string } } };
+  assert.strictEqual(hoBody.ok, true, 'task_handoff ok:true');
+  assert.strictEqual(hoBody.result.next.pod_role, 'rev', 'the successor is at the target role');
+  const stC = await statusOf('t_c');
+  assert.strictEqual(stC.status, 'done', 'the handoff source is closed');
+  assert.strictEqual(JSON.parse(stC.closed!).reason, 'handed-off', 'closed with reason handed-off');
+  assert.strictEqual(JSON.parse(stC.closed!).target, 'rev', 'closed.target names the successor pod');
+  const succ = await statusOf(hoBody.result.next.id);
+  assert.ok(succ.status, 'the successor task exists (visible after re-fetch)');
+
+  // 9e) task_cancel → cancelled.
+  const canc = await postOp({ type: 'task_cancel', id: 't_d' });
+  assert.strictEqual(canc.status, 200, 'task_cancel is a 200');
+  const cancBody = (await canc.json()) as { ok: boolean };
+  assert.strictEqual(cancBody.ok, true, 'task_cancel ok:true');
+  assert.strictEqual((await statusOf('t_d')).status, 'cancelled', 'task t_d is cancelled');
+
+  // 9f) pod_close {role} → state closed (kill-window is a no-op here — no
+  //     tmux; the store state is what the Pods panel re-renders).
+  const pclose = await postOp({ type: 'pod_close', role: 'review' });
+  assert.strictEqual(pclose.status, 200, 'pod_close is a 200');
+  const pcloseBody = (await pclose.json()) as { ok: boolean };
+  assert.strictEqual(pcloseBody.ok, true, 'pod_close ok:true');
+  const pods = await get('/api/pods');
+  const podsBody = (await pods.json()) as { pods: { role: string; state: string }[] };
+  assert.strictEqual(podsBody.pods.find((p) => p.role === 'review')!.state, 'closed', 'pod review is closed');
 }
 
 fs.rmSync(home, { recursive: true, force: true });

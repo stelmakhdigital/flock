@@ -43,7 +43,9 @@
   // [U4]/[U6]): destructive → confirm() → POST /api/ops → toast(ok/error).
   // Returns {ok, result?|error?|cancelled?}; the caller re-fetches the panel.
   async function act(op, { destructive = false } = {}) {
-    const label = op.type + (op.id ? ` (${op.id})` : '');
+    // label несёт идентификатор (id или role) + флаги (fresh) — confirm-текст
+    // покрывает «что именно» делаем
+    const label = op.type + (op.id ? ` (${op.id})` : op.role ? ` (${op.role}${op.fresh ? ', fresh' : ''})` : '');
     if (destructive) {
       const yes = window.confirm(`Подтвердить действие: ${label}?`);
       if (!yes) { toast(`${label}: отменено`, 'error'); return { ok: false, cancelled: true }; }
@@ -135,13 +137,40 @@
       const tr = document.createElement('tr');
       if (p.state === 'live') tr.className = 'live';
       if (p.state === 'closed') tr.className = 'closed';
-      tr.innerHTML = `<td></td><td></td><td class="state"></td><td></td><td class="dir"></td>`;
-      const [c0, c1, c2, c3, c4] = tr.children;
+      tr.innerHTML = `<td></td><td></td><td class="state"></td><td></td><td class="dir"></td><td class="acts"></td>`;
+      const [c0, c1, c2, c3, c4, c5] = tr.children;
       c0.textContent = p.role; c1.textContent = p.agent ?? '—'; c2.textContent = p.state;
       c3.textContent = p.model ?? '—'; c4.textContent = p.dir;
+      // [U6] pod-действия (только при допустимом live-состоянии):
+      // Relaunch — для pi/bash-подов (cmd — raw-cmd, core отказывается);
+      // Close — только live. Разрушительные → confirm (act, destructive).
+      if (p.agent !== 'cmd' && (p.state === 'live' || p.state === 'closed')) {
+        const b = document.createElement('button');
+        b.className = 'pbtn prel'; b.textContent = 'Relaunch'; b.dataset.role = p.role;
+        b.addEventListener('click', () => {
+          const freshAns = window.prompt(`Relaunch ${p.role}: новая сессия (--fresh)? yes/no (по умолчанию no — честный resume)`, 'no');
+          if (freshAns === null) return; // отмена
+          const fresh = /^yes$/i.test(String(freshAns).trim());
+          const r = act(fresh ? { type: 'pod_relaunch', role: p.role, fresh: true } : { type: 'pod_relaunch', role: p.role, fork: p.role }, { destructive: true });
+          r.then((x) => { if (x.ok) refreshPods().catch(() => {}); }).catch(() => {});
+        });
+        c5.appendChild(b);
+      }
+      if (p.state === 'live') {
+        const b = document.createElement('button');
+        b.className = 'pbtn pcl'; b.textContent = 'Close'; b.dataset.role = p.role;
+        b.addEventListener('click', () => {
+          const r = act({ type: 'pod_close', role: p.role }, { destructive: true });
+          r.then((x) => { if (x.ok) refreshPods().catch(() => {}); }).catch(() => {});
+        });
+        c5.appendChild(b);
+      }
       tbody.appendChild(tr);
     }
   }
+
+  // closure-словарь для Done (task_done): без 'handed-off' — это Handoff
+  const DONE_REASONS = ['finished', 'blocked', 'denied', 'canceled', 'escalated'];
 
   async function refreshTasks() {
     const { tasks } = await apiGet(`/api/tasks?limit=200${taskFilter ? `&status=${taskFilter}` : ''}`);
@@ -151,10 +180,53 @@
       let target = '—';
       try { const c = t.closed ? JSON.parse(t.closed) : null; if (c && c.target) target = c.target; } catch { /* keep — */ }
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td></td><td class="state"></td><td></td><td></td><td class="dir"></td>`;
-      const [c0, c1, c2, c3, c4] = tr.children;
+      tr.innerHTML = `<td></td><td class="state"></td><td></td><td></td><td class="dir"></td><td class="acts"></td>`;
+      const [c0, c1, c2, c3, c4, c5] = tr.children;
       c0.textContent = t.id; c1.textContent = t.status; c2.textContent = t.pod_role;
       c3.textContent = t.title; c4.textContent = target;
+      // [U6] task-действия по состоянию: закрытым (done/cancelled) — нет;
+      // Done/Cancel/Handoff — только незакрытым; Unblock — только blocked.
+      const closed = t.status === 'done' || t.status === 'cancelled';
+      if (!closed) {
+        const b = document.createElement('button');
+        b.className = 'tbtn tdone'; b.textContent = 'Done'; b.dataset.id = t.id;
+        b.addEventListener('click', () => {
+          const reason = window.prompt(`Done ${t.id}: closure reason (${DONE_REASONS.join('|')}):`, 'finished');
+          if (reason === null) return; // отмена
+          const r2 = String(reason).trim();
+          if (!DONE_REASONS.includes(r2)) { toast(`task_done (${t.id}): bad reason: ${r2}`, 'error'); return; }
+          const x = act({ type: 'task_done', id: t.id, reason: r2 }); // закрытие — не destructive
+          x.then((y) => { if (y.ok) refreshTasks().catch(() => {}); }).catch(() => {});
+        });
+        c5.appendChild(b);
+        if (t.status === 'blocked') {
+          const u = document.createElement('button');
+          u.className = 'tbtn tunblk'; u.textContent = 'Unblock'; u.dataset.id = t.id;
+          u.addEventListener('click', () => {
+            const x = act({ type: 'task_unblock', id: t.id }); // -> queued, не destructive
+            x.then((y) => { if (y.ok) refreshTasks().catch(() => {}); }).catch(() => {});
+          });
+          c5.appendChild(u);
+        }
+        const c = document.createElement('button');
+        c.className = 'tbtn tcancel'; c.textContent = 'Cancel'; c.dataset.id = t.id;
+        c.addEventListener('click', () => {
+          const x = act({ type: 'task_cancel', id: t.id }, { destructive: true });
+          x.then((y) => { if (y.ok) refreshTasks().catch(() => {}); }).catch(() => {});
+        });
+        c5.appendChild(c);
+        const h = document.createElement('button');
+        h.className = 'tbtn thandoff'; h.textContent = 'Handoff'; h.dataset.id = t.id;
+        h.addEventListener('click', () => {
+          const to = window.prompt(`Handoff ${t.id}: to-role (под должен существовать):`, '');
+          if (to === null) return; // отмена
+          const r2 = String(to).trim();
+          if (!r2) return;
+          const x = act({ type: 'task_handoff', id: t.id, to: r2 }, { destructive: true });
+          x.then((y) => { if (y.ok) refreshTasks().catch(() => {}); }).catch(() => {});
+        });
+        c5.appendChild(h);
+      }
       tbody.appendChild(tr);
     }
   }
