@@ -148,10 +148,14 @@
         const b = document.createElement('button');
         b.className = 'pbtn prel'; b.textContent = 'Relaunch'; b.dataset.role = p.role;
         b.addEventListener('click', () => {
-          const freshAns = window.prompt(`Relaunch ${p.role}: новая сессия (--fresh)? yes/no (по умолчанию no — честный resume)`, 'no');
+          const freshAns = window.prompt(`Relaunch ${p.role}: новая сессия (--fresh)? yes/no (по умолчанию no — честный resume с последней сессией)`, 'no');
           if (freshAns === null) return; // отмена
           const fresh = /^yes$/i.test(String(freshAns).trim());
-          const r = act(fresh ? { type: 'pod_relaunch', role: p.role, fresh: true } : { type: 'pod_relaunch', role: p.role, fork: p.role }, { destructive: true });
+          // I1 (R2): дефолт — spec-базовый op pod_relaunch {role} = honest resume
+          // (resumeToken = pinned/latest-сессия; без сессии — чистый fresh-start).
+          // fork:role НЕ по дефолту — это форк от чужой ветки (нужен session-файл;
+          // без него core 404 «no session file»). Явная --fresh-ветка — fresh: true.
+          const r = act(fresh ? { type: 'pod_relaunch', role: p.role, fresh: true } : { type: 'pod_relaunch', role: p.role }, { destructive: true });
           r.then((x) => { if (x.ok) refreshPods().catch(() => {}); }).catch(() => {});
         });
         c5.appendChild(b);
