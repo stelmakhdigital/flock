@@ -6,6 +6,8 @@
 // Rendering goes through the documented pods.yaml subset (team.ts parser);
 // topologySpec() round-trips through the real parser, which the test guards.
 import { parseTeamYaml, type TeamPodSpec, type TeamSpec } from './team.js';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export interface Topology {
   name: string;
@@ -90,6 +92,33 @@ export const TOPOLOGIES: Topology[] = [
 
 export function listTopologies(): { name: string; summary: string; pods: string[] }[] {
   return TOPOLOGIES.map((t) => ({ name: t.name, summary: t.summary, pods: Object.keys(t.pods) }));
+}
+
+// [U10] the full catalog = builtin presets (TOPOLOGIES) + USER topologies
+// (<home>/topologies/*.yaml, saved by the topology_save op). A user file
+// colliding with a builtin name is SKIPPED — user never masks builtin
+// (topology_save refuses the name with 409). Unreadable/broken user files
+// are skipped honestly (the catalog must not crash).
+export function listAllTopologies(home: string, live: Set<string>): {
+  name: string; summary: string; pods: string[]; source: 'builtin' | 'user'; live: string[];
+}[] {
+  const out: { name: string; summary: string; pods: string[]; source: 'builtin' | 'user'; live: string[] }[] =
+    TOPOLOGIES.map((t) => {
+      const roles = Object.keys(t.pods);
+      return { name: t.name, summary: t.summary, pods: roles, source: 'builtin' as const, live: roles.filter((r) => live.has(r)) };
+    });
+  const dir = path.join(home, 'topologies');
+  let files: string[] = [];
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.yaml')).sort(); } catch { /* no dir — builtins only */ }
+  for (const f of files) {
+    const name = f.slice(0, -'.yaml'.length);
+    if (TOPOLOGIES.some((t) => t.name === name)) continue; // builtin wins
+    let roles: string[];
+    try { roles = Object.keys(parseTeamYaml(fs.readFileSync(path.join(dir, f), 'utf8')).pods); }
+    catch { continue; } // broken user file — skip, do not crash the catalog
+    out.push({ name, summary: '(user)', pods: roles, source: 'user', live: roles.filter((r) => live.has(r)) });
+  }
+  return out;
 }
 
 export function getTopology(name: string): Topology {

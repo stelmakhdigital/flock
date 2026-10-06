@@ -280,6 +280,279 @@
     }
   }
 
+  // ---------- [U10] Topology editor: SVG-граф (узлы = поды, рёбра = handoff A→B) ----------
+  // Модель — TeamSpec (единый team-контур, без второго механизма): связи
+  // детерминированно отражаются в guidance (Auto-guidance) и в YAML
+  // (renderTeamYaml-subset — тот же, что парсит parseTeamYaml). Run —
+  // team_up {yaml}, Save — topology_save {name, yaml}. Чистый SVG/JS
+  // (без npm-зависимостей).
+  const TOPO_W = 150, TOPO_H = 56; // геометрия узла (SVG)
+  const TOPO_ROLE_RE = /^[a-z][a-z0-9-]*$/; // ровно core'овский regex роли (team.ts parseTeamYaml)
+  let topoState = null;    // { name, nodes: [{role,agent,model,dir,guidance,x,y}], edges: [[from,to]] }
+  let topoSelected = null; // role выбранного узла
+  let topoPending = null;  // role источника для создания ребра (клик источника → клик цели)
+  let topoDrag = null;     // { node, dx, dy } — drag-перемещение узла
+
+  const topoNode = (role) => topoState?.nodes.find((n) => n.role === role);
+  const topoSetHint = (s) => { $('#topo-hint').textContent = s; };
+
+  // YAML-превью: тот же subset, что renderTeamYaml core (pods: → role →
+  // скаляры в core-порядке + guidance: | блок)
+  function topoYaml() {
+    const out = ['pods:'];
+    for (const n of topoState.nodes) {
+      out.push(`  ${n.role}:`);
+      if (n.agent) out.push(`    agent: ${n.agent}`);
+      if (n.model) out.push(`    model: ${n.model}`);
+      if (n.dir) out.push(`    dir: ${n.dir}`);
+      if (n.guidance) {
+        out.push('    guidance: |');
+        for (const line of String(n.guidance).split('\n')) out.push(`      ${line}`);
+      }
+    }
+    return out.join('\n') + '\n';
+  }
+  function topoRefreshYaml() { $('#topo-yaml-pre').textContent = topoYaml(); }
+
+  // Auto-guidance: детерминированный шаблон из рёбер (перезаписывает guidance)
+  function topoAutoGuidance(role) {
+    const n = topoNode(role);
+    if (!n) return;
+    const out = [];
+    for (const [f, t] of topoState.edges) if (f === role) out.push(`Передаёшь: \`flock task handoff <id> ${t}\``);
+    for (const [f, t] of topoState.edges) if (t === role) out.push(`Получаешь от: ${f}`);
+    if (!topoState.edges.some(([f]) => f === role)) out.push(`Закрытие: \`flock task done <id> finished\``);
+    n.guidance = out.join('\n');
+    topoSelectNode(role);
+    topoRefreshYaml();
+    topoSetHint('Auto-guidance: guidance перезаписан из рёбер');
+  }
+
+  function topoRender() {
+    const SVG = 'http://www.w3.org/2000/svg';
+    const svg = $('#topo-svg');
+    svg.innerHTML = '';
+    // стрелка (marker) для рёбер
+    const defs = document.createElementNS(SVG, 'defs');
+    const marker = document.createElementNS(SVG, 'marker');
+    for (const [k, v] of [['id', 'topo-arrow'], ['viewBox', '0 0 10 10'], ['refX', '9'], ['refY', '5'], ['markerWidth', '7'], ['markerHeight', '7'], ['orient', 'auto']]) marker.setAttribute(k, v);
+    const mpath = document.createElementNS(SVG, 'path');
+    mpath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
+    mpath.setAttribute('fill', '#64748b');
+    marker.appendChild(mpath); defs.appendChild(marker); svg.appendChild(defs);
+    // рёбра (под узлами): клик по рёбру — удалить
+    for (const [from, to] of topoState.edges) {
+      const a = topoNode(from), b = topoNode(to);
+      if (!a || !b) continue;
+      const line = document.createElementNS(SVG, 'line');
+      line.setAttribute('class', 'tedge');
+      line.setAttribute('x1', String(a.x + TOPO_W / 2)); line.setAttribute('y1', String(a.y + TOPO_H / 2));
+      line.setAttribute('x2', String(b.x + TOPO_W / 2)); line.setAttribute('y2', String(b.y + TOPO_H / 2));
+      line.setAttribute('stroke', '#64748b'); line.setAttribute('stroke-width', '2');
+      line.setAttribute('marker-end', 'url(#topo-arrow)');
+      line.dataset.from = from; line.dataset.to = to;
+      line.addEventListener('click', () => {
+        topoState.edges = topoState.edges.filter(([f, t]) => !(f === from && t === to));
+        topoRender();
+        topoSetHint(`ребро ${from} → ${to} удалено`);
+      });
+      svg.appendChild(line);
+    }
+    // узлы: rect + role + agent-бейдж + × (удалить, confirm)
+    for (const n of topoState.nodes) {
+      const g = document.createElementNS(SVG, 'g');
+      g.setAttribute('class', 'tnode' + (topoSelected === n.role ? ' tnode-sel' : '') + (topoPending === n.role ? ' tnode-pend' : ''));
+      g.setAttribute('transform', `translate(${n.x},${n.y})`);
+      g.dataset.role = n.role;
+      const rect = document.createElementNS(SVG, 'rect');
+      for (const [k, v] of [['width', String(TOPO_W)], ['height', String(TOPO_H)], ['rx', '8'], ['class', 'tnode-box']]) rect.setAttribute(k, v);
+      g.appendChild(rect);
+      const tRole = document.createElementNS(SVG, 'text');
+      tRole.setAttribute('class', 'tnode-role'); tRole.setAttribute('x', '10'); tRole.setAttribute('y', '24');
+      tRole.textContent = n.role;
+      g.appendChild(tRole);
+      const tAgent = document.createElementNS(SVG, 'text');
+      tAgent.setAttribute('class', 'tnode-agent'); tAgent.setAttribute('x', '10'); tAgent.setAttribute('y', '42');
+      tAgent.textContent = n.agent || '—';
+      g.appendChild(tAgent);
+      const del = document.createElementNS(SVG, 'text');
+      del.setAttribute('class', 'tnode-del'); del.setAttribute('x', String(TOPO_W - 22)); del.setAttribute('y', '18');
+      del.textContent = '×';
+      del.addEventListener('click', (e) => { if (e && e.stopPropagation) e.stopPropagation(); topoNodeDelete(n.role); });
+      g.appendChild(del);
+      // drag-перемещение (реальный браузер; fake-DOM событий мыши не имеет)
+      g.addEventListener('mousedown', (e) => { topoDrag = { node: n, dx: (e?.clientX ?? 0) - n.x, dy: (e?.clientY ?? 0) - n.y }; });
+      // клик: без pending — выбрать источник; с pending — создать ребро
+      g.addEventListener('click', () => topoNodeClick(n.role));
+      svg.appendChild(g);
+    }
+  }
+
+  function topoNodeClick(role) {
+    if (topoPending === role) {
+      // повторный клик по источнику — отмена режима соединения
+      // (само-ребро A→A невозможно: второе клика по тому же узлу снимает pending)
+      topoPending = null;
+      topoSetHint(`источник ${role} снят (режим соединения отменён)`);
+    } else if (topoPending) {
+      const from = topoPending;
+      topoPending = null;
+      if (topoState.edges.some(([f, t]) => f === from && t === role)) {
+        toast(`topo edge ${from} → ${role}: уже существует`, 'error');
+      } else {
+        topoState.edges.push([from, role]);
+        topoSetHint(`ребро ${from} → ${role}: создано (клик по рёбру — удалить)`);
+      }
+    } else {
+      topoPending = role;
+      topoSetHint(`источник: ${role} — кликни целевой узел (или тот же — отмена)`);
+    }
+    topoSelectNode(role);
+    topoRender();
+  }
+
+  function topoNodeDelete(role) {
+    if (!window.confirm(`Удалить узел ${role} вместе с его рёбрами?`)) { toast(`topo node ${role}: отменено`, 'error'); return; }
+    topoState.nodes = topoState.nodes.filter((n) => n.role !== role);
+    topoState.edges = topoState.edges.filter(([f, t]) => f !== role && t !== role);
+    if (topoSelected === role) topoSelected = null;
+    if (topoPending === role) topoPending = null;
+    topoRender(); topoRefreshYaml(); topoSelectNode(null);
+    topoSetHint(`узел ${role} удалён (с рёбрами)`);
+  }
+
+  function topoSelectNode(role) {
+    topoSelected = role;
+    const n = topoNode(role);
+    $('#topo-props-title').textContent = n ? `properties — ${n.role}` : 'properties — выбери узел';
+    $('#topo-p-role').value = n ? n.role : '';
+    $('#topo-p-agent').value = n ? (n.agent || 'pi') : 'pi';
+    $('#topo-p-model').value = n ? n.model : '';
+    $('#topo-p-dir').value = n ? n.dir : '';
+    $('#topo-p-guidance').value = n ? n.guidance : '';
+  }
+
+  function topoOpen(name, roles) {
+    topoState = {
+      name: name || '',
+      nodes: (roles || []).map((r, i) => ({ role: r, agent: 'pi', model: '', dir: '', guidance: '', x: 60 + (i % 3) * 210, y: 40 + Math.floor(i / 3) * 130 })),
+      edges: [],
+    };
+    topoSelected = null;
+    topoPending = null;
+    $('#topo-name').value = name || '';
+    $('#topo-editor').classList.remove('hidden');
+    topoSetHint((roles && roles.length)
+      ? 'узлы из каталога (topology_ls); свойства/рёбра — отредактируй; Auto-guidance соберёт guidance из рёбер'
+      : 'пустой граф: + Node (role), клик узла-источника → клик узла-цели = ребро (handoff)');
+    topoRender(); topoRefreshYaml(); topoSelectNode(null);
+  }
+  function topoClose() {
+    $('#topo-editor').classList.add('hidden');
+    topoState = null; topoSelected = null; topoPending = null; topoDrag = null;
+  }
+
+  // properties: change → в state + yaml-превью
+  for (const [id, field] of [['#topo-p-agent', 'agent'], ['#topo-p-model', 'model'], ['#topo-p-dir', 'dir'], ['#topo-p-guidance', 'guidance']]) {
+    $(id).addEventListener('change', () => {
+      const n = topoNode(topoSelected);
+      if (!n) return;
+      n[field] = $(id).value;
+      topoRender(); topoRefreshYaml();
+    });
+  }
+  // Rename: валидация по core-regex роли + без коллизий (рёбра пересвязываются)
+  $('#topo-p-rename').addEventListener('click', () => {
+    const n = topoNode(topoSelected);
+    if (!n) { toast('rename: выбери узел', 'error'); return; }
+    const to = $('#topo-p-role').value.trim();
+    if (!TOPO_ROLE_RE.test(to)) { toast(`rename: bad role (want [a-z][a-z0-9-]*): ${to}`, 'error'); return; }
+    if (to === n.role) return;
+    if (topoNode(to)) { toast(`rename: role ${to} уже существует`, 'error'); return; }
+    for (const e of topoState.edges) { if (e[0] === n.role) e[0] = to; if (e[1] === n.role) e[1] = to; }
+    n.role = to;
+    topoSelectNode(to); topoRender(); topoRefreshYaml();
+    topoSetHint(`узел переименован: ${n.role}`);
+  });
+  // + Node: inline-ввод role, валидация по core-regex, без дублей
+  $('#topo-add-node').addEventListener('click', () => {
+    $('#topo-addrole-wrap').classList.remove('hidden');
+    $('#topo-new-role').value = '';
+    try { $('#topo-new-role').focus(); } catch { /* fake-DOM */ }
+  });
+  $('#topo-add-role').addEventListener('click', () => {
+    const role = $('#topo-new-role').value.trim();
+    if (!TOPO_ROLE_RE.test(role)) { toast(`topo node: bad role (want [a-z][a-z0-9-]*): ${role}`, 'error'); return; }
+    if (topoNode(role)) { toast(`topo node: role ${role} уже существует`, 'error'); return; }
+    const i = topoState.nodes.length;
+    topoState.nodes.push({ role, agent: 'pi', model: '', dir: '', guidance: '', x: 60 + (i % 3) * 210, y: 40 + Math.floor(i / 3) * 130 });
+    $('#topo-addrole-wrap').classList.add('hidden');
+    topoRender(); topoRefreshYaml(); topoSelectNode(role);
+    topoSetHint(`узел ${role} добавлен`);
+  });
+  // Auto-guidance (перезаписывает guidance из рёбер)
+  $('#topo-autoguide').addEventListener('click', () => {
+    if (!topoSelected) { toast('auto-guidance: выбери узел', 'error'); return; }
+    topoAutoGuidance(topoSelected);
+  });
+  // Save: валидация имени; существующее (topology_ls) — confirm перезаписи;
+  // коллизия с builtin → 409 дословно от core
+  $('#topo-save').addEventListener('click', async () => {
+    const name = $('#topo-name').value.trim();
+    if (!/^[a-z0-9_-]+$/.test(name)) { toast('topology_save: bad name (want [a-z0-9_-]+)', 'error'); return; }
+    if (!topoState.nodes.length) { toast('topology_save: граф пуст', 'error'); return; }
+    let exists = false;
+    try {
+      const { result } = await apiOp({ type: 'topology_ls' });
+      exists = (result || []).some((t) => t.name === name);
+    } catch { /* ls недоступен — core ответит честно */ }
+    if (exists && !window.confirm(`Топология ${name} уже существует — перезаписать?`)) { toast(`topology_save (${name}): отменено`, 'error'); return; }
+    const r = await act({ type: 'topology_save', name, yaml: topoYaml() }, {
+      okToast: (res) => `topology_save (${name}): ok — ${res && res.file ? res.file : ''}`,
+    });
+    if (r.ok) { refreshTopologies().catch(() => {}); topoSetHint(`сохранено: ${name} (source=user)`); }
+  });
+  // Run: destructive confirm (список ролей) → team_up {yaml} (inline)
+  $('#topo-run').addEventListener('click', async () => {
+    if (!topoState.nodes.length) { toast('team_up: граф пуст', 'error'); return; }
+    const roles = topoState.nodes.map((n) => n.role);
+    const name = $('#topo-name').value.trim() || '(unnamed)';
+    if (!window.confirm(`Run топологии ${name}: reconcile pods: ${roles.join(', ')} — запустить?`)) { toast('team_up: отменено', 'error'); return; }
+    const r = await act({ type: 'team_up', yaml: topoYaml() }, {
+      okToast: (res) => `team_up (${name}): ok — ` + Object.entries((res && res.results) || {}).map(([role, x]) => `${role}: ${x && x.action}`).join(', '),
+    });
+    if (r.ok) { refreshTopologies().catch(() => {}); refreshPods().catch(() => {}); }
+  });
+  // Close — без confirm (ничего не применяется)
+  $('#topo-close').addEventListener('click', topoClose);
+  // Copy / Download (YAML-превью)
+  $('#topo-copy').addEventListener('click', async () => {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard недоступен');
+      await navigator.clipboard.writeText(topoYaml());
+      toast('YAML скопирован', 'ok');
+    } catch (e) { toast(`copy: ${(e && e.message) || 'clipboard недоступен в этом окружении'}`, 'error'); }
+  });
+  $('#topo-download').addEventListener('click', () => {
+    try {
+      const name = $('#topo-name').value.trim() || 'topology';
+      const blob = new Blob([topoYaml()], { type: 'text/yaml' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `${name}.yaml`;
+      document.body.appendChild(a); a.click(); a.remove();
+      toast(`download: ${name}.yaml`, 'ok');
+    } catch (e) { toast(`download: ${(e && e.message) || 'недоступно в этом окружении'}`, 'error'); }
+  });
+  // drag: document-level (одноразово; топологически текущий узел в topoDrag)
+  document.addEventListener('mousemove', (e) => {
+    if (!topoDrag || !e) return;
+    topoDrag.node.x = Math.max(0, e.clientX - topoDrag.dx);
+    topoDrag.node.y = Math.max(0, e.clientY - topoDrag.dy);
+    topoRender();
+  });
+  document.addEventListener('mouseup', () => { topoDrag = null; });
+
   // ---------- [U9] Terminal: live-capture панели пода (read-only, op pod_capture) ----------
   // Модалка одна на весь board: openTerminal(role, {lines}) — capture + hint
   // «tmux attach -t …» + авто-refresh раз в 5с (паттерн fallback-поллинга),
@@ -546,7 +819,11 @@
         const live = new Set(t.live ?? []);
         const pods = t.pods.map((r) =>
           `<span class="topo ${live.has(r) ? 'topo-live' : 'topo-idle'}">${r}${live.has(r) ? ' ●' : ''}</span>`).join(' ');
-        return `<tr><td>${t.name}</td><td class="dir">${t.summary}</td><td>${pods}</td><td><button class="tup" data-name="${t.name}">Up</button></td></tr>`;
+        // [U10] source-метка (builtin/user); Up — только builtin (topology_up
+        // работает по каталогу; user-топологии запускаются редактором → Run)
+        const src = t.source === 'user' ? '<span class="topo-src topo-src-user">user</span>' : '<span class="topo-src">builtin</span>';
+        const up = t.source === 'user' ? '' : `<button class="tup" data-name="${t.name}">Up</button>`;
+        return `<tr><td>${t.name} ${src}</td><td class="dir">${t.summary}</td><td>${pods}</td><td>${up} <button class="tedit" data-name="${t.name}">Edit</button></td></tr>`;
       }).join('');
       parts.push(`<table><thead><tr><th>name</th><th>summary</th><th>pods (● = live)</th><th></th></tr></thead><tbody>${rows}</tbody></table>`);
     }
@@ -556,7 +833,19 @@
         const r = await act({ type: 'topology_up', name: b.dataset.name }); // reconcile — не destructive
         if (r.ok) { refreshTopologies().catch(() => {}); refreshPods().catch(() => {}); }
       }));
+    // [U10] Edit (builtin и user) → графический редактор: узлы из topology_ls
+    document.querySelectorAll('#topologies-body .tedit').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          const { result } = await apiOp({ type: 'topology_ls' });
+          const t = (result || []).find((x) => x.name === b.dataset.name);
+          if (!t) { toast(`topology ${b.dataset.name}: нет в каталоге`, 'error'); return; }
+          topoOpen(t.name, t.pods);
+        } catch (e) { toast(`topology ${b.dataset.name}: ${e.message}`, 'error'); }
+      }));
   }
+  // [U10] + New — пустой граф в редакторе
+  $('#topo-new').addEventListener('click', () => topoOpen('', []));
 
   // ---------- [U5] read-only panels: fleet / watchdog / messages / pm ----------
 

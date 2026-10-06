@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as store from './store.js';
-import { parseTeamYaml, TeamParseError } from './team.js';
+import { parseTeamYaml, TeamParseError, type TeamSpec } from './team.js';
 import { listTeams, listSnapshots, readSnapshot, readTeamSpec, saveSnapshot, validateTeamName, type SnapshotPod } from './team-snap.js';
 import * as terminal from './terminal.js';
 import { resolveAgent, loadAgents, firstUserModel, manifestRuntime, podRuntime, type AgentManifest, type ResolvedAgent } from './agent.js';
@@ -15,7 +15,7 @@ import { listPacks, readPackMeta, buildPackBundle } from './packs.js';
 import { readWorkspace, resolveWorkspaceRef, workspacePath } from './workspace.js';
 import { piList, pluginShowDetail, type PluginEntry } from './plugins.js';
 import * as fleet from './fleet.js';
-import { topologySpec, renderTopologyYaml, listTopologies } from './topologies.js';
+import { topologySpec, renderTopologyYaml, listAllTopologies, TOPOLOGIES } from './topologies.js';
 import type { Ticks } from './ticks.js';
 
 // apply(op) — the SINGLE mutation path.
@@ -148,9 +148,10 @@ export const OP_REGISTRY: Record<string, OpDef> = {
   pod_adopt: { group: 'pod', scopes: ['operator', 'pod'], summary: 'adopt a live tmux pane as a pod (move it into the core session, no restart; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_adopt'); return podAdopt(o, c); } },
   pod_relaunch: { group: 'pod', scopes: ['operator', 'pod'], summary: 'new run on the same pod (honest resume, --fork; pod token: pm only)', run: (o, c) => { requireCoordinator(c, 'pod_relaunch'); return podRelaunch(o, c); } },
   pod_set_resume_token: { group: 'pod', scopes: ['operator'], summary: 'pin/reset the session used for resume', run: (o, c) => podSetResumeToken(o, c) },
-  team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live)', run: (o, c) => teamUp(o, c) },
+  team_up: { group: 'team', scopes: ['operator'], summary: 'reconcile a pods.yaml team (spawn missing, refresh live); file/name OR inline op.yaml', run: (o, c) => teamUp(o, c) },
   topology_up: { group: 'team', scopes: ['operator'], summary: 'launch a named topology preset (conveyor, adversarial-review, research-team, secrets-manager) via the team path', run: (o, c) => topologyUp(o, c) },
-  topology_ls: { group: 'team', scopes: ['operator', 'pod'], summary: 'topology catalog: name/summary/pods per preset + which preset roles are live now', run: (_o, c) => { const live = new Set(store.listPods(c.store).filter((p) => p.state === 'live').map((p) => p.role)); return listTopologies().map((t) => ({ ...t, live: t.pods.filter((r) => live.has(r)) })); } },
+  topology_ls: { group: 'team', scopes: ['operator', 'pod'], summary: 'topology catalog: builtin presets + user topologies (~/.flock/topologies) — name/summary/pods/source + which roles are live now', run: (_o, c) => { const live = new Set(store.listPods(c.store).filter((p) => p.state === 'live').map((p) => p.role)); return listAllTopologies(c.store.home, live); } },
+  topology_save: { group: 'team', scopes: ['operator'], summary: 'save a user topology (pods.yaml subset) to ~/.flock/topologies/<name>.yaml (builtin names: 409)', run: (o, c) => topologySave(o, c) },
   esc_ls: { group: 'team', scopes: ['operator', 'pod'], summary: '5.4c durable escalations (ladder audit)', run: (o, c) => { const activeOnly = o.active === true || o.active === 'true'; return store.listEscalations(c.store, activeOnly); } },
   esc_ack: { group: 'team', scopes: ['operator'], summary: '5.4c acknowledge an escalation (stops operator reminders)', run: (o, c) => { const id = o.id as string | undefined; if (!id) throw new Error('id required'); const row = store.getEscalation(c.store, id); if (!row) throw new Error('escalation not found'); if (!store.ESC_ACTIVE_STATES.includes(row.state as (typeof store.ESC_ACTIVE_STATES)[number]) && row.state !== 'pm_notified') throw new Error(`escalation is ${row.state}`); store.setEscalationState(c.store, id, 'acknowledged', { resolvedReason: 'operator ack' }); c.emit?.({ type: 'escalation_resolved', id, key: row.key, reason: 'operator ack' }); return { ok: true, id, state: 'acknowledged' }; } },
   pod_send: { group: 'pod', scopes: ['operator'], summary: 'send text to a live pod (transport, verified)', run: (o, c) => podSend(o, c) },
@@ -1666,19 +1667,27 @@ async function messageClaim(op: Record<string, unknown>, ctx: CoreCtx): Promise<
 // pods are spawned. Never kills a live pod — a team file change takes effect
 // on relaunch/close, which the operator does deliberately.
 async function teamUp(op: Record<string, unknown>, ctx: CoreCtx): Promise<unknown> {
-  // C14: a team NAME resolves to ~/.flock/teams/<name>.yaml; a path works
-  // as before (the legacy `team up <file>` keeps working).
-  const raw = String(op.file ?? 'pods.yaml');
-  let file = path.resolve(raw);
-  if (!raw.includes('/') && !fs.existsSync(file)) {
-    const { file: named } = readTeamSpec(ctx.store.home, raw);
-    file = named;
-  }
+  // [U10] op.yaml — inline pods.yaml (the board's topology editor); the
+  // file/name path below is unchanged (not breaking).
+  let file: string;
   let src: string;
-  try {
-    src = fs.readFileSync(file, 'utf8');
-  } catch (e) {
-    throw new OpError(400, `cannot read team file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+  if (op.yaml != null) {
+    file = 'inline';
+    src = String(op.yaml);
+  } else {
+    // C14: a team NAME resolves to ~/.flock/teams/<name>.yaml; a path works
+    // as before (the legacy `team up <file>` keeps working).
+    const raw = String(op.file ?? 'pods.yaml');
+    file = path.resolve(raw);
+    if (!raw.includes('/') && !fs.existsSync(file)) {
+      const { file: named } = readTeamSpec(ctx.store.home, raw);
+      file = named;
+    }
+    try {
+      src = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+      throw new OpError(400, `cannot read team file ${file}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   let spec;
   try {
@@ -1726,6 +1735,32 @@ async function reconcileTeam(ctx: CoreCtx, spec: { pods: Record<string, { agent?
     }
   }
   return results;
+}
+
+// topology_save [U10]: a USER topology = a pods.yaml subset on disk
+// (<FLOCK_HOME>/topologies/<name>.yaml), merged into topology_ls. Parse
+// validation BEFORE write (bad yaml → 400, honest message). Builtin names
+// are never masked (409). Re-save overwrites (idempotent).
+function topologySave(op: Record<string, unknown>, ctx: CoreCtx): unknown {
+  const name = String(op.name ?? '');
+  if (!/^[a-z0-9_-]+$/.test(name)) throw new OpError(400, `bad topology name: ${name || '(empty)'} (want [a-z0-9_-]+)`);
+  if (TOPOLOGIES.some((t) => t.name === name)) {
+    throw new OpError(409, `topology ${name} is builtin — user topologies do not mask builtins`);
+  }
+  const yaml = String(op.yaml ?? '');
+  let spec: TeamSpec;
+  try {
+    spec = parseTeamYaml(yaml);
+  } catch (e) {
+    if (e instanceof TeamParseError) throw new OpError(400, e.message);
+    throw e;
+  }
+  const dir = path.join(ctx.store.home, 'topologies');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${name}.yaml`);
+  fs.writeFileSync(file, yaml); // name charset [a-z0-9_-]+ — no path escape
+  ctx.emit?.({ type: 'topology_save', name, pods: Object.keys(spec.pods) });
+  return { name, file, pods: Object.keys(spec.pods) };
 }
 
 // topology_up: a named preset from the catalog, reconciled through the team

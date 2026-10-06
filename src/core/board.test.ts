@@ -19,6 +19,9 @@ import { TMUX_SESSION } from './terminal.js';
 import { DatabaseSync } from 'node:sqlite';
 import { openStore, insertEvent, upsertEscalation } from './store.js';
 import { createHttp, stopPodSocket } from './http.js';
+import { renderTeamYaml } from './team.js';
+import { TOPOLOGIES } from './topologies.js';
+const TOPO_NAMES = new Set(TOPOLOGIES.map((t) => t.name));
 import type { CoreCtx } from './ops.js';
 
 const home = testHome;
@@ -495,10 +498,101 @@ const capGBody = (await capG.json()) as { ok: boolean; error?: string };
 assert.strictEqual(capGBody.ok, false);
 assert.ok(/no live pod/.test(capGBody.error ?? ''), `missing-pod capture error: ${JSON.stringify(capGBody)}`);
 
-// teardown: the isolated tmux session (u8p: sleep 3600, u8t: sleep 300)
-// + the u8t pod-local socket (keeps the event loop alive)
-spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION], { stdio: 'ignore' });
+// teardown: the isolated tmux session is killed at the very end (after §13)
+// — all spawned pods (u8p, u8t, u10*) live in it. The u8t pod-local unix
+// socket is closed here (startPodSocket on spawn keeps the event loop alive;
+// stopPodSocket — the same core path pod_close uses).
 stopPodSocket(path.join(home, 'pods', 'u8t'));
+
+// ---- 13) [U10] topology editor core: renderTeamYaml round-trip,
+//          team_up {yaml} (inline), topology_save + user in topology_ls ----
+
+// 13a) renderTeamYaml round-trip: parseTeamYaml(renderTeamYaml(spec)) ≡ spec
+{
+  const { parseTeamYaml } = await import('./team.js');
+  const specs: import('./team.js').TeamSpec[] = [
+    // conveyor-like: guidance-блоки + model у одного
+    { pods: {
+      intake: { agent: 'pi', guidance: 'Приём. Передаёшь: `flock task handoff <id> plan`.' },
+      plan: { agent: 'pi', model: 'cat-vllm/x', guidance: 'План. Получаешь от: intake. Передаёшь: `flock task handoff <id> build`.' },
+      review: { agent: 'pi', guidance: 'Проверка. Закрытие: `flock task done <id> finished`.' },
+    } },
+    // все поля subset
+    { pods: { dev: { agent: 'bash', model: 'm1', profile: 'quiet', posture: 'full_bypass', dir: '/tmp/ws', guidance: 'a\nb' } } },
+    // пустые поля
+    { pods: { solo: {} } },
+  ];
+  for (const spec of specs) {
+    const back = parseTeamYaml(renderTeamYaml(spec));
+    assert.deepStrictEqual(back, spec, `round-trip: ${JSON.stringify(spec)}`);
+  }
+}
+
+// 13b) team_up {yaml} (inline) — reconcile по yaml: bash-поды (без LLM,
+//      изолированный tmux) → spawned
+const tuInline = await postOp({ type: 'team_up', yaml: 'pods:\n  u10a:\n    agent: bash\n  u10b:\n    agent: bash\n    guidance: test guidance\n' });
+assert.strictEqual(tuInline.status, 200);
+const tuInlineBody = (await tuInline.json()) as { ok: boolean; result: { file: string; results: Record<string, { action: string; error?: string }> } };
+assert.strictEqual(tuInlineBody.ok, true, `team_up {yaml} ok: ${JSON.stringify(tuInlineBody)}`);
+assert.strictEqual(tuInlineBody.result.file, 'inline');
+assert.strictEqual(tuInlineBody.result.results.u10a.action, 'spawned', `u10a: ${JSON.stringify(tuInlineBody.result.results.u10a)}`);
+assert.strictEqual(tuInlineBody.result.results.u10b.action, 'spawned', `u10b: ${JSON.stringify(tuInlineBody.result.results.u10b)}`);
+
+// 13c) team_up {file} — regression: путь через файл работает как было
+const teamFile = path.join(home, 'u10-team.yaml');
+fs.writeFileSync(teamFile, 'pods:\n  u10c:\n    agent: bash\n');
+const tuFile = await postOp({ type: 'team_up', file: teamFile });
+assert.strictEqual(tuFile.status, 200);
+const tuFileBody = (await tuFile.json()) as { ok: boolean; result: { results: Record<string, { action: string }> } };
+assert.strictEqual(tuFileBody.ok, true);
+assert.strictEqual(tuFileBody.result.results.u10c.action, 'spawned', `u10c (file): ${JSON.stringify(tuFileBody.result.results.u10c)}`);
+
+// 13d) team_up {yaml} с битым yaml → 400 ok:false (честно, не 500)
+const tuBad = await postOp({ type: 'team_up', yaml: 'pods:\n  Bad_Role:\n    agent: pi\n' });
+assert.strictEqual(tuBad.status, 400);
+const tuBadBody = (await tuBad.json()) as { ok: boolean; error?: string };
+assert.strictEqual(tuBadBody.ok, false);
+assert.ok(/bad pod role/.test(tuBadBody.error ?? ''), `bad yaml error: ${JSON.stringify(tuBadBody)}`);
+
+// 13e) topology_save: валидный → 200 + файл в FLOCK_HOME + source:'user' в ls
+const goodYaml = 'pods:\n  a:\n    agent: bash\n  b:\n    agent: bash\n';
+const ts1 = await postOp({ type: 'topology_save', name: 'u10-saved', yaml: goodYaml });
+assert.strictEqual(ts1.status, 200);
+const ts1Body = (await ts1.json()) as { ok: boolean; result: { name: string; file: string; pods: string[] } };
+assert.strictEqual(ts1Body.ok, true);
+assert.ok(fs.existsSync(path.join(home, 'topologies', 'u10-saved.yaml')), 'user topology file exists in FLOCK_HOME');
+const tls1 = await postOp({ type: 'topology_ls' });
+const tls1Body = (await tls1.json()) as { ok: boolean; result: Array<{ name: string; source: string; pods: string[] }> };
+const saved = tls1Body.result.find((t) => t.name === 'u10-saved');
+assert.ok(saved && saved.source === 'user', `u10-saved in topology_ls with source=user: ${JSON.stringify(saved)}`);
+assert.deepStrictEqual([...saved!.pods].sort(), ['a', 'b']);
+assert.ok(tls1Body.result.every((t) => (TOPO_NAMES.has(t.name) ? t.source === 'builtin' : t.source === 'user')), 'builtins have source=builtin');
+
+// 13f) topology_save: bad yaml → 400 ok:false
+const tsBad = await postOp({ type: 'topology_save', name: 'u10-bad', yaml: 'pods:\n  X_Y:\n' });
+assert.strictEqual(tsBad.status, 400);
+const tsBadBody = (await tsBad.json()) as { ok: boolean; error?: string };
+assert.strictEqual(tsBadBody.ok, false);
+assert.ok(!fs.existsSync(path.join(home, 'topologies', 'u10-bad.yaml')), 'bad yaml is NOT written');
+
+// 13g) topology_save: имя с коллизией builtin → 409; bad name → 400
+const tsColl = await postOp({ type: 'topology_save', name: 'conveyor', yaml: goodYaml });
+assert.strictEqual(tsColl.status, 409);
+const tsCollBody = (await tsColl.json()) as { ok: boolean; error?: string };
+assert.strictEqual(tsCollBody.ok, false);
+assert.ok(/builtin/.test(tsCollBody.error ?? ''), `builtin collision 409: ${JSON.stringify(tsCollBody)}`);
+const tsName = await postOp({ type: 'topology_save', name: 'Bad Name!', yaml: goodYaml });
+assert.strictEqual(tsName.status, 400);
+
+// 13h) topology_save: повторный save — перезапись (idempotent)
+const ts2 = await postOp({ type: 'topology_save', name: 'u10-saved', yaml: 'pods:\n  a:\n    agent: bash\n    guidance: updated\n' });
+assert.strictEqual(ts2.status, 200);
+assert.ok(fs.readFileSync(path.join(home, 'topologies', 'u10-saved.yaml'), 'utf8').includes('updated'), 're-save overwrites the file');
+
+// teardown: the isolated tmux session (u8p, u8t, u10a, u10b, u10c) +
+// pod-local sockets (u10a/u10b/u10c keep the event loop alive)
+spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION], { stdio: 'ignore' });
+for (const r of ['u10a', 'u10b', 'u10c']) stopPodSocket(path.join(home, 'pods', r));
 
 fs.rmSync(home, { recursive: true, force: true });
 console.log('board.test.js: all checks passed');

@@ -11,6 +11,26 @@
 //         line one
 //         line two
 //
+// Render an arbitrary TeamSpec as the documented pods.yaml subset.
+// Round-trip: parseTeamYaml(renderTeamYaml(spec)) ≡ spec (guarded by
+// board.test §13). The board's topology editor renders the same subset.
+export function renderTeamYaml(spec: TeamSpec): string {
+  const out: string[] = ['pods:'];
+  for (const [role, p] of Object.entries(spec.pods)) {
+    out.push(`  ${role}:`);
+    if (p.agent) out.push(`    agent: ${p.agent}`);
+    if (p.model) out.push(`    model: ${p.model}`);
+    if (p.profile) out.push(`    profile: ${p.profile}`);
+    if (p.posture) out.push(`    posture: ${p.posture}`);
+    if (p.dir) out.push(`    dir: ${p.dir}`);
+    if (p.guidance) {
+      out.push('    guidance: |');
+      for (const line of p.guidance.split('\n')) out.push(`      ${line}`);
+    }
+  }
+  return out.join('\n') + '\n';
+}
+
 // team up is a reconcile: live pods are only refreshed (guidance re-merged,
 // idempotent), missing/closed pods are spawned. It never kills live pods.
 import type { OpError } from './ops.js';

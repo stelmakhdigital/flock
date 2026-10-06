@@ -96,7 +96,7 @@
         <div id="campaigns-body"></div>
       </section>
       <section id="panel-topologies" class="panel">
-        <h2>Topologies</h2>
+        <h2>Topologies <button id="topo-new" class="newbtn">+ New</button></h2>
         <div id="topologies-body"></div>
       </section>
       <section id="panel-fleet" class="panel">
@@ -128,6 +128,47 @@
     <div id="term-hint" class="term-hint"></div>
     <pre id="term-text" class="term-text"></pre>
     <div id="term-error" class="term-error hidden"></div>
+  </div>
+  <!-- [U10] Topology editor: SVG-граф (узлы = поды, рёбра = handoff A→B),
+       properties, live-YAML (renderTeamYaml-subset), Run (team_up yaml) /
+       Save (topology_save) / Close. Только существующий team-контур. -->
+  <div id="topo-editor" class="topo-editor hidden">
+    <div class="topo-head">
+      <span class="topo-head-title">Topology editor</span>
+      <input id="topo-name" class="topo-name" type="text" placeholder="name ([a-z0-9_-]+)">
+      <button id="topo-add-node" class="tbtn2">+ Node</button>
+      <span id="topo-addrole-wrap" class="hidden">
+        <input id="topo-new-role" class="topo-newrole" type="text" placeholder="role">
+        <button id="topo-add-role" class="tbtn2">Add</button>
+      </span>
+      <span id="topo-hint" class="topo-hint"></span>
+      <button id="topo-save" class="topo-save">Save</button>
+      <button id="topo-run" class="topo-run">Run</button>
+      <button id="topo-close" class="topo-close">Close</button>
+    </div>
+    <div class="topo-body">
+      <div class="topo-canvas-wrap">
+        <svg id="topo-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+      <div class="topo-side">
+        <div class="topo-props" id="topo-props">
+          <div class="topo-props-title" id="topo-props-title">properties — выбери узел</div>
+          <div class="topo-prow" id="topo-prow-wrap">
+            <span class="tdet-k">role</span>
+            <span><input id="topo-p-role" class="nfin" type="text" placeholder="role"> <button id="topo-p-rename" class="tbtn2">Rename</button></span>
+          </div>
+          <div class="topo-prow"><span class="tdet-k">agent</span><select id="topo-p-agent" class="nfin"><option value="pi">pi</option><option value="bash">bash</option></select></div>
+          <div class="topo-prow"><span class="tdet-k">model</span><input id="topo-p-model" class="nfin" type="text" placeholder="model (опц.)"></div>
+          <div class="topo-prow"><span class="tdet-k">dir</span><input id="topo-p-dir" class="nfin" type="text" placeholder="dir (опц.)"></div>
+          <div class="topo-prow"><span class="tdet-k">guidance</span><textarea id="topo-p-guidance" class="nfin" rows="4" placeholder="guidance (опц.)"></textarea></div>
+          <div class="topo-prow"><span class="tdet-k"></span><button id="topo-autoguide" class="tbtn2">Auto-guidance (перезапишет из рёбер)</button></div>
+        </div>
+        <div class="topo-yaml">
+          <div class="topo-yaml-head">YAML (live) <button id="topo-copy" class="tbtn2">Copy</button> <button id="topo-download" class="tbtn2">Download</button></div>
+          <pre id="topo-yaml-pre" class="topo-yaml-pre"></pre>
+        </div>
+      </div>
+    </div>
   </div>
   <script src="/board/assets/board.js"></script>
 </body>
