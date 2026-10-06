@@ -16,3 +16,6 @@ screenshots/
 *.secret
 .env
 secrets/
+
+# sandbox-маркер проекта (локальное доверие)
+.sandbox
